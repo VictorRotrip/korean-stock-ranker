@@ -1,0 +1,16 @@
+# Core data sources
+pykrx>=1.0.45
+opendartreader>=0.2.1
+financedatareader>=0.9.50
+
+# Optional: bulk historical price data (faster than pykrx for full loads)
+# marcap>=0.3.2
+
+# Database
+psycopg2-binary>=2.9.9
+
+# Data processing
+pandas>=2.1.0
+
+# Environment
+python-dotenv>=1.0.0

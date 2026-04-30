@@ -1,0 +1,241 @@
+"use client";
+
+import { useMemo } from "react";
+import { useParams } from "next/navigation";
+import Link from "next/link";
+import { ArrowLeft } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { getStocksSync as getStocks, getStockPriceHistorySync as getStockPriceHistory, getLatestFinancialsSync as getLatestFinancials, getLatestPricesSync as getLatestPrices } from "@/lib/data-service";
+import { FACTOR_REGISTRY, type FactorInput } from "@/lib/factors";
+import { formatKRW, formatPercent, formatNumber, cn, scoreColor } from "@/lib/utils";
+import type { Stock, FinancialStatement } from "@/types";
+
+// Simple SVG price chart
+function PriceChart({ data }: { data: { date: string; close: number }[] }) {
+  if (data.length < 2) return <div className="text-muted-foreground text-sm">Insufficient data</div>;
+
+  const width = 700;
+  const height = 200;
+  const padding = { top: 10, right: 10, bottom: 30, left: 60 };
+
+  const prices = data.map(d => d.close);
+  const minP = Math.min(...prices) * 0.98;
+  const maxP = Math.max(...prices) * 1.02;
+
+  const xScale = (i: number) => padding.left + (i / (data.length - 1)) * (width - padding.left - padding.right);
+  const yScale = (v: number) => padding.top + (1 - (v - minP) / (maxP - minP)) * (height - padding.top - padding.bottom);
+
+  const pathD = data.map((d, i) => `${i === 0 ? "M" : "L"} ${xScale(i).toFixed(1)} ${yScale(d.close).toFixed(1)}`).join(" ");
+
+  const firstPrice = data[0].close;
+  const lastPrice = data[data.length - 1].close;
+  const isUp = lastPrice >= firstPrice;
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} className="w-full" style={{ maxHeight: 200 }}>
+      {/* Y-axis labels */}
+      {[0, 0.25, 0.5, 0.75, 1].map(pct => {
+        const val = minP + pct * (maxP - minP);
+        return (
+          <g key={pct}>
+            <line x1={padding.left} y1={yScale(val)} x2={width - padding.right} y2={yScale(val)} stroke="hsl(var(--border))" strokeDasharray="2,2" />
+            <text x={padding.left - 5} y={yScale(val) + 4} textAnchor="end" className="text-[10px] fill-muted-foreground">
+              {(val / 1000).toFixed(0)}K
+            </text>
+          </g>
+        );
+      })}
+      {/* Date labels */}
+      {[0, Math.floor(data.length / 2), data.length - 1].map(i => (
+        <text key={i} x={xScale(i)} y={height - 5} textAnchor="middle" className="text-[10px] fill-muted-foreground">
+          {data[i].date.substring(5)}
+        </text>
+      ))}
+      {/* Price line */}
+      <path d={pathD} fill="none" stroke={isUp ? "hsl(142, 71%, 45%)" : "hsl(0, 84%, 60%)"} strokeWidth={1.5} />
+    </svg>
+  );
+}
+
+export default function StockDetailPage() {
+  const params = useParams();
+  const ticker = params.ticker as string;
+
+  const stocks = getStocks();
+  const stock = stocks.find(s => s.ticker === ticker);
+  const priceHistory = useMemo(() => getStockPriceHistory(ticker), [ticker]);
+  const latestPrices = getLatestPrices();
+  const latestPrice = latestPrices.get(ticker);
+  const financials = getLatestFinancials("2024-12-20").get(ticker);
+
+  if (!stock) {
+    return (
+      <div className="text-center py-12">
+        <p className="text-muted-foreground mb-4">Stock {ticker} not found</p>
+        <Link href="/universe"><Button variant="outline">Back to Universe</Button></Link>
+      </div>
+    );
+  }
+
+  // Compute all factors for this stock
+  const factorValues = useMemo(() => {
+    if (!latestPrice) return [];
+    const input: FactorInput = {
+      stock,
+      latestPrice,
+      priceHistory,
+      financials: financials ?? null,
+      priorFinancials: null, // simplified for detail page
+      shortSelling: null,
+    };
+    return FACTOR_REGISTRY.map(f => ({
+      id: f.id,
+      name: f.name,
+      category: f.category,
+      direction: f.direction,
+      value: f.compute(input),
+    }));
+  }, [stock, latestPrice, priceHistory, financials]);
+
+  const chartData = priceHistory.slice(-120).map(p => ({ date: p.date, close: p.close }));
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center gap-4">
+        <Link href="/universe">
+          <Button variant="ghost" size="icon"><ArrowLeft className="h-4 w-4" /></Button>
+        </Link>
+        <div className="flex-1">
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-bold">{stock.name}</h1>
+            <Badge variant="outline">{stock.market}</Badge>
+          </div>
+          <p className="text-muted-foreground text-sm">
+            {stock.ticker} {stock.nameEn && `· ${stock.nameEn}`} · {stock.sector} · {stock.industry}
+          </p>
+        </div>
+        {latestPrice && (
+          <div className="text-right">
+            <p className="text-2xl font-bold">{latestPrice.close.toLocaleString("ko-KR")} KRW</p>
+            <p className="text-sm text-muted-foreground">Market Cap: {formatKRW(latestPrice.marketCap)}</p>
+          </div>
+        )}
+      </div>
+
+      <Tabs defaultValue="overview">
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="financials">Financials</TabsTrigger>
+          <TabsTrigger value="factors">Factor Scores</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="overview" className="space-y-4">
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">Price History (6 Months)</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <PriceChart data={chartData} />
+            </CardContent>
+          </Card>
+
+          <div className="grid gap-4 md:grid-cols-3">
+            <Card>
+              <CardContent className="pt-4">
+                <p className="text-xs text-muted-foreground">Volume</p>
+                <p className="text-lg font-bold">{latestPrice?.volume.toLocaleString("ko-KR") ?? "N/A"}</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-4">
+                <p className="text-xs text-muted-foreground">Shares Outstanding</p>
+                <p className="text-lg font-bold">{latestPrice?.sharesOutstanding?.toLocaleString("ko-KR") ?? "N/A"}</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-4">
+                <p className="text-xs text-muted-foreground">Sector / Industry</p>
+                <p className="text-lg font-bold">{stock.sector} / {stock.industry}</p>
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="financials">
+          {financials ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">
+                  Financial Statement — Period Ending {financials.periodEnd}
+                </CardTitle>
+                <p className="text-xs text-muted-foreground">Filed: {financials.filingDate}</p>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                  {([
+                    ["Revenue", financials.revenue],
+                    ["Gross Profit", financials.grossProfit],
+                    ["Operating Income", financials.operatingIncome],
+                    ["Net Income", financials.netIncome],
+                    ["EBITDA", financials.ebitda],
+                    ["Total Assets", financials.totalAssets],
+                    ["Total Equity", financials.totalEquity],
+                    ["Total Debt", financials.totalDebt],
+                    ["Cash", financials.cash],
+                    ["Operating CF", financials.operatingCashFlow],
+                    ["CapEx", financials.capitalExpenditure],
+                    ["Free Cash Flow", financials.freeCashFlow],
+                    ["EPS", financials.eps],
+                    ["BV/Share", financials.bookValuePerShare],
+                    ["Dividends Paid", financials.dividendsPaid],
+                  ] as [string, number | null][]).map(([label, val]) => (
+                    <div key={label}>
+                      <p className="text-xs text-muted-foreground">{label}</p>
+                      <p className="text-sm font-medium">
+                        {val !== null ? (Math.abs(val) >= 1e8 ? formatKRW(val) : formatNumber(val)) : "N/A"}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <Card><CardContent className="py-8 text-center text-muted-foreground">No financial data available</CardContent></Card>
+          )}
+        </TabsContent>
+
+        <TabsContent value="factors">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Computed Factor Values</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                Raw values for each factor. Percentile ranks require running a full ranking against the universe.
+              </p>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {factorValues.map(f => (
+                  <div key={f.id} className="flex items-center justify-between px-3 py-2 rounded border">
+                    <div>
+                      <p className="text-sm font-medium">{f.name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {f.category} · {f.direction === "higher_is_better" ? "Higher = Better" : "Lower = Better"}
+                      </p>
+                    </div>
+                    <p className="font-mono text-sm">
+                      {f.value !== null ? formatNumber(f.value, 4) : "N/A"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
