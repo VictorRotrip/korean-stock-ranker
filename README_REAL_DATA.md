@@ -4,7 +4,7 @@ This guide walks you through switching from mock data to a live Supabase Postgre
 
 ## Prerequisites
 
-- **Node.js 18+** and **Python 3.10+**
+- **Node.js 18+** and **Python 3.9+** (3.10+ recommended)
 - A free [Supabase](https://supabase.com/) project (or any Postgres 15+ instance)
 - Optional: [DART API key](https://opendart.fss.or.kr/) for Phase 3 financial statements
 
@@ -76,23 +76,27 @@ Required packages: `pykrx`, `opendartreader`, `financedatareader`, `psycopg2-bin
 
 ```bash
 cd scripts/python
-python smoke_test.py --as-of-date 2024-12-31
+python smoke_test.py
 ```
 
-This takes ~2–5 minutes and will:
+This defaults to `--as-of-date 2024-12-30` (a known Korean trading day) and takes ~2–5 minutes. It will:
 1. Check `DATABASE_URL` and DB connection
 2. Verify all 11 tables exist
 3. Ingest universe, prices, fundamentals, short selling for 5 tickers
 4. Calculate factor values and percentile ranks
 5. Create a ranking snapshot
-6. Print a pass/fail summary
+6. Print a pass/fail summary with the exact commands run
 
-If DART_API_KEY is not set, it skips DART ingestion (that's fine for the smoke test).
-
-You can also run it without ingestion to just verify existing data:
+If `DART_API_KEY` is not set, DART ingestion is skipped automatically. You can also skip it explicitly:
 
 ```bash
-python smoke_test.py --skip-ingestion --as-of-date 2024-12-31
+python smoke_test.py --skip-dart
+```
+
+Run without ingestion to just verify existing data:
+
+```bash
+python smoke_test.py --skip-ingestion
 ```
 
 ## 6. Full Ingestion (Step by Step)
@@ -210,6 +214,16 @@ You need to run `calculate_factors.py` before `run_ranking_snapshot.py`. Factor 
 
 ### "connection refused" or "timeout"
 Check that your Supabase project is not paused (free tier pauses after 1 week of inactivity). Go to the Supabase dashboard and unpause it.
+
+### Windows: UnicodeEncodeError with Korean characters
+On Windows, the default console encoding can't handle Korean text from DART. Set the UTF-8 environment variable before running:
+
+```powershell
+$env:PYTHONUTF8="1"
+python smoke_test.py
+```
+
+Or set it permanently in your PowerShell profile.
 
 ### pykrx returns empty data
 pykrx pulls from KRX/Naver and sometimes returns empty DataFrames for weekends, holidays, or when the service is temporarily down. Retry after a few minutes. Also check that your date is a valid trading day.

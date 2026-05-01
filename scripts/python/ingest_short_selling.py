@@ -1,12 +1,15 @@
 """
 Ingest short selling data from pykrx into Supabase Postgres.
 
-Usage:
-    python ingest_short_selling.py --tickers 005930,000660 --date 2024-12-31
-    python ingest_short_selling.py --start-date 2024-01-01 --end-date 2024-12-31
-    python ingest_short_selling.py --limit 20 --start-date 2024-06-01
+Note: pykrx 1.0.51 broke the market-wide short selling APIs.
+This script tries the per-ticker API. If that also fails, it skips gracefully.
 
-NOTE: Korean short selling was banned Nov 2023 – Mar 2025 for most stocks.
+Also note: Korean short selling was banned Nov 2023 - Mar 2025 for most stocks.
+
+Usage:
+    python ingest_short_selling.py --tickers 005930,000660 --date 2025-04-15
+    python ingest_short_selling.py --start-date 2025-04-01 --end-date 2025-04-30
+    python ingest_short_selling.py --limit 20 --start-date 2025-04-01
 """
 
 import os
@@ -58,60 +61,88 @@ def log_finish(conn, log_id, status, rows_processed=0, rows_inserted=0,
     cur.close()
 
 
-def to_yyyymmdd(iso: str) -> str:
-    return iso.replace("-", "")
+def normalize_date(date_str):
+    return date_str.replace("-", "")
+
+
+def to_iso(yyyymmdd):
+    s = yyyymmdd.replace("-", "")
+    return "{}-{}-{}".format(s[:4], s[4:6], s[6:8])
 
 
 def get_db_tickers(conn, limit=None):
     cur = conn.cursor()
     q = "SELECT ticker FROM stocks WHERE is_active = TRUE ORDER BY ticker"
     if limit:
-        q += f" LIMIT {int(limit)}"
+        q += " LIMIT {}".format(int(limit))
     cur.execute(q)
     tickers = [r[0] for r in cur.fetchall()]
     cur.close()
     return tickers
 
 
-def fetch_short_volume(date_str: str, market: str):
+def is_short_selling_ban_period(start, end):
+    """Check if entire date range falls in the ban (Nov 6 2023 - Mar 30 2025)."""
+    s = int(start.replace("-", "")[:8])
+    e = int(end.replace("-", "")[:8])
+    return s >= 20231106 and e <= 20250330
+
+
+# ---------------------------------------------------------------------------
+# Per-ticker short selling (pykrx 1.0.51)
+# ---------------------------------------------------------------------------
+
+def fetch_short_selling_per_ticker(ticker, start, end):
+    """Try pykrx per-ticker short selling volume.
+    Returns DataFrame or empty."""
     from pykrx import stock
-    df = stock.get_shorting_volume_by_ticker(date_str, market=market)
-    time.sleep(0.3)
-    if df.empty:
-        return pd.DataFrame()
-    iso_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    df["date"] = iso_date
-    df.index.name = "ticker"
+
+    try:
+        df = stock.get_shorting_volume_by_date(start, end, ticker)
+        time.sleep(0.3)
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+    if df is None or df.empty:
+        return pd.DataFrame(), None
+
+    df.index.name = "date_idx"
     df = df.reset_index()
-    col_map = {"공매도거래량": "short_volume", "공매도거래대금": "short_value", "비중": "short_ratio"}
+
+    # Rename columns (Korean)
+    col_map = {
+        "date_idx": "date_raw",
+        "공매도거래량": "short_volume",
+        "공매도거래대금": "short_value",
+        "비중": "short_ratio",
+        "잔고수량": "short_balance",
+        "잔고금액": "short_balance_value",
+    }
     df = df.rename(columns=col_map)
-    return df
+
+    if "date_raw" in df.columns:
+        df["date"] = pd.to_datetime(df["date_raw"]).dt.strftime("%Y-%m-%d")
+
+    df["ticker"] = ticker
+
+    return df, None
 
 
-def fetch_short_balance(date_str: str, market: str):
-    from pykrx import stock
-    df = stock.get_shorting_balance_by_ticker(date_str, market=market)
-    time.sleep(0.3)
+def upsert_short_selling(conn, df):
     if df.empty:
-        return pd.DataFrame()
-    iso_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    df["date"] = iso_date
-    df.index.name = "ticker"
-    df = df.reset_index()
-    col_map = {"공매도잔고": "short_balance", "공매도금액": "short_balance_value"}
-    df = df.rename(columns=col_map)
-    return df
+        return 0
 
-
-def upsert_short_selling(conn, df: pd.DataFrame):
     cur = conn.cursor()
     values = [
-        (row["ticker"], row["date"], row.get("short_volume"), row.get("short_value"),
-         row.get("short_balance"), row.get("short_balance_value"), row.get("short_ratio"), "pykrx")
+        (row["ticker"], row["date"],
+         row.get("short_volume"), row.get("short_value"),
+         row.get("short_balance"), row.get("short_balance_value"),
+         row.get("short_ratio"), "pykrx")
         for _, row in df.iterrows()
     ]
     if not values:
         return 0
+
     query = """
     INSERT INTO short_selling (ticker, date, short_volume, short_value,
         short_balance, short_balance_value, short_ratio, source)
@@ -128,6 +159,10 @@ def upsert_short_selling(conn, df: pd.DataFrame):
     return len(values)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest short selling data")
     parser.add_argument("--tickers", help="Comma-separated tickers")
@@ -141,81 +176,88 @@ if __name__ == "__main__":
     conn = psycopg2.connect(DATABASE_URL)
 
     if args.date:
-        start = to_yyyymmdd(args.date)
+        start = normalize_date(args.date)
         end = start
     elif args.full:
         start, end = "20200101", datetime.now().strftime("%Y%m%d")
     elif args.start_date:
-        start = to_yyyymmdd(args.start_date)
-        end = to_yyyymmdd(args.end_date) if args.end_date else datetime.now().strftime("%Y%m%d")
+        start = normalize_date(args.start_date)
+        end = normalize_date(args.end_date) if args.end_date else datetime.now().strftime("%Y%m%d")
     else:
         start = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
         end = datetime.now().strftime("%Y%m%d")
 
-    tickers_filter = set(args.tickers.split(",")) if args.tickers else None
+    # Resolve tickers
+    if args.tickers:
+        tickers = args.tickers.split(",")
+    else:
+        tickers = get_db_tickers(conn, args.limit)
 
-    log_id = log_start(conn, {"start": start, "end": end, "tickers": args.tickers, "limit": args.limit})
-    total_rows = 0
-    total_processed = 0
-
-    try:
-        print(f"Ingesting short selling from {start} to {end}...")
-        try:
-            from pykrx import stock
-            days = stock.get_previous_business_days(fromdate=start, todate=end)
-        except Exception:
-            days = pd.bdate_range(start, end)
-
-        for day in days:
-            day_str = day.strftime("%Y%m%d")
-            print(f"  {day_str}...", end=" ", flush=True)
-            for market in ["KOSPI", "KOSDAQ"]:
-                try:
-                    vol_df = fetch_short_volume(day_str, market)
-                    bal_df = fetch_short_balance(day_str, market)
-
-                    if vol_df.empty:
-                        continue
-                    result = vol_df[["ticker", "date", "short_volume", "short_value", "short_ratio"]].copy()
-                    if not bal_df.empty:
-                        bc = bal_df[["ticker", "date", "short_balance", "short_balance_value"]]
-                        result = result.merge(bc, on=["ticker", "date"], how="left")
-                    else:
-                        result["short_balance"] = None
-                        result["short_balance_value"] = None
-
-                    if tickers_filter:
-                        result = result[result["ticker"].isin(tickers_filter)]
-                    if args.limit:
-                        db_tickers = set(get_db_tickers(conn, args.limit))
-                        result = result[result["ticker"].isin(db_tickers)]
-
-                    if not result.empty:
-                        total_processed += len(result)
-                        n = upsert_short_selling(conn, result)
-                        total_rows += n
-                        print(f"{market}={n}", end=" ", flush=True)
-                except Exception as e:
-                    print(f"Error {market}: {e}", end=" ")
-            print()
+    # Check ban period
+    if is_short_selling_ban_period(start, end):
+        print("NOTE: Date range {}-{} is in the short selling ban period (Nov 2023 - Mar 2025).".format(start, end))
+        print("      No short selling data available. Marking factors as unavailable.")
 
         cur = conn.cursor()
         cur.execute("""
-            UPDATE factor_coverage SET data_status = 'real', is_available = TRUE,
-                uses_mock_data = FALSE, last_updated = NOW()
-            WHERE factor_id IN ('short_ratio','short_balance_ratio') AND data_status = 'mock'
+            UPDATE factor_coverage SET data_status = 'unavailable', is_available = FALSE,
+                last_updated = NOW()
+            WHERE factor_id IN ('short_ratio','short_balance_ratio')
         """)
         conn.commit()
         cur.close()
+        conn.close()
+        print("Done! (skipped — ban period)")
+        sys.exit(0)
 
-        log_finish(conn, log_id, "success", rows_processed=total_processed, rows_inserted=total_rows)
+    log_id = log_start(conn, {"start": start, "end": end, "tickers": args.tickers, "limit": args.limit})
+    total_rows = 0
+    total_errors = 0
+
+    try:
+        print("Ingesting short selling from {} to {} for {} tickers...".format(start, end, len(tickers)))
+
+        for i, ticker in enumerate(tickers):
+            print("  [{}/{}] {}...".format(i + 1, len(tickers), ticker), end=" ", flush=True)
+
+            df, err = fetch_short_selling_per_ticker(ticker, start, end)
+
+            if err:
+                print("err: {}".format(err[:60]))
+                total_errors += 1
+                continue
+
+            if df.empty:
+                print("no data")
+                continue
+
+            n = upsert_short_selling(conn, df)
+            total_rows += n
+            print("{} rows".format(n))
+
+            time.sleep(0.2)
+
+        if total_rows > 0:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE factor_coverage SET data_status = 'real', is_available = TRUE,
+                    uses_mock_data = FALSE, last_updated = NOW()
+                WHERE factor_id IN ('short_ratio','short_balance_ratio') AND data_status = 'mock'
+            """)
+            conn.commit()
+            cur.close()
+
+        log_finish(conn, log_id, "success", rows_processed=len(tickers), rows_inserted=total_rows)
 
     except Exception as e:
         log_finish(conn, log_id, "error", error_message=str(e),
-                   rows_processed=total_processed, rows_inserted=total_rows)
-        print(f"ERROR: {e}")
+                   rows_processed=len(tickers), rows_inserted=total_rows)
+        print("ERROR: {}".format(e))
         raise
     finally:
         conn.close()
 
-    print(f"\nDone! Inserted/updated {total_rows} short selling records.")
+    print("\nDone! Inserted/updated {} short selling records.".format(total_rows))
+    if total_rows == 0 and total_errors > 0:
+        print("WARNING: pykrx short selling APIs may be broken in version 1.0.51.")
+        print("  Short selling factors are optional — the ranking engine handles missing data.")

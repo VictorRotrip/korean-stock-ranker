@@ -2,8 +2,12 @@
 Ingest KOSPI and KOSDAQ stock universe into Supabase Postgres.
 
 Data sources (in order of preference):
-1. pykrx.stock.get_market_ticker_list() — most reliable for current listings
-2. FinanceDataReader.StockListing("KRX") — includes sector info
+1. FinanceDataReader.StockListing("KRX") — most reliable, includes sector info
+2. pykrx.stock.get_market_ticker_name() — for name lookups
+3. Hardcoded KNOWN_TICKERS — fallback for smoke test tickers
+
+Note: pykrx 1.0.51 broke get_market_ticker_list(). This script now uses
+FinanceDataReader as the primary source for the universe.
 
 Usage:
     python ingest_universe.py
@@ -25,10 +29,29 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    print("ERROR: DATABASE_URL not set. Copy .env.example → .env.local and fill in your Supabase URL.")
+    print("ERROR: DATABASE_URL not set. Copy .env.example -> .env.local and fill in your Supabase URL.")
     sys.exit(1)
 
 SCRIPT_NAME = "ingest_universe"
+
+# Well-known tickers for fallback (smoke test)
+KNOWN_TICKERS = {
+    "005930": ("삼성전자", "Samsung Electronics", "KOSPI"),
+    "000660": ("SK하이닉스", "SK Hynix", "KOSPI"),
+    "035420": ("NAVER", "Naver Corp", "KOSPI"),
+    "051910": ("LG화학", "LG Chem", "KOSPI"),
+    "005380": ("현대자동차", "Hyundai Motor", "KOSPI"),
+    "035720": ("카카오", "Kakao Corp", "KOSPI"),
+    "006400": ("삼성SDI", "Samsung SDI", "KOSPI"),
+    "068270": ("셀트리온", "Celltrion", "KOSPI"),
+    "028260": ("삼성물산", "Samsung C&T", "KOSPI"),
+    "105560": ("KB금융", "KB Financial", "KOSPI"),
+    "055550": ("신한지주", "Shinhan Financial", "KOSPI"),
+    "003670": ("포스코퓨처엠", "POSCO Future M", "KOSPI"),
+    "207940": ("삼성바이오로직스", "Samsung Biologics", "KOSPI"),
+    "247540": ("에코프로비엠", "EcoPro BM", "KOSDAQ"),
+    "373220": ("LG에너지솔루션", "LG Energy Solution", "KOSPI"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -67,67 +90,124 @@ def log_finish(conn, log_id, status, rows_processed=0, rows_inserted=0,
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_from_pykrx(tickers_filter=None):
-    """Load stock universe using pykrx."""
-    from pykrx import stock
+def load_from_fdr(tickers_filter=None):
+    """Load stock universe from FinanceDataReader (primary source)."""
+    import FinanceDataReader as fdr
 
-    today = datetime.now().strftime("%Y%m%d")
     results = []
     for market in ["KOSPI", "KOSDAQ"]:
-        all_tickers = stock.get_market_ticker_list(today, market=market)
-        for ticker in all_tickers:
-            if tickers_filter and ticker not in tickers_filter:
+        try:
+            listing = fdr.StockListing(market)
+            if listing is None or listing.empty:
+                print("  Warning: FDR StockListing({}) returned empty".format(market))
                 continue
-            name = stock.get_market_ticker_name(ticker)
-            results.append({"ticker": ticker, "name": name, "market": market})
 
-    return pd.DataFrame(results)
+            # Normalize column names
+            rename = {}
+            for col in listing.columns:
+                lc = col.lower()
+                if lc in ("code", "symbol", "종목코드"):
+                    rename[col] = "ticker"
+                elif lc in ("name", "종목명"):
+                    rename[col] = "name"
+                elif lc in ("sector", "섹터"):
+                    rename[col] = "sector"
+                elif lc in ("industry", "산업"):
+                    rename[col] = "industry"
+                elif lc in ("listingdate", "상장일"):
+                    rename[col] = "listing_date"
+            listing = listing.rename(columns=rename)
+
+            if "ticker" not in listing.columns or "name" not in listing.columns:
+                print("  Warning: FDR {} missing ticker/name columns. Got: {}".format(
+                    market, list(listing.columns)))
+                continue
+
+            listing["market"] = market
+
+            if tickers_filter:
+                listing = listing[listing["ticker"].isin(tickers_filter)]
+
+            results.append(listing)
+            print("  FDR {}: {} stocks".format(market, len(listing)))
+
+        except Exception as e:
+            print("  Warning: FDR StockListing({}) failed: {}".format(market, e))
+
+    if results:
+        df = pd.concat(results, ignore_index=True)
+        return df
+
+    return pd.DataFrame(columns=["ticker", "name", "market"])
 
 
-def enrich_with_fdr(df: pd.DataFrame) -> pd.DataFrame:
-    """Merge sector/industry from FinanceDataReader."""
+def load_ticker_names_pykrx(tickers):
+    """Look up names for specific tickers via pykrx (fallback)."""
+    results = []
     try:
-        import FinanceDataReader as fdr
+        from pykrx import stock
+        import time
+        for ticker in tickers:
+            try:
+                name = stock.get_market_ticker_name(ticker)
+                time.sleep(0.1)
+                if name:
+                    results.append({"ticker": ticker, "name": name})
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    return results
 
-        kospi = fdr.StockListing("KOSPI")
-        kosdaq = fdr.StockListing("KOSDAQ")
-        kospi["market"] = "KOSPI"
-        kosdaq["market"] = "KOSDAQ"
-        fdr_df = pd.concat([kospi, kosdaq], ignore_index=True)
 
-        # Normalize column names
-        rename = {}
-        for col in fdr_df.columns:
-            lc = col.lower()
-            if lc in ("code", "symbol", "종목코드"):
-                rename[col] = "ticker"
-            elif lc in ("sector", "섹터"):
-                rename[col] = "sector"
-            elif lc in ("industry", "산업"):
-                rename[col] = "industry"
-            elif lc in ("listingdate", "상장일"):
-                rename[col] = "listing_date"
-        fdr_df = fdr_df.rename(columns=rename)
+def build_fallback_universe(tickers):
+    """Build universe from KNOWN_TICKERS + pykrx name lookups."""
+    results = []
+    unknown = []
 
-        if "ticker" in fdr_df.columns:
-            cols = [c for c in ["ticker", "sector", "industry", "listing_date"] if c in fdr_df.columns]
-            fdr_df = fdr_df[cols].drop_duplicates(subset="ticker")
-            df = df.merge(fdr_df, on="ticker", how="left")
-            print(f"  Enriched {df['sector'].notna().sum()} stocks with sector info from FDR")
-    except Exception as e:
-        print(f"  Warning: Could not enrich from FDR: {e}")
-    return df
+    for ticker in tickers:
+        if ticker in KNOWN_TICKERS:
+            name_kr, name_en, market = KNOWN_TICKERS[ticker]
+            results.append({
+                "ticker": ticker, "name": name_kr, "name_en": name_en, "market": market,
+            })
+        else:
+            unknown.append(ticker)
+
+    # Try pykrx for unknown tickers
+    if unknown:
+        pykrx_names = load_ticker_names_pykrx(unknown)
+        found_tickers = set()
+        for item in pykrx_names:
+            results.append({
+                "ticker": item["ticker"], "name": item["name"], "market": "KOSPI",
+            })
+            found_tickers.add(item["ticker"])
+
+        # Last resort: use ticker as name
+        for ticker in unknown:
+            if ticker not in found_tickers:
+                results.append({
+                    "ticker": ticker, "name": ticker, "market": "KOSPI",
+                })
+
+    return pd.DataFrame(results) if results else pd.DataFrame(columns=["ticker", "name", "market"])
 
 
 # ---------------------------------------------------------------------------
 # Classification tags
 # ---------------------------------------------------------------------------
 
-def tag_stocks(df: pd.DataFrame) -> pd.DataFrame:
-    """Tag preferred shares, SPACs, financials, holdings, etc."""
+def tag_stocks(df):
+    if df.empty or "name" not in df.columns:
+        for col in ["is_preferred", "is_spac", "is_financial", "is_holding", "is_etf", "is_reit"]:
+            if col not in df.columns:
+                df[col] = False
+        return df
+
     df["is_preferred"] = df.apply(
-        lambda r: r["ticker"][-1] in ("5", "7", "8", "9")
-        or any(kw in str(r["name"]) for kw in ["우", "우B", "우C", "2우B"]),
+        lambda r: str(r.get("ticker", ""))[-1] in ("5", "7", "8", "9")
+        or any(kw in str(r.get("name", "")) for kw in ["우", "우B", "우C", "2우B"]),
         axis=1,
     )
     df["is_spac"] = df["name"].apply(lambda n: "스팩" in str(n) or "SPAC" in str(n).upper())
@@ -150,7 +230,10 @@ def tag_stocks(df: pd.DataFrame) -> pd.DataFrame:
 # Upsert
 # ---------------------------------------------------------------------------
 
-def upsert_to_db(conn, df: pd.DataFrame):
+def upsert_to_db(conn, df):
+    if df.empty:
+        return 0
+
     cur = conn.cursor()
     values = [
         (
@@ -159,7 +242,7 @@ def upsert_to_db(conn, df: pd.DataFrame):
             str(row["listing_date"])[:10] if pd.notna(row.get("listing_date")) else None,
             True, bool(row.get("is_spac", False)), bool(row.get("is_preferred", False)),
             bool(row.get("is_etf", False)), bool(row.get("is_reit", False)),
-            bool(row.get("is_financial", False)), bool(row.get("is_holding", False)), "marcap",
+            bool(row.get("is_financial", False)), bool(row.get("is_holding", False)), "fdr",
         )
         for _, row in df.iterrows()
     ]
@@ -202,27 +285,54 @@ if __name__ == "__main__":
 
     try:
         print("Loading Korean stock universe...")
+        requested = len(tickers_filter) if tickers_filter else "all"
+        print("  Requested: {} tickers".format(requested))
+
+        # Try FDR first (most reliable in 2024/2025)
+        df = pd.DataFrame(columns=["ticker", "name", "market"])
         try:
-            df = load_from_pykrx(tickers_filter)
-            print(f"  Loaded {len(df)} stocks from pykrx")
-            df = enrich_with_fdr(df)
-        except ImportError:
-            print("  pykrx not available — cannot proceed")
+            df = load_from_fdr(tickers_filter)
+            print("  Loaded {} stocks from FinanceDataReader".format(len(df)))
+        except Exception as e:
+            print("  Warning: FDR failed: {}".format(e))
+
+        # Fallback for missing tickers
+        if tickers_filter and len(df) < len(tickers_filter):
+            found = set(df["ticker"].tolist()) if not df.empty else set()
+            missing = tickers_filter - found
+            if missing:
+                print("  Building fallback for {} missing tickers: {}".format(
+                    len(missing), sorted(missing)))
+                fallback = build_fallback_universe(sorted(missing))
+                if not fallback.empty:
+                    df = pd.concat([df, fallback], ignore_index=True).drop_duplicates(subset="ticker")
+
+        # If we still have nothing and tickers were specified, use pure fallback
+        if df.empty and tickers_filter:
+            print("  All sources failed. Using hardcoded fallback for {} tickers.".format(
+                len(tickers_filter)))
+            df = build_fallback_universe(sorted(tickers_filter))
+
+        if df.empty:
+            print("  ERROR: No stocks found from any source. Cannot proceed.")
+            log_finish(conn, log_id, "error", error_message="No stocks found from any source")
             sys.exit(1)
 
+        # Tag stock types
         df = tag_stocks(df)
 
         if args.limit:
             df = df.head(args.limit)
-            print(f"  Limited to {len(df)} stocks")
+            print("  Limited to {} stocks".format(len(df)))
 
         n = upsert_to_db(conn, df)
-        print(f"  Upserted {n} stocks")
+        print("  Upserted {} stocks".format(n))
+
         log_finish(conn, log_id, "success", rows_processed=len(df), rows_inserted=n)
 
     except Exception as e:
         log_finish(conn, log_id, "error", error_message=str(e))
-        print(f"ERROR: {e}")
+        print("ERROR: {}".format(e))
         raise
     finally:
         conn.close()

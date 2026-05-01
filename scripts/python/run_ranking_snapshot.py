@@ -118,6 +118,42 @@ def collect_category_scores(tree, factor_ranks):
 
 
 # ---------------------------------------------------------------------------
+# Ensure default ranking system exists
+# ---------------------------------------------------------------------------
+
+DEFAULT_OPTIONS = {
+    "winsorize": True,
+    "winsorizeLevel": 5,
+    "sectorNeutral": False,
+    "higherIsBetter": True,
+}
+
+
+def ensure_default_ranking_system(conn):
+    """Create the default ranking system in the DB if it doesn't exist."""
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM ranking_systems WHERE id = 'default'")
+    if cur.fetchone():
+        cur.close()
+        return  # already exists
+
+    print("  Seeding default ranking system into ranking_systems table...")
+    cur.execute("""
+        INSERT INTO ranking_systems (id, name, description, tree, options)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO NOTHING
+    """, (
+        "default",
+        "Default Composite",
+        "Default multi-factor ranking: Value 30%, Quality 25%, Growth 20%, Momentum 25%",
+        PgJson(DEFAULT_TREE),
+        PgJson(DEFAULT_OPTIONS),
+    ))
+    conn.commit()
+    cur.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -137,6 +173,10 @@ if __name__ == "__main__":
         # 1. Load the ranking system tree
         tree = DEFAULT_TREE
         system_id = args.system_id
+
+        # Ensure the default system exists in the DB (needed for FK on ranking_snapshots)
+        ensure_default_ranking_system(conn)
+
         if system_id != "default":
             cur.execute("SELECT tree FROM ranking_systems WHERE id = %s", (system_id,))
             row = cur.fetchone()

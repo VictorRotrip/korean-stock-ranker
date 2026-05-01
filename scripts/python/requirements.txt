@@ -1,7 +1,7 @@
 # Core data sources
 pykrx>=1.0.45
 opendartreader>=0.2.1
-financedatareader>=0.9.50
+finance-datareader>=0.9.50
 
 # Optional: bulk historical price data (faster than pykrx for full loads)
 # marcap>=0.3.2
