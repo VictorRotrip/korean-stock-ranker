@@ -1,10 +1,10 @@
 // =============================================================================
-// Factor Library for Korean Equities
+// Factor Library for Korean Equities — P123-Inspired Multi-Factor Framework
 // =============================================================================
 // Each factor is defined with:
-// - A unique ID
+// - A unique ID (matches Python factor_definitions.py)
 // - Human-readable name and description
-// - Category (value, quality, growth, momentum, risk, short_interest, etc.)
+// - Category (value, quality, growth, momentum, risk, liquidity, sentiment, etc.)
 // - Direction (higher_is_better or lower_is_better)
 // - A compute function that takes stock data and returns the raw value
 //
@@ -13,6 +13,7 @@
 // - Financial data is only used if its filingDate <= the ranking date.
 // - Price-based factors use the price as of the ranking date.
 // - Growth factors compare the latest available annual period to the prior year.
+// - Factor IDs must match the Python factor_definitions.py for ranking consistency.
 // =============================================================================
 
 import type {
@@ -54,10 +55,10 @@ export interface ComputeFactor extends FactorDefinition {
 // VALUE Factors
 // ---------------------------------------------------------------------------
 
-const earningsYield: ComputeFactor = {
-  id: "earnings_yield",
-  name: "Earnings Yield (E/P)",
-  description: "Net income / market cap. Inverse of P/E. Higher means cheaper.",
+const peTtmInv: ComputeFactor = {
+  id: "pe_ttm_inv",
+  name: "P/E TTM (inverted)",
+  description: "Earnings yield = Net Income TTM / Market Cap. Higher means cheaper.",
   category: "value",
   direction: "higher_is_better",
   formula: "Net Income (TTM) / Market Cap",
@@ -71,10 +72,10 @@ const earningsYield: ComputeFactor = {
   },
 };
 
-const bookToMarket: ComputeFactor = {
-  id: "book_to_market",
-  name: "Book-to-Market (B/M)",
-  description: "Book value of equity / market cap. Higher means cheaper (deep value).",
+const priceBook: ComputeFactor = {
+  id: "price_book",
+  name: "Price / Book",
+  description: "Book-to-Market = Total Equity / Market Cap. Higher means cheaper.",
   category: "value",
   direction: "higher_is_better",
   formula: "Total Equity / Market Cap",
@@ -88,10 +89,10 @@ const bookToMarket: ComputeFactor = {
   },
 };
 
-const salesYield: ComputeFactor = {
-  id: "sales_yield",
-  name: "Sales Yield (S/P)",
-  description: "Revenue / market cap. Inverse of P/S. Higher means cheaper.",
+const priceSalesTtmInv: ComputeFactor = {
+  id: "price_sales_ttm_inv",
+  name: "Price/Sales TTM (inverted)",
+  description: "Sales yield = Revenue TTM / Market Cap. Higher means cheaper.",
   category: "value",
   direction: "higher_is_better",
   formula: "Revenue (TTM) / Market Cap",
@@ -105,10 +106,10 @@ const salesYield: ComputeFactor = {
   },
 };
 
-const cashFlowYield: ComputeFactor = {
-  id: "cf_yield",
-  name: "Cash Flow Yield (FCF/P)",
-  description: "Free cash flow / market cap. Higher means cheaper.",
+const fcfMcap: ComputeFactor = {
+  id: "fcf_mcap",
+  name: "FCF / Market Cap",
+  description: "Free cash flow yield. Higher means cheaper.",
   category: "value",
   direction: "higher_is_better",
   formula: "Free Cash Flow / Market Cap",
@@ -122,10 +123,10 @@ const cashFlowYield: ComputeFactor = {
   },
 };
 
-const evToEbitda: ComputeFactor = {
-  id: "ev_ebitda",
-  name: "EV/EBITDA (inverted)",
-  description: "EBITDA / Enterprise Value. Higher means cheaper. (Inverted so higher is better.)",
+const ebitdaEv: ComputeFactor = {
+  id: "ebitda_ev",
+  name: "EBITDA / EV",
+  description: "EBITDA divided by Enterprise Value. Higher means cheaper.",
   category: "value",
   direction: "higher_is_better",
   formula: "EBITDA / (Market Cap + Total Debt - Cash)",
@@ -146,7 +147,7 @@ const dividendYield: ComputeFactor = {
   id: "dividend_yield",
   name: "Dividend Yield",
   description: "Annual dividends paid / market cap.",
-  category: "dividend",
+  category: "value",
   direction: "higher_is_better",
   formula: "Dividends Paid / Market Cap",
   frequency: "quarterly",
@@ -160,13 +161,94 @@ const dividendYield: ComputeFactor = {
   },
 };
 
+const evSalesTtmInv: ComputeFactor = {
+  id: "ev_sales_ttm_inv",
+  name: "EV/Sales TTM (inverted)",
+  description: "Revenue / Enterprise Value. Higher means cheaper.",
+  category: "value",
+  direction: "higher_is_better",
+  formula: "Revenue / (Market Cap + Total Debt - Cash)",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials + price",
+  compute: ({ financials, latestPrice }) => {
+    if (!financials?.revenue || !latestPrice.marketCap) return null;
+    const cash = financials.cash ?? 0;
+    const debt = financials.totalDebt ?? 0;
+    const ev = latestPrice.marketCap + debt - cash;
+    if (ev <= 0) return null;
+    return financials.revenue / ev;
+  },
+};
+
+const grossProfitEv: ComputeFactor = {
+  id: "gross_profit_ev",
+  name: "Gross Profit / EV",
+  description: "Gross Profit divided by Enterprise Value. Higher is better.",
+  category: "value",
+  direction: "higher_is_better",
+  formula: "Gross Profit / (Market Cap + Total Debt - Cash)",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials + price",
+  compute: ({ financials, latestPrice }) => {
+    if (!financials?.grossProfit || !latestPrice.marketCap) return null;
+    const cash = financials.cash ?? 0;
+    const debt = financials.totalDebt ?? 0;
+    const ev = latestPrice.marketCap + debt - cash;
+    if (ev <= 0) return null;
+    return financials.grossProfit / ev;
+  },
+};
+
+const ocfMcap: ComputeFactor = {
+  id: "ocf_mcap",
+  name: "Operating CF / Market Cap",
+  description: "Operating cash flow yield.",
+  category: "value",
+  direction: "higher_is_better",
+  formula: "Operating Cash Flow / Market Cap",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials + price",
+  compute: ({ financials, latestPrice }) => {
+    if (!financials?.operatingCashFlow || !latestPrice.marketCap) return null;
+    if (latestPrice.marketCap === 0) return null;
+    return financials.operatingCashFlow / latestPrice.marketCap;
+  },
+};
+
+const ufcfEv: ComputeFactor = {
+  id: "ufcf_ev",
+  name: "Unlevered FCF / EV",
+  description: "(OCF - Capex + 0.8 * Interest) / EV.",
+  category: "value",
+  direction: "higher_is_better",
+  formula: "(Operating CF - CapEx + 0.8 * Interest Expense) / EV",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials + price",
+  compute: ({ financials, latestPrice }) => {
+    if (!latestPrice.marketCap) return null;
+    const ocf = financials?.operatingCashFlow ?? 0;
+    const capex = financials?.capex ?? 0;
+    const interest = financials?.interestExpense ?? 0;
+    const cash = financials?.cash ?? 0;
+    const debt = financials?.totalDebt ?? 0;
+    const ufcf = ocf - capex + 0.8 * Math.abs(interest);
+    const ev = latestPrice.marketCap + debt - cash;
+    if (ev <= 0) return null;
+    return ufcf / ev;
+  },
+};
+
 // ---------------------------------------------------------------------------
 // QUALITY Factors
 // ---------------------------------------------------------------------------
 
-const returnOnEquity: ComputeFactor = {
-  id: "roe",
-  name: "Return on Equity (ROE)",
+const roeTtm: ComputeFactor = {
+  id: "roe_ttm",
+  name: "ROE TTM",
   description: "Net income / total equity. Measures profitability relative to shareholder equity.",
   category: "quality",
   direction: "higher_is_better",
@@ -181,9 +263,9 @@ const returnOnEquity: ComputeFactor = {
   },
 };
 
-const returnOnAssets: ComputeFactor = {
-  id: "roa",
-  name: "Return on Assets (ROA)",
+const roaTtm: ComputeFactor = {
+  id: "roa_ttm",
+  name: "ROA TTM",
   description: "Net income / total assets.",
   category: "quality",
   direction: "higher_is_better",
@@ -198,9 +280,9 @@ const returnOnAssets: ComputeFactor = {
   },
 };
 
-const grossProfitability: ComputeFactor = {
-  id: "gross_profitability",
-  name: "Gross Profitability (Novy-Marx)",
+const grossProfitAssets: ComputeFactor = {
+  id: "gross_profit_assets",
+  name: "Gross Profit / Assets",
   description: "Gross profit / total assets. Novy-Marx quality factor.",
   category: "quality",
   direction: "higher_is_better",
@@ -215,9 +297,9 @@ const grossProfitability: ComputeFactor = {
   },
 };
 
-const operatingMargin: ComputeFactor = {
-  id: "operating_margin",
-  name: "Operating Margin",
+const operatingMarginTtm: ComputeFactor = {
+  id: "operating_margin_ttm",
+  name: "Operating Margin TTM",
   description: "Operating income / revenue.",
   category: "quality",
   direction: "higher_is_better",
@@ -229,6 +311,40 @@ const operatingMargin: ComputeFactor = {
     if (!financials?.operatingIncome || !financials.revenue) return null;
     if (financials.revenue === 0) return null;
     return financials.operatingIncome / financials.revenue;
+  },
+};
+
+const grossMarginTtm: ComputeFactor = {
+  id: "gross_margin_ttm",
+  name: "Gross Margin TTM",
+  description: "Gross profit / revenue.",
+  category: "quality",
+  direction: "higher_is_better",
+  formula: "Gross Profit / Revenue",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: ({ financials }) => {
+    if (!financials?.grossProfit || !financials.revenue) return null;
+    if (financials.revenue === 0) return null;
+    return financials.grossProfit / financials.revenue;
+  },
+};
+
+const assetTurnoverTtm: ComputeFactor = {
+  id: "asset_turnover_ttm",
+  name: "Asset Turnover TTM",
+  description: "Revenue / total assets.",
+  category: "quality",
+  direction: "higher_is_better",
+  formula: "Revenue / Total Assets",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: ({ financials }) => {
+    if (!financials?.revenue || !financials.totalAssets) return null;
+    if (financials.totalAssets === 0) return null;
+    return financials.revenue / financials.totalAssets;
   },
 };
 
@@ -249,9 +365,9 @@ const debtToEquity: ComputeFactor = {
   },
 };
 
-const interestCoverage: ComputeFactor = {
-  id: "interest_coverage",
-  name: "Interest Coverage",
+const interestCoverageTtm: ComputeFactor = {
+  id: "interest_coverage_ttm",
+  name: "Interest Coverage TTM",
   description: "EBITDA / interest expense. Higher means more ability to service debt.",
   category: "quality",
   direction: "higher_is_better",
@@ -270,9 +386,9 @@ const interestCoverage: ComputeFactor = {
 // GROWTH Factors
 // ---------------------------------------------------------------------------
 
-const revenueGrowth: ComputeFactor = {
-  id: "revenue_growth",
-  name: "Revenue Growth (YoY)",
+const salesGrowthYoy: ComputeFactor = {
+  id: "sales_growth_yoy",
+  name: "Sales Growth YoY",
   description: "Year-over-year revenue growth.",
   category: "growth",
   direction: "higher_is_better",
@@ -287,9 +403,9 @@ const revenueGrowth: ComputeFactor = {
   },
 };
 
-const epsGrowth: ComputeFactor = {
-  id: "eps_growth",
-  name: "EPS Growth (YoY)",
+const epsGrowthYoy: ComputeFactor = {
+  id: "eps_growth_yoy",
+  name: "EPS Growth YoY",
   description: "Year-over-year EPS growth.",
   category: "growth",
   direction: "higher_is_better",
@@ -304,9 +420,9 @@ const epsGrowth: ComputeFactor = {
   },
 };
 
-const operatingIncomeGrowth: ComputeFactor = {
-  id: "op_income_growth",
-  name: "Operating Income Growth (YoY)",
+const opIncomeGrowthYoy: ComputeFactor = {
+  id: "op_income_growth_yoy",
+  name: "Op Income Growth YoY",
   description: "Year-over-year operating income growth.",
   category: "growth",
   direction: "higher_is_better",
@@ -321,20 +437,20 @@ const operatingIncomeGrowth: ComputeFactor = {
   },
 };
 
-const fcfGrowth: ComputeFactor = {
-  id: "fcf_growth",
-  name: "Free Cash Flow Growth (YoY)",
-  description: "Year-over-year free cash flow growth.",
+const netIncomeGrowthYoy: ComputeFactor = {
+  id: "net_income_growth_yoy",
+  name: "Net Income Growth YoY",
+  description: "Year-over-year net income growth.",
   category: "growth",
   direction: "higher_is_better",
-  formula: "(FCF_t - FCF_t-1) / |FCF_t-1|",
+  formula: "(NetIncome_t - NetIncome_t-1) / |NetIncome_t-1|",
   frequency: "quarterly",
   availableInMvp: true,
   dataSource: "DART financials",
   compute: ({ financials, priorFinancials }) => {
-    if (!financials?.freeCashFlow || !priorFinancials?.freeCashFlow) return null;
-    if (priorFinancials.freeCashFlow === 0) return null;
-    return (financials.freeCashFlow - priorFinancials.freeCashFlow) / Math.abs(priorFinancials.freeCashFlow);
+    if (!financials?.netIncome || !priorFinancials?.netIncome) return null;
+    if (priorFinancials.netIncome === 0) return null;
+    return (financials.netIncome - priorFinancials.netIncome) / Math.abs(priorFinancials.netIncome);
   },
 };
 
@@ -434,7 +550,7 @@ const distanceFrom52wHigh: ComputeFactor = {
 // RISK Factors
 // ---------------------------------------------------------------------------
 
-const volatility: ComputeFactor = {
+const volatility60d: ComputeFactor = {
   id: "volatility_60d",
   name: "60-Day Volatility",
   description: "Annualized standard deviation of daily returns over 60 days. Lower is less risky.",
@@ -462,23 +578,82 @@ const volatility: ComputeFactor = {
   },
 };
 
-const turnoverRatio: ComputeFactor = {
-  id: "turnover_ratio",
-  name: "Turnover Ratio (30d avg)",
-  description: "Average daily volume / shares outstanding over 30 days. Proxy for liquidity.",
+const volatility252d: ComputeFactor = {
+  id: "volatility_252d",
+  name: "252-Day Volatility",
+  description: "Annualized standard deviation of daily returns over 252 days. Lower is less risky.",
+  category: "risk",
+  direction: "lower_is_better",
+  formula: "std(daily returns, 252d) * sqrt(252)",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    const recent = priceHistory.slice(-260);
+    if (recent.length < 200) return null;
+
+    const returns: number[] = [];
+    for (let i = 1; i < recent.length; i++) {
+      if (recent[i - 1].close === 0) continue;
+      returns.push((recent[i].close - recent[i - 1].close) / recent[i - 1].close);
+    }
+
+    if (returns.length < 150) return null;
+
+    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const variance = returns.reduce((a, b) => a + (b - mean) ** 2, 0) / (returns.length - 1);
+    return Math.sqrt(variance) * Math.sqrt(252); // annualize
+  },
+};
+
+const maxDrawdown252d: ComputeFactor = {
+  id: "max_drawdown_252d",
+  name: "Max Drawdown 252d",
+  description: "Maximum drawdown over 252 trading days. Lower is better (less risky).",
+  category: "risk",
+  direction: "lower_is_better",
+  formula: "min(cumulative return) over 252 days",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    const recent = priceHistory.slice(-260);
+    if (recent.length < 200) return null;
+
+    let peak = recent[0].close;
+    let maxDD = 0;
+    for (let i = 1; i < recent.length; i++) {
+      if (recent[i].close > peak) {
+        peak = recent[i].close;
+      } else {
+        const dd = (peak - recent[i].close) / peak;
+        if (dd > maxDD) {
+          maxDD = dd;
+        }
+      }
+    }
+    return -maxDD; // negative so that lower (more negative) is worse risk
+  },
+};
+
+const shareTurnover65d: ComputeFactor = {
+  id: "share_turnover_65d",
+  name: "Share Turnover 65d",
+  description: "Median daily volume / shares outstanding over 65 days. Proxy for liquidity.",
   category: "liquidity",
   direction: "higher_is_better",
-  formula: "avg(Volume, 30d) / Shares Outstanding",
+  formula: "median(Volume, 65d) / Shares Outstanding",
   frequency: "daily",
   availableInMvp: true,
   dataSource: "Daily prices",
   compute: ({ priceHistory, latestPrice }) => {
-    const recent = priceHistory.slice(-30);
-    if (recent.length < 10) return null;
+    const recent = priceHistory.slice(-70);
+    if (recent.length < 20) return null;
     if (!latestPrice.sharesOutstanding || latestPrice.sharesOutstanding === 0) return null;
 
-    const avgVolume = recent.reduce((a, b) => a + b.volume, 0) / recent.length;
-    return avgVolume / latestPrice.sharesOutstanding;
+    const volumes = recent.map(p => p.volume).sort((a, b) => a - b);
+    const medianVolume = volumes[Math.floor(volumes.length / 2)];
+    return medianVolume / latestPrice.sharesOutstanding;
   },
 };
 
@@ -486,31 +661,15 @@ const turnoverRatio: ComputeFactor = {
 // SHORT INTEREST Factors
 // ---------------------------------------------------------------------------
 
-const shortSellingRatio: ComputeFactor = {
-  id: "short_ratio",
-  name: "Short Selling Ratio",
-  description: "Short volume as % of total volume. Higher = more bearish sentiment.",
-  category: "short_interest",
-  direction: "lower_is_better",
-  formula: "Short Volume / Total Volume",
-  frequency: "daily",
-  availableInMvp: true,
-  dataSource: "KRX short selling data",
-  compute: ({ shortSelling }) => {
-    if (!shortSelling) return null;
-    return shortSelling.shortRatio / 100; // convert from percentage
-  },
-};
-
-const shortBalanceRatio: ComputeFactor = {
-  id: "short_balance_ratio",
-  name: "Short Balance Ratio",
-  description: "Outstanding short balance / shares. Higher = more shorts outstanding.",
-  category: "short_interest",
+const shortInterestPct: ComputeFactor = {
+  id: "short_interest_pct",
+  name: "Short Interest % Shares",
+  description: "Short balance as % of shares outstanding. Lower = less bearish sentiment.",
+  category: "sentiment",
   direction: "lower_is_better",
   formula: "Short Balance / Shares Outstanding",
   frequency: "daily",
-  availableInMvp: true,
+  availableInMvp: false,
   dataSource: "KRX short selling data",
   compute: ({ shortSelling, latestPrice }) => {
     if (!shortSelling?.shortBalance) return null;
@@ -519,42 +678,201 @@ const shortBalanceRatio: ComputeFactor = {
   },
 };
 
+// Price change factors
+const priceChange120d: ComputeFactor = {
+  id: "price_change_120d",
+  name: "Price Change 120d",
+  description: "Close(0) / Close(120) - 1. 120-day price return.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "(Price_t - Price_t-120) / Price_t-120",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    if (priceHistory.length < 130) return null;
+    const startIdx = priceHistory.length - 130;
+    const startPrice = priceHistory[startIdx].close;
+    const endPrice = priceHistory[priceHistory.length - 1].close;
+    if (startPrice === 0) return null;
+    return (endPrice - startPrice) / startPrice;
+  },
+};
+
+const priceChange180d: ComputeFactor = {
+  id: "price_change_180d",
+  name: "Price Change 180d",
+  description: "Close(0) / Close(180) - 1. 180-day price return.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "(Price_t - Price_t-180) / Price_t-180",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    if (priceHistory.length < 190) return null;
+    const startIdx = priceHistory.length - 190;
+    const startPrice = priceHistory[startIdx].close;
+    const endPrice = priceHistory[priceHistory.length - 1].close;
+    if (startPrice === 0) return null;
+    return (endPrice - startPrice) / startPrice;
+  },
+};
+
+// Technical factors
+const upDownRatio20: ComputeFactor = {
+  id: "up_down_ratio_20",
+  name: "Up/Down Ratio 20d",
+  description: "Ratio of up days to down days over 20 trading days.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "Count(Close_i > Close_i-1) / Count(Close_i < Close_i-1)",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    const recent = priceHistory.slice(-25);
+    if (recent.length < 20) return null;
+    let upDays = 0;
+    let downDays = 0;
+    for (let i = 1; i < recent.length; i++) {
+      if (recent[i].close > recent[i - 1].close) upDays++;
+      else if (recent[i].close < recent[i - 1].close) downDays++;
+    }
+    if (downDays === 0) return upDays > 0 ? 2.0 : 1.0;
+    return upDays / downDays;
+  },
+};
+
+const upDownRatio60: ComputeFactor = {
+  id: "up_down_ratio_60",
+  name: "Up/Down Ratio 60d",
+  description: "Ratio of up days to down days over 60 trading days.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "Count(Close_i > Close_i-1) / Count(Close_i < Close_i-1)",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    const recent = priceHistory.slice(-65);
+    if (recent.length < 60) return null;
+    let upDays = 0;
+    let downDays = 0;
+    for (let i = 1; i < recent.length; i++) {
+      if (recent[i].close > recent[i - 1].close) upDays++;
+      else if (recent[i].close < recent[i - 1].close) downDays++;
+    }
+    if (downDays === 0) return upDays > 0 ? 2.0 : 1.0;
+    return upDays / downDays;
+  },
+};
+
+const upDownRatio120: ComputeFactor = {
+  id: "up_down_ratio_120",
+  name: "Up/Down Ratio 120d",
+  description: "Ratio of up days to down days over 120 trading days.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "Count(Close_i > Close_i-1) / Count(Close_i < Close_i-1)",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    const recent = priceHistory.slice(-130);
+    if (recent.length < 120) return null;
+    let upDays = 0;
+    let downDays = 0;
+    for (let i = 1; i < recent.length; i++) {
+      if (recent[i].close > recent[i - 1].close) upDays++;
+      else if (recent[i].close < recent[i - 1].close) downDays++;
+    }
+    if (downDays === 0) return upDays > 0 ? 2.0 : 1.0;
+    return upDays / downDays;
+  },
+};
+
+const rsi200: ComputeFactor = {
+  id: "rsi_200",
+  name: "RSI 200",
+  description: "Relative Strength Index over 200 days. Scales to 0-100.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "100 - (100 / (1 + (avg gain / avg loss)))",
+  frequency: "daily",
+  availableInMvp: true,
+  dataSource: "Daily prices",
+  compute: ({ priceHistory }) => {
+    const recent = priceHistory.slice(-210);
+    if (recent.length < 200) return null;
+
+    let gains = 0;
+    let losses = 0;
+    for (let i = 1; i < recent.length; i++) {
+      const change = recent[i].close - recent[i - 1].close;
+      if (change > 0) gains += change;
+      else if (change < 0) losses += Math.abs(change);
+    }
+
+    const avgGain = gains / 200;
+    const avgLoss = losses / 200;
+    if (avgLoss === 0) return avgGain > 0 ? 100 : 50;
+
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  },
+};
+
 // ---------------------------------------------------------------------------
 // Factor Registry
 // ---------------------------------------------------------------------------
 
 export const FACTOR_REGISTRY: ComputeFactor[] = [
-  // Value
-  earningsYield,
-  bookToMarket,
-  salesYield,
-  cashFlowYield,
-  evToEbitda,
+  // === VALUE ===
+  peTtmInv,
+  ebitdaEv,
+  priceSalesTtmInv,
+  evSalesTtmInv,
+  grossProfitEv,
+  fcfMcap,
+  ocfMcap,
+  ufcfEv,
+  priceBook,
   dividendYield,
-  // Quality
-  returnOnEquity,
-  returnOnAssets,
-  grossProfitability,
-  operatingMargin,
+  // === QUALITY ===
+  roeTtm,
+  roaTtm,
+  grossProfitAssets,
+  operatingMarginTtm,
+  grossMarginTtm,
+  assetTurnoverTtm,
   debtToEquity,
-  interestCoverage,
-  // Growth
-  revenueGrowth,
-  epsGrowth,
-  operatingIncomeGrowth,
-  fcfGrowth,
-  // Momentum
+  interestCoverageTtm,
+  // === GROWTH ===
+  salesGrowthYoy,
+  opIncomeGrowthYoy,
+  epsGrowthYoy,
+  netIncomeGrowthYoy,
+  // === MOMENTUM ===
+  priceChange120d,
+  priceChange180d,
+  upDownRatio20,
+  upDownRatio60,
+  upDownRatio120,
+  rsi200,
   momentum12m1m,
   momentum6m,
   momentum3m,
   reversal1m,
   distanceFrom52wHigh,
-  // Risk
-  volatility,
-  turnoverRatio,
-  // Short Interest
-  shortSellingRatio,
-  shortBalanceRatio,
+  // === RISK ===
+  volatility60d,
+  volatility252d,
+  maxDrawdown252d,
+  // === LIQUIDITY ===
+  shareTurnover65d,
+  // === SENTIMENT ===
+  shortInterestPct,
 ];
 
 /**
@@ -608,37 +926,59 @@ export const CATEGORY_LABELS: Record<FactorCategory, string> = {
 // When real data is ingested, the factor_coverage DB table overrides these.
 
 const DEFAULT_COVERAGE: Record<string, FactorCoverage> = {
-  // Value — will come from DART (Phase 3), proxy from pykrx (Phase 2)
-  earnings_yield:     { preferredSource: "dart", fallbackSource: "pykrx", dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  book_to_market:     { preferredSource: "dart", fallbackSource: "pykrx", dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  sales_yield:        { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  cf_yield:           { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  ev_ebitda:          { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  dividend_yield:     { preferredSource: "pykrx", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  // Quality — DART only
-  roe:                { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  roa:                { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  gross_profitability:{ preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  operating_margin:   { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  debt_to_equity:     { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  interest_coverage:  { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  // Growth — DART only
-  revenue_growth:     { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  eps_growth:         { preferredSource: "dart", fallbackSource: "pykrx", dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  op_income_growth:   { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  fcf_growth:         { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  // Momentum — marcap/price data (available in Phase 1)
-  momentum_12_1:      { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  momentum_6m:        { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  momentum_3m:        { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  reversal_1m:        { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  dist_52w_high:      { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  // Risk & Liquidity — marcap/price data
-  volatility_60d:     { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  turnover_ratio:     { preferredSource: "marcap", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
-  // Short Interest — pykrx (Phase 2)
-  short_ratio:        { preferredSource: "pykrx", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
-  short_balance_ratio:{ preferredSource: "pykrx", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
+  // === VALUE (earnings-based) ===
+  pe_ttm_inv:         { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  ebitda_ev:          { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === VALUE (sales-based) ===
+  price_sales_ttm_inv:{ preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  ev_sales_ttm_inv:   { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  gross_profit_ev:    { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === VALUE (fcf-based) ===
+  fcf_mcap:           { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  ocf_mcap:           { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  ufcf_ev:            { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === VALUE (asset-based) ===
+  price_book:         { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  dividend_yield:     { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === QUALITY (margins) ===
+  operating_margin_ttm: { preferredSource: "dart", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  gross_margin_ttm:   { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === QUALITY (return on capital) ===
+  roe_ttm:            { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  roa_ttm:            { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  gross_profit_assets:{ preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === QUALITY (turnover) ===
+  asset_turnover_ttm: { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === QUALITY (finances) ===
+  debt_to_equity:     { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  interest_coverage_ttm: { preferredSource: "dart", fallbackSource: null, dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === GROWTH ===
+  sales_growth_yoy:   { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  op_income_growth_yoy: { preferredSource: "dart", fallbackSource: null,  dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  eps_growth_yoy:     { preferredSource: "dart", fallbackSource: null,    dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  net_income_growth_yoy: { preferredSource: "dart", fallbackSource: null, dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === MOMENTUM (price changes) ===
+  price_change_120d:  { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  price_change_180d:  { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === MOMENTUM (technical) ===
+  up_down_ratio_20:   { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  up_down_ratio_60:   { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  up_down_ratio_120:  { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  rsi_200:            { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === MOMENTUM (quarterly returns) ===
+  momentum_12_1:      { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  momentum_6m:        { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  momentum_3m:        { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  reversal_1m:        { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  dist_52w_high:      { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === RISK ===
+  volatility_252d:    { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  volatility_60d:     { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  max_drawdown_252d:  { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === LIQUIDITY ===
+  share_turnover_65d: { preferredSource: "price", fallbackSource: null,   dataStatus: "mock", usesMockData: true, pointInTimeSafe: true,  coverageRatio: 0 },
+  // === SENTIMENT ===
+  short_interest_pct: { preferredSource: "estimates", fallbackSource: null, dataStatus: "mock", usesMockData: true, pointInTimeSafe: false, coverageRatio: 0 },
 };
 
 /**
@@ -666,6 +1006,164 @@ export function getFactorDefinitionsWithCoverage(): (FactorDefinition & { covera
     coverage: getDefaultCoverage(def.id),
   }));
 }
+
+// ---------------------------------------------------------------------------
+// P123-Inspired Ranking System (for client-side use)
+// ---------------------------------------------------------------------------
+
+export const P123_INSPIRED_RANKING_SYSTEM = {
+  id: "p123-inspired",
+  name: "P123 Inspired Korea Multi-Factor",
+  tree: {
+    id: "root",
+    type: "composite" as const,
+    name: "P123 Inspired Korea Multi-Factor",
+    weight: 100,
+    children: [
+      // === Core: Value — 25% ===
+      {
+        id: "cat-value", type: "category" as const, name: "Value", weight: 25,
+        children: [
+          {
+            id: "sub-val-earn", type: "composite" as const, name: "Earnings-Based", weight: 35,
+            children: [
+              { id: "f-ey", type: "factor" as const, name: "Earnings Yield", weight: 50, factorId: "pe_ttm_inv" },
+              { id: "f-ebitda-ev", type: "factor" as const, name: "EBITDA/EV", weight: 50, factorId: "ebitda_ev" },
+            ] as any[],
+          },
+          {
+            id: "sub-val-sales", type: "composite" as const, name: "Sales-Based", weight: 30,
+            children: [
+              { id: "f-ps", type: "factor" as const, name: "Sales Yield", weight: 40, factorId: "price_sales_ttm_inv" },
+              { id: "f-evs", type: "factor" as const, name: "Revenue/EV", weight: 30, factorId: "ev_sales_ttm_inv" },
+              { id: "f-gpev", type: "factor" as const, name: "Gross Profit/EV", weight: 30, factorId: "gross_profit_ev" },
+            ] as any[],
+          },
+          {
+            id: "sub-val-fcf", type: "composite" as const, name: "FCF-Based", weight: 20,
+            children: [
+              { id: "f-fcfy", type: "factor" as const, name: "FCF Yield", weight: 40, factorId: "fcf_mcap" },
+              { id: "f-ocfy", type: "factor" as const, name: "OCF Yield", weight: 30, factorId: "ocf_mcap" },
+              { id: "f-ufcf", type: "factor" as const, name: "Unlevered FCF/EV", weight: 30, factorId: "ufcf_ev" },
+            ] as any[],
+          },
+          {
+            id: "sub-val-asset", type: "composite" as const, name: "Asset-Based", weight: 15,
+            children: [
+              { id: "f-pb", type: "factor" as const, name: "Book/Market", weight: 60, factorId: "price_book" },
+              { id: "f-divy", type: "factor" as const, name: "Dividend Yield", weight: 40, factorId: "dividend_yield" },
+            ] as any[],
+          },
+        ] as any[],
+      },
+      // === Core: Quality — 30% ===
+      {
+        id: "cat-quality", type: "category" as const, name: "Quality", weight: 30,
+        children: [
+          {
+            id: "sub-q-margin", type: "composite" as const, name: "Margins", weight: 25,
+            children: [
+              { id: "f-opmgn", type: "factor" as const, name: "Operating Margin", weight: 60, factorId: "operating_margin_ttm" },
+              { id: "f-gpmgn", type: "factor" as const, name: "Gross Margin", weight: 40, factorId: "gross_margin_ttm" },
+            ] as any[],
+          },
+          {
+            id: "sub-q-roc", type: "composite" as const, name: "Return on Capital", weight: 35,
+            children: [
+              { id: "f-roe", type: "factor" as const, name: "ROE", weight: 35, factorId: "roe_ttm" },
+              { id: "f-roa", type: "factor" as const, name: "ROA", weight: 30, factorId: "roa_ttm" },
+              { id: "f-gpa", type: "factor" as const, name: "Gross Profit/Assets", weight: 35, factorId: "gross_profit_assets" },
+            ] as any[],
+          },
+          {
+            id: "sub-q-turn", type: "composite" as const, name: "Turnover", weight: 15,
+            children: [
+              { id: "f-at", type: "factor" as const, name: "Asset Turnover", weight: 100, factorId: "asset_turnover_ttm" },
+            ] as any[],
+          },
+          {
+            id: "sub-q-fin", type: "composite" as const, name: "Finances", weight: 25,
+            children: [
+              { id: "f-de", type: "factor" as const, name: "Debt/Equity", weight: 50, factorId: "debt_to_equity" },
+              { id: "f-ic", type: "factor" as const, name: "Interest Coverage", weight: 50, factorId: "interest_coverage_ttm" },
+            ] as any[],
+          },
+        ] as any[],
+      },
+      // === Core: Growth — 15% ===
+      {
+        id: "cat-growth", type: "category" as const, name: "Growth", weight: 15,
+        children: [
+          {
+            id: "sub-g-sales", type: "composite" as const, name: "Sales Growth", weight: 35,
+            children: [
+              { id: "f-sg", type: "factor" as const, name: "Sales Growth YoY", weight: 100, factorId: "sales_growth_yoy" },
+            ] as any[],
+          },
+          {
+            id: "sub-g-opinc", type: "composite" as const, name: "Op Income Growth", weight: 30,
+            children: [
+              { id: "f-oig", type: "factor" as const, name: "Op Income Growth YoY", weight: 100, factorId: "op_income_growth_yoy" },
+            ] as any[],
+          },
+          {
+            id: "sub-g-eps", type: "composite" as const, name: "EPS Growth", weight: 35,
+            children: [
+              { id: "f-epsg", type: "factor" as const, name: "EPS Growth YoY", weight: 50, factorId: "eps_growth_yoy" },
+              { id: "f-nig", type: "factor" as const, name: "Net Income Growth YoY", weight: 50, factorId: "net_income_growth_yoy" },
+            ] as any[],
+          },
+        ] as any[],
+      },
+      // === Core: Momentum — 10% ===
+      {
+        id: "cat-momentum", type: "category" as const, name: "Momentum", weight: 10,
+        children: [
+          {
+            id: "sub-m-price", type: "composite" as const, name: "Price Changes", weight: 35,
+            children: [
+              { id: "f-pc120", type: "factor" as const, name: "120d Return", weight: 50, factorId: "price_change_120d" },
+              { id: "f-pc180", type: "factor" as const, name: "180d Return", weight: 50, factorId: "price_change_180d" },
+            ] as any[],
+          },
+          {
+            id: "sub-m-tech", type: "composite" as const, name: "Technical", weight: 35,
+            children: [
+              { id: "f-udr20", type: "factor" as const, name: "UpDown 20d", weight: 20, factorId: "up_down_ratio_20" },
+              { id: "f-udr60", type: "factor" as const, name: "UpDown 60d", weight: 30, factorId: "up_down_ratio_60" },
+              { id: "f-udr120", type: "factor" as const, name: "UpDown 120d", weight: 25, factorId: "up_down_ratio_120" },
+              { id: "f-rsi200", type: "factor" as const, name: "RSI 200", weight: 25, factorId: "rsi_200" },
+            ] as any[],
+          },
+          {
+            id: "sub-m-qtr", type: "composite" as const, name: "Quarterly Returns", weight: 30,
+            children: [
+              { id: "f-m3", type: "factor" as const, name: "3M Return", weight: 30, factorId: "momentum_3m" },
+              { id: "f-m6", type: "factor" as const, name: "6M Return", weight: 35, factorId: "momentum_6m" },
+              { id: "f-m121", type: "factor" as const, name: "12-1M Momentum", weight: 35, factorId: "momentum_12_1" },
+            ] as any[],
+          },
+        ] as any[],
+      },
+      // === Core: Low Volatility — 10% ===
+      {
+        id: "cat-risk", type: "category" as const, name: "Low Volatility", weight: 10,
+        children: [
+          { id: "f-vol252", type: "factor" as const, name: "252d Volatility", weight: 40, factorId: "volatility_252d" },
+          { id: "f-vol60", type: "factor" as const, name: "60d Volatility", weight: 30, factorId: "volatility_60d" },
+          { id: "f-mdd", type: "factor" as const, name: "Max Drawdown 252d", weight: 30, factorId: "max_drawdown_252d" },
+        ] as any[],
+      },
+      // === Core: Sentiment — 10% ===
+      {
+        id: "cat-sentiment", type: "category" as const, name: "Sentiment", weight: 10,
+        children: [
+          { id: "f-si", type: "factor" as const, name: "Short Interest", weight: 100, factorId: "short_interest_pct" },
+        ] as any[],
+      },
+    ] as any[],
+  },
+};
 
 /**
  * UI badge color for data status.

@@ -3,16 +3,27 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, ArrowUpDown, Download, ChevronDown, ChevronUp } from "lucide-react";
+import { ArrowLeft, ArrowUpDown, Download, ChevronDown, ChevronUp, Database, FileText } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { RankingSystem, RankingResult, StockRanking } from "@/types";
 import { getSystemById } from "@/lib/store";
-import { runRanking, collectFactorIds } from "@/lib/ranking-engine";
+import { runRanking, collectFactorIds, DEFAULT_RANKING_SYSTEM } from "@/lib/ranking-engine";
 import { getFactorDefinitions } from "@/lib/factors";
 import { cn, formatKRW, formatPercent, formatNumber, scoreColor, scoreBg } from "@/lib/utils";
+
+// ---------------------------------------------------------------------------
+// Data source detection (client-safe — uses NEXT_PUBLIC_ env var)
+// ---------------------------------------------------------------------------
+
+function getClientDataSource(): "db" | "mock" {
+  const explicit = process.env.NEXT_PUBLIC_DATA_SOURCE;
+  if (explicit === "db") return "db";
+  if (explicit === "mock") return "mock";
+  return "mock"; // default to mock on the client
+}
 
 // ---------------------------------------------------------------------------
 // Score Cell Component
@@ -72,30 +83,32 @@ function StockDetailRow({
       </div>
 
       {/* Individual factor scores */}
-      <div>
-        <p className="text-xs font-medium text-muted-foreground mb-2">Factor Details</p>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-          {Object.entries(stock.factorScores).map(([factorId, data]) => {
-            const def = factorDefs.find(f => f.id === factorId);
-            return (
-              <div
-                key={factorId}
-                className="flex items-center justify-between px-3 py-1.5 rounded border bg-card text-xs"
-              >
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium truncate">{def?.name ?? factorId}</p>
-                  <p className="text-muted-foreground">
-                    Raw: {data.rawValue !== null ? formatNumber(data.rawValue, 4) : "N/A"}
-                  </p>
+      {stock.factorScores && Object.keys(stock.factorScores).length > 0 && (
+        <div>
+          <p className="text-xs font-medium text-muted-foreground mb-2">Factor Details</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+            {Object.entries(stock.factorScores).map(([factorId, data]) => {
+              const def = factorDefs.find(f => f.id === factorId);
+              return (
+                <div
+                  key={factorId}
+                  className="flex items-center justify-between px-3 py-1.5 rounded border bg-card text-xs"
+                >
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium truncate">{def?.name ?? factorId}</p>
+                    <p className="text-muted-foreground">
+                      Raw: {data.rawValue !== null ? formatNumber(data.rawValue, 4) : "N/A"}
+                    </p>
+                  </div>
+                  <div className={cn("ml-2 font-mono font-medium", scoreColor(data.percentileRank))}>
+                    {data.percentileRank.toFixed(1)}
+                  </div>
                 </div>
-                <div className={cn("ml-2 font-mono font-medium", scoreColor(data.percentileRank))}>
-                  {data.percentileRank.toFixed(1)}
-                </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="pt-1">
         <Link href={`/stocks/${stock.ticker}`}>
@@ -109,6 +122,15 @@ function StockDetailRow({
 }
 
 // ---------------------------------------------------------------------------
+// DB snapshot metadata type (extra fields from API response)
+// ---------------------------------------------------------------------------
+
+interface DbRankingResult extends RankingResult {
+  snapshotId?: number;
+  dataSource?: "db" | "mock";
+}
+
+// ---------------------------------------------------------------------------
 // Results Page
 // ---------------------------------------------------------------------------
 
@@ -117,8 +139,10 @@ export default function RankingResultsPage() {
   const id = params.id as string;
 
   const [system, setSystem] = useState<RankingSystem | null>(null);
-  const [result, setResult] = useState<RankingResult | null>(null);
+  const [result, setResult] = useState<DbRankingResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [dataSource, setDataSource] = useState<"db" | "mock">("mock");
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [sortField, setSortField] = useState<string>("rank");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -126,14 +150,52 @@ export default function RankingResultsPage() {
   const factorDefs = useMemo(() => getFactorDefinitions(), []);
 
   useEffect(() => {
-    const sys = getSystemById(id);
-    if (sys) {
-      setSystem(sys);
-      // Run the ranking engine
-      const rankingResult = runRanking(sys);
-      setResult(rankingResult);
+    const source = getClientDataSource();
+    setDataSource(source);
+
+    async function loadResults() {
+      try {
+        if (source === "db") {
+          // DB mode: fetch the pre-computed snapshot from the API
+          console.log(`[results] Data source: db, fetching snapshot for system="${id}"`);
+
+          const res = await fetch(`/api/ranking-snapshots/${id}`);
+          const data = await res.json();
+
+          if (!res.ok) {
+            console.error(`[results] API error:`, data);
+            setError(data.error || "Failed to load ranking snapshot from database.");
+            setLoading(false);
+            return;
+          }
+
+          console.log(`[results] DB snapshot loaded: id=${data.snapshotId}, ${data.rankings?.length} stocks`);
+
+          // For DB mode, use the default system definition for tree/category info
+          // (the system config comes from localStorage OR the default)
+          const sys = getSystemById(id) ?? (id === "default" ? DEFAULT_RANKING_SYSTEM : null);
+          setSystem(sys);
+          setResult(data as DbRankingResult);
+        } else {
+          // Mock mode: run ranking engine client-side
+          console.log(`[results] Data source: mock, running ranking engine for system="${id}"`);
+          const sys = getSystemById(id);
+          if (sys) {
+            setSystem(sys);
+            const rankingResult = runRanking(sys);
+            setResult({ ...rankingResult, dataSource: "mock" });
+          } else {
+            setError("Ranking system not found in localStorage.");
+          }
+        }
+      } catch (err) {
+        console.error("[results] Error loading results:", err);
+        setError(String(err));
+      }
+      setLoading(false);
     }
-    setLoading(false);
+
+    loadResults();
   }, [id]);
 
   const toggleRow = (ticker: string) => {
@@ -181,10 +243,34 @@ export default function RankingResultsPage() {
   }, [result, sortField, sortDir]);
 
   if (loading) {
-    return <div className="text-muted-foreground">Computing rankings...</div>;
+    return <div className="text-muted-foreground">
+      {dataSource === "db" ? "Loading ranking snapshot from database..." : "Computing rankings..."}
+    </div>;
   }
 
-  if (!system || !result) {
+  if (error) {
+    return (
+      <div className="text-center py-12 space-y-4">
+        <Badge variant="destructive" className="text-sm">
+          <Database className="h-3.5 w-3.5 mr-1.5" />
+          Data source: Database
+        </Badge>
+        <p className="text-destructive font-medium">{error}</p>
+        <p className="text-muted-foreground text-sm max-w-md mx-auto">
+          No DB ranking snapshot found. Run{" "}
+          <code className="bg-muted px-1.5 py-0.5 rounded text-xs">python smoke_test.py</code>{" "}
+          or{" "}
+          <code className="bg-muted px-1.5 py-0.5 rounded text-xs">python run_ranking_snapshot.py</code>{" "}
+          to generate one.
+        </p>
+        <Link href="/ranking-systems">
+          <Button variant="outline">Back to Systems</Button>
+        </Link>
+      </div>
+    );
+  }
+
+  if (!result) {
     return (
       <div className="text-center py-12">
         <p className="text-muted-foreground mb-4">Ranking system not found</p>
@@ -195,7 +281,13 @@ export default function RankingResultsPage() {
     );
   }
 
-  const categoryNames = system.tree.children?.map(c => c.name) ?? [];
+  // Derive category names from the result data (works for both mock and DB)
+  const categoryNames = system?.tree.children?.map(c => c.name)
+    ?? (result.rankings.length > 0
+      ? Object.keys(result.rankings[0].categoryScores)
+      : []);
+
+  const dbResult = result as DbRankingResult;
 
   // Sort header component
   const SortHeader = ({ field, label, className }: { field: string; label: string; className?: string }) => (
@@ -220,9 +312,22 @@ export default function RankingResultsPage() {
           </Button>
         </Link>
         <div className="flex-1">
-          <h1 className="text-2xl font-bold tracking-tight">{system.name}</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-bold tracking-tight">{system?.name ?? id}</h1>
+            <Badge
+              variant={dataSource === "db" ? "default" : "secondary"}
+              className="text-xs"
+            >
+              {dataSource === "db" ? (
+                <><Database className="h-3 w-3 mr-1" />Database</>
+              ) : (
+                <><FileText className="h-3 w-3 mr-1" />Mock</>
+              )}
+            </Badge>
+          </div>
           <p className="text-muted-foreground text-sm mt-0.5">
             {result.rankings.length} stocks ranked from {result.universeSize} in universe
+            {" | "}Date: {result.date}
             {" | "}Computed: {new Date(result.computedAt).toLocaleString()}
           </p>
         </div>
@@ -238,8 +343,14 @@ export default function RankingResultsPage() {
         </Card>
         <Card>
           <CardContent className="pt-4 pb-3">
-            <p className="text-xs text-muted-foreground">Factors Used</p>
-            <p className="text-xl font-bold">{collectFactorIds(system.tree).length}</p>
+            <p className="text-xs text-muted-foreground">
+              {dataSource === "db" ? "Snapshot ID" : "Factors Used"}
+            </p>
+            <p className="text-xl font-bold">
+              {dataSource === "db"
+                ? (dbResult.snapshotId ?? "—")
+                : (system ? collectFactorIds(system.tree).length : "—")}
+            </p>
           </CardContent>
         </Card>
         <Card>
@@ -261,6 +372,32 @@ export default function RankingResultsPage() {
           </CardContent>
         </Card>
       </div>
+
+      {/* DB snapshot metadata */}
+      {dataSource === "db" && dbResult.snapshotId && (
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <div className="flex flex-wrap gap-6 text-sm">
+              <div>
+                <span className="text-muted-foreground">Snapshot ID: </span>
+                <span className="font-mono font-medium">{dbResult.snapshotId}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">As-of date: </span>
+                <span className="font-mono font-medium">{result.date}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Stock count: </span>
+                <span className="font-mono font-medium">{result.rankings.length}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Created: </span>
+                <span className="font-mono font-medium">{new Date(result.computedAt).toLocaleString()}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Results table */}
       <Card>

@@ -156,6 +156,50 @@ export const financialStatements = pgTable("financial_statements", {
 }));
 
 // ---------------------------------------------------------------------------
+// Fundamental Snapshots (normalized DART financial data)
+// ---------------------------------------------------------------------------
+// Normalized view of DART financial data that the factor engine will query.
+// Point-in-time safe for ranking operations.
+
+export const fundamentalSnapshots = pgTable("fundamental_snapshots", {
+  id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
+  ticker: varchar("ticker", { length: 10 }).notNull(),
+  periodEnd: date("period_end").notNull(),
+  dataAvailableDate: date("data_available_date").notNull(),
+  fiscalYear: integer("fiscal_year").notNull(),
+  fiscalQuarter: integer("fiscal_quarter"),  // null = annual
+  reportCode: varchar("report_code", { length: 10 }),  // 11011, 11012, etc.
+  consolidatedOrSeparate: varchar("consolidated_or_separate", { length: 15 }).default("consolidated"),
+  // Normalized financials (KRW)
+  revenue: bigint("revenue", { mode: "number" }),
+  grossProfit: bigint("gross_profit", { mode: "number" }),
+  operatingIncome: bigint("operating_income", { mode: "number" }),
+  netIncome: bigint("net_income", { mode: "number" }),
+  eps: doublePrecision("eps"),
+  totalAssets: bigint("total_assets", { mode: "number" }),
+  totalEquity: bigint("total_equity", { mode: "number" }),
+  totalLiabilities: bigint("total_liabilities", { mode: "number" }),
+  totalDebt: bigint("total_debt", { mode: "number" }),
+  cashAndEquivalents: bigint("cash_and_equivalents", { mode: "number" }),
+  inventory: bigint("inventory", { mode: "number" }),
+  operatingCashFlow: bigint("operating_cash_flow", { mode: "number" }),
+  capex: bigint("capex", { mode: "number" }),
+  freeCashFlow: bigint("free_cash_flow", { mode: "number" }),
+  depreciationAmortization: bigint("depreciation_amortization", { mode: "number" }),
+  interestExpense: bigint("interest_expense", { mode: "number" }),
+  ebitda: bigint("ebitda", { mode: "number" }),
+  sharesOutstanding: bigint("shares_outstanding", { mode: "number" }),
+  dividendsPaid: bigint("dividends_paid", { mode: "number" }),
+  source: varchar("source", { length: 20 }).default("dart"),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => ({
+  tickerPeriodIdx: uniqueIndex("fsnap_ticker_period_idx")
+    .on(table.ticker, table.periodEnd, table.fiscalQuarter, table.consolidatedOrSeparate),
+  dataAvailIdx: index("fsnap_data_avail_idx").on(table.dataAvailableDate),
+  tickerFiscalIdx: index("fsnap_ticker_fiscal_idx").on(table.ticker, table.fiscalYear),
+}));
+
+// ---------------------------------------------------------------------------
 // Short Selling Data (from pykrx / KRX)
 // ---------------------------------------------------------------------------
 
@@ -204,6 +248,14 @@ export const factorCoverage = pgTable("factor_coverage", {
   pointInTimeSafe: boolean("point_in_time_safe").default(false),
   // Status label: "real" | "proxy" | "mock" | "unavailable"
   dataStatus: varchar("data_status", { length: 15 }).default("mock"),
+  // Ranking parameters
+  rankDirection: varchar("rank_direction", { length: 20 }),       // "higher_is_better" | "lower_is_better"
+  scope: varchar("scope", { length: 20 }),                        // "universe" | "sector" | "industry"
+  subcategory: varchar("subcategory", { length: 50 }),
+  implementationStatus: varchar("implementation_status", { length: 20 }).default("unavailable"), // "real" | "proxy" | "unavailable" | "mock"
+  missingValuePolicy: varchar("missing_value_policy", { length: 30 }).default("exclude_from_factor"),
+  lookbackDays: integer("lookback_days"),
+  dataSourceDetail: varchar("data_source_detail", { length: 30 }), // "price" | "marcap" | "dart" | "pykrx" | "estimates" | "derived"
   lastUpdated: timestamp("last_updated").defaultNow(),
 });
 
@@ -249,6 +301,9 @@ export const factorSnapshots = pgTable("factor_snapshots", {
   rawValue: doublePrecision("raw_value"),
   percentileRank: doublePrecision("percentile_rank"),
   source: varchar("source", { length: 20 }),  // "marcap" | "pykrx" | "dart" | "mock"
+  scope: varchar("scope", { length: 20 }),    // what scope was used for ranking
+  scopeFallback: boolean("scope_fallback").default(false), // true if fell back to universe scope
+  missingReason: varchar("missing_reason", { length: 30 }), // null if present, "no_data" | "insufficient_history" | "unavailable"
 }, (table) => ({
   pk: primaryKey({ columns: [table.ticker, table.factorId, table.date] }),
   dateIdx: index("factor_snap_date_idx").on(table.date),
@@ -270,4 +325,18 @@ export const ingestionLog = pgTable("ingestion_log", {
   rowsSkipped: integer("rows_skipped").default(0),
   errorMessage: text("error_message"),
   parameters: jsonb("parameters"),  // store CLI args for reproducibility
+});
+
+// ---------------------------------------------------------------------------
+// Ingestion Errors (detailed error tracking)
+// ---------------------------------------------------------------------------
+
+export const ingestionErrors = pgTable("ingestion_errors", {
+  id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
+  scriptName: varchar("script_name", { length: 100 }).notNull(),
+  ticker: varchar("ticker", { length: 10 }),
+  errorType: varchar("error_type", { length: 50 }),  // "timeout" | "api_error" | "parse_error" | etc.
+  errorMessage: text("error_message"),
+  parameters: jsonb("parameters"),
+  createdAt: timestamp("created_at").defaultNow(),
 });

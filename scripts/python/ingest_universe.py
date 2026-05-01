@@ -3,8 +3,9 @@ Ingest KOSPI and KOSDAQ stock universe into Supabase Postgres.
 
 Data sources (in order of preference):
 1. FinanceDataReader.StockListing("KRX") — most reliable, includes sector info
-2. pykrx.stock.get_market_ticker_name() — for name lookups
-3. Hardcoded KNOWN_TICKERS — fallback for smoke test tickers
+2. FinanceDataReader.StockListing("KOSPI"/"KOSDAQ") — fallback for market-specific calls
+3. pykrx.stock.get_market_ticker_name() — for name lookups
+4. Hardcoded KNOWN_TICKERS — fallback for smoke test tickers
 
 Note: pykrx 1.0.51 broke get_market_ticker_list(). This script now uses
 FinanceDataReader as the primary source for the universe.
@@ -13,6 +14,9 @@ Usage:
     python ingest_universe.py
     python ingest_universe.py --tickers 005930,000660,035420
     python ingest_universe.py --limit 20
+    python ingest_universe.py --market KOSPI,KOSDAQ
+    python ingest_universe.py --dry-run
+    python ingest_universe.py --resume
 """
 
 import os
@@ -90,12 +94,65 @@ def log_finish(conn, log_id, status, rows_processed=0, rows_inserted=0,
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_from_fdr(tickers_filter=None):
-    """Load stock universe from FinanceDataReader (primary source)."""
+def load_from_fdr(tickers_filter=None, markets=None):
+    """Load stock universe from FinanceDataReader (primary source).
+
+    Args:
+        tickers_filter: set of tickers to filter, or None for all
+        markets: list of markets ["KOSPI", "KOSDAQ"] or None for both
+
+    Returns:
+        DataFrame with columns: ticker, name, market, sector (optional), industry (optional)
+    """
     import FinanceDataReader as fdr
 
+    if markets is None:
+        markets = ["KOSPI", "KOSDAQ"]
+
     results = []
-    for market in ["KOSPI", "KOSDAQ"]:
+
+    # Try KRX first (covers both markets)
+    try:
+        listing = fdr.StockListing("KRX")
+        if listing is not None and not listing.empty:
+            # Check if market info is available
+            has_market_col = any(col.lower() in ("market", "마켓", "시장") for col in listing.columns)
+
+            if has_market_col:
+                # Normalize column names
+                rename = {}
+                for col in listing.columns:
+                    lc = col.lower()
+                    if lc in ("code", "symbol", "종목코드"):
+                        rename[col] = "ticker"
+                    elif lc in ("name", "종목명"):
+                        rename[col] = "name"
+                    elif lc in ("sector", "섹터"):
+                        rename[col] = "sector"
+                    elif lc in ("industry", "산업"):
+                        rename[col] = "industry"
+                    elif lc in ("market", "마켓", "시장"):
+                        rename[col] = "market"
+                    elif lc in ("listingdate", "상장일"):
+                        rename[col] = "listing_date"
+                listing = listing.rename(columns=rename)
+
+                # Filter by market
+                if "market" in listing.columns:
+                    listing = listing[listing["market"].isin(markets)]
+
+                if tickers_filter:
+                    listing = listing[listing["ticker"].isin(tickers_filter)]
+
+                if not listing.empty:
+                    results.append(listing)
+                    print("  FDR KRX: {} stocks".format(len(listing)))
+                    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=["ticker", "name", "market"])
+    except Exception as e:
+        print("  Warning: FDR StockListing(KRX) failed: {}".format(e))
+
+    # Fallback to market-specific calls
+    for market in markets:
         try:
             listing = fdr.StockListing(market)
             if listing is None or listing.empty:
@@ -205,34 +262,63 @@ def tag_stocks(df):
                 df[col] = False
         return df
 
+    # Preferred: ticker ends in 5,7,8,9 OR name contains preferred keywords
     df["is_preferred"] = df.apply(
         lambda r: str(r.get("ticker", ""))[-1] in ("5", "7", "8", "9")
-        or any(kw in str(r.get("name", "")) for kw in ["우", "우B", "우C", "2우B"]),
+        or any(kw in str(r.get("name", "")) for kw in ["우", "우B", "2우B"]),
         axis=1,
     )
+
+    # SPAC
     df["is_spac"] = df["name"].apply(lambda n: "스팩" in str(n) or "SPAC" in str(n).upper())
 
+    # Financial institutions
     fin_kw = ["은행", "금융", "보험", "증권", "캐피탈", "저축", "카드", "투자", "자산운용", "리스"]
     df["is_financial"] = df["name"].apply(lambda n: any(kw in str(n) for kw in fin_kw))
 
+    # Holding companies
     hold_kw = ["지주", "홀딩스", "Holdings"]
     df["is_holding"] = df["name"].apply(lambda n: any(kw in str(n) for kw in hold_kw))
 
+    # ETF/ETN
+    etf_kw = ["ETF", "KODEX", "TIGER", "KBSTAR", "ARIRANG", "ACE", "SOL", "HANARO", "ETN"]
     df["is_etf"] = df["name"].apply(
-        lambda n: any(kw in str(n).upper() for kw in ["ETF", "KODEX", "TIGER", "KBSTAR", "ARIRANG"])
+        lambda n: any(kw in str(n).upper() for kw in etf_kw)
     )
+
+    # REIT
     df["is_reit"] = df["name"].apply(lambda n: "리츠" in str(n) or "REIT" in str(n).upper())
 
     return df
 
 
 # ---------------------------------------------------------------------------
+# Get existing tickers (for --resume)
+# ---------------------------------------------------------------------------
+
+def get_existing_tickers(conn):
+    """Get set of tickers already in database."""
+    cur = conn.cursor()
+    cur.execute("SELECT ticker FROM stocks")
+    tickers = set(r[0] for r in cur.fetchall())
+    cur.close()
+    return tickers
+
+
+# ---------------------------------------------------------------------------
 # Upsert
 # ---------------------------------------------------------------------------
 
-def upsert_to_db(conn, df):
+def upsert_to_db(conn, df, dry_run=False):
     if df.empty:
         return 0
+
+    if dry_run:
+        print("  [DRY RUN] Would insert/update {} stocks:".format(len(df)))
+        for _, row in df.iterrows():
+            print("    {} ({}) - {}".format(
+                row["ticker"], row["market"], row.get("name", "N/A")))
+        return len(df)
 
     cur = conn.cursor()
     values = [
@@ -269,29 +355,70 @@ def upsert_to_db(conn, df):
 
 
 # ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+def print_summary(df):
+    """Print summary stats about loaded universe."""
+    if df.empty:
+        print("  [Summary] No stocks loaded")
+        return
+
+    total = len(df)
+    kospi = len(df[df["market"] == "KOSPI"]) if "market" in df.columns else 0
+    kosdaq = len(df[df["market"] == "KOSDAQ"]) if "market" in df.columns else 0
+    preferred = len(df[df.get("is_preferred", False)])
+    etf = len(df[df.get("is_etf", False)])
+    spac = len(df[df.get("is_spac", False)])
+    financial = len(df[df.get("is_financial", False)])
+
+    print("  [Summary]")
+    print("    Total: {} stocks".format(total))
+    print("    KOSPI: {}, KOSDAQ: {}".format(kospi, kosdaq))
+    print("    Preferred: {}, ETF: {}, SPAC: {}, Financial: {}".format(
+        preferred, etf, spac, financial))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest Korean stock universe")
     parser.add_argument("--tickers", help="Comma-separated tickers (e.g. 005930,000660)")
+    parser.add_argument("--market", help="Filter by market: KOSPI,KOSDAQ (default: both)")
     parser.add_argument("--limit", type=int, help="Max number of stocks to ingest")
+    parser.add_argument("--dry-run", action="store_true", help="Print what would be inserted but don't write")
+    parser.add_argument("--resume", action="store_true", help="Skip tickers already in DB")
     args = parser.parse_args()
 
     tickers_filter = set(args.tickers.split(",")) if args.tickers else None
+    markets = args.market.split(",") if args.market else None
 
     conn = psycopg2.connect(DATABASE_URL)
-    log_id = log_start(conn, {"tickers": args.tickers, "limit": args.limit})
+
+    # Load existing tickers if --resume
+    existing_tickers = get_existing_tickers(conn) if args.resume else set()
+
+    log_id = log_start(conn, {
+        "tickers": args.tickers,
+        "market": args.market,
+        "limit": args.limit,
+        "dry_run": args.dry_run,
+        "resume": args.resume,
+    })
 
     try:
         print("Loading Korean stock universe...")
         requested = len(tickers_filter) if tickers_filter else "all"
         print("  Requested: {} tickers".format(requested))
+        if args.resume:
+            print("  Resume mode: skipping {} existing tickers".format(len(existing_tickers)))
 
         # Try FDR first (most reliable in 2024/2025)
         df = pd.DataFrame(columns=["ticker", "name", "market"])
         try:
-            df = load_from_fdr(tickers_filter)
+            df = load_from_fdr(tickers_filter, markets)
             print("  Loaded {} stocks from FinanceDataReader".format(len(df)))
         except Exception as e:
             print("  Warning: FDR failed: {}".format(e))
@@ -314,18 +441,35 @@ if __name__ == "__main__":
             df = build_fallback_universe(sorted(tickers_filter))
 
         if df.empty:
-            print("  ERROR: No stocks found from any source. Cannot proceed.")
+            print("ERROR: No stocks found from any source. Cannot proceed.")
             log_finish(conn, log_id, "error", error_message="No stocks found from any source")
+            conn.close()
             sys.exit(1)
 
         # Tag stock types
         df = tag_stocks(df)
 
+        # Apply --resume filter
+        if args.resume and existing_tickers:
+            before = len(df)
+            df = df[~df["ticker"].isin(existing_tickers)]
+            skipped = before - len(df)
+            print("  Skipped {} existing tickers, {} new".format(skipped, len(df)))
+            if df.empty:
+                print("WARNING: All tickers already in database. Nothing to insert.")
+                log_finish(conn, log_id, "success", rows_processed=0, rows_inserted=0,
+                          rows_skipped=skipped)
+                conn.close()
+                print("Done!")
+                sys.exit(0)
+
         if args.limit:
             df = df.head(args.limit)
             print("  Limited to {} stocks".format(len(df)))
 
-        n = upsert_to_db(conn, df)
+        print_summary(df)
+
+        n = upsert_to_db(conn, df, dry_run=args.dry_run)
         print("  Upserted {} stocks".format(n))
 
         log_finish(conn, log_id, "success", rows_processed=len(df), rows_inserted=n)

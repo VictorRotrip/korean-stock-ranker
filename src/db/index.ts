@@ -1,10 +1,14 @@
 // =============================================================================
-// Drizzle ORM Database Client
+// Drizzle ORM Database Client (SERVER-ONLY)
 // =============================================================================
 // Creates a singleton Postgres connection via the `postgres` driver.
 // Only initialised when DATABASE_URL is set — otherwise the app runs on mock data.
+//
+// This module must NEVER be imported from client components.
+// The `server-only` guard will throw a build error if it is.
 // =============================================================================
 
+import "server-only";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import * as schema from "./schema";

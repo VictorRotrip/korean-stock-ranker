@@ -2,17 +2,20 @@
 Ingest daily OHLCV and market cap data into Supabase Postgres.
 
 Data sources (in order):
-1. pykrx per-ticker: stock.get_market_ohlcv(start, end, ticker) — most reliable in 1.0.51
-2. FinanceDataReader: fdr.DataReader(ticker, start, end) — fallback
+1. FinanceDataReader: fdr.DataReader(ticker, start, end) — provides OHLCV + Marcap in single call
+2. pykrx per-ticker: stock.get_market_ohlcv(start, end, ticker) — fallback only
 
-Note: pykrx 1.0.51 broke the market-wide single-date calls.
-This script uses the per-ticker date-range API instead.
+Note: FinanceDataReader is preferred as it provides market cap (marcap) + OHLCV
+in a single call, making it more reliable than pykrx for bulk data.
 
 Usage:
     python ingest_prices.py --tickers 005930,000660 --start-date 2024-01-01 --end-date 2024-12-31
     python ingest_prices.py --start-date 2024-06-01              # all active stocks from DB
     python ingest_prices.py --limit 20 --start-date 2024-01-01   # first 20 tickers in DB
-    python ingest_prices.py --full                                # WARNING: full 2015+ load
+    python ingest_prices.py --full                                # from 2015-01-01
+    python ingest_prices.py --dry-run --limit 5
+    python ingest_prices.py --resume --start-date 2024-06-01
+    python ingest_prices.py --market KOSPI,KOSDAQ --start-date 2024-06-01
 """
 
 import os
@@ -72,9 +75,15 @@ def log_finish(conn, log_id, status, rows_processed=0, rows_inserted=0,
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_db_tickers(conn, limit=None):
+def get_db_tickers(conn, limit=None, market=None):
+    """Get active tickers from DB, optionally filtered by market."""
     cur = conn.cursor()
-    q = "SELECT ticker FROM stocks WHERE is_active = TRUE ORDER BY ticker"
+    q = "SELECT ticker FROM stocks WHERE is_active = TRUE"
+    if market:
+        q += " AND market IN ({})".format(
+            ",".join("'{}'".format(m) for m in market.split(","))
+        )
+    q += " ORDER BY ticker"
     if limit:
         q += " LIMIT {}".format(int(limit))
     cur.execute(q)
@@ -83,25 +92,120 @@ def get_db_tickers(conn, limit=None):
     return tickers
 
 
+def get_latest_date_for_ticker(conn, ticker):
+    """Get the latest date already in daily_prices for a ticker."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT MAX(date) FROM daily_prices WHERE ticker = %s",
+        (ticker,)
+    )
+    result = cur.fetchone()
+    cur.close()
+    if result and result[0]:
+        return result[0]
+    return None
+
+
 def normalize_date(date_str):
-    """Accept YYYY-MM-DD or YYYYMMDD, always return YYYYMMDD."""
-    return date_str.replace("-", "")
-
-
-def to_iso(yyyymmdd):
-    """YYYYMMDD -> YYYY-MM-DD."""
-    s = yyyymmdd.replace("-", "")
+    """Accept YYYY-MM-DD or YYYYMMDD, always return YYYY-MM-DD."""
+    s = date_str.replace("-", "")
     return "{}-{}-{}".format(s[:4], s[4:6], s[6:8])
 
 
+def to_yyyymmdd(iso_date):
+    """YYYY-MM-DD -> YYYYMMDD."""
+    return iso_date.replace("-", "")
+
+
 # ---------------------------------------------------------------------------
-# Data fetching — per-ticker (works in pykrx 1.0.51)
+# Data fetching — FinanceDataReader (primary)
 # ---------------------------------------------------------------------------
 
-def fetch_ohlcv_per_ticker(ticker, start, end):
-    """Fetch OHLCV for a single ticker over a date range.
-    start/end: YYYYMMDD format.
-    Returns DataFrame with columns: date, open, high, low, close, volume.
+def fetch_from_fdr(ticker, start, end):
+    """Fetch OHLCV + Marcap from FinanceDataReader.
+
+    Args:
+        ticker: stock ticker
+        start: YYYY-MM-DD format
+        end: YYYY-MM-DD format
+
+    Returns:
+        tuple: (df, source) where source is "fdr" or None if failed
+               df columns: date, ticker, open, high, low, close, volume, market_cap, shares_outstanding
+    """
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.DataReader(ticker, start, end)
+
+        if df is None or df.empty:
+            return None, None
+
+        df.index.name = "date_idx"
+        df = df.reset_index()
+
+        # Normalize column names (FDR uses English column names usually)
+        rename = {}
+        for col in df.columns:
+            lc = col.lower()
+            if lc in ("date", "date_idx"):
+                rename[col] = "date"
+            elif lc in ("open", "시가"):
+                rename[col] = "open"
+            elif lc in ("high", "고가"):
+                rename[col] = "high"
+            elif lc in ("low", "저가"):
+                rename[col] = "low"
+            elif lc in ("close", "종가"):
+                rename[col] = "close"
+            elif lc in ("volume", "거래량"):
+                rename[col] = "volume"
+            elif lc in ("marcap", "시가총액"):
+                rename[col] = "market_cap"
+        df = df.rename(columns=rename)
+
+        # Convert date to ISO string
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+        else:
+            df["date"] = df.index.strftime("%Y-%m-%d") if hasattr(df.index, "strftime") else df.index
+
+        df["ticker"] = ticker
+
+        # Try to extract shares_outstanding from market_cap / close
+        if "market_cap" in df.columns and "close" in df.columns:
+            df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["shares_outstanding"] = df.apply(
+                lambda r: int(r["market_cap"] / r["close"]) if r["market_cap"] > 0 and r["close"] > 0 else None,
+                axis=1
+            )
+        else:
+            df["shares_outstanding"] = None
+
+        if "trading_value" not in df.columns:
+            df["trading_value"] = None
+
+        return df, "fdr"
+
+    except Exception as e:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Data fetching — pykrx (fallback)
+# ---------------------------------------------------------------------------
+
+def fetch_from_pykrx(ticker, start, end):
+    """Fetch OHLCV from pykrx (fallback only).
+
+    Args:
+        ticker: stock ticker
+        start: YYYYMMDD format
+        end: YYYYMMDD format
+
+    Returns:
+        tuple: (df, source) where source is "pykrx" or None if failed
+               df columns: date, ticker, open, high, low, close, volume
     """
     from pykrx import stock
 
@@ -109,11 +213,10 @@ def fetch_ohlcv_per_ticker(ticker, start, end):
         df = stock.get_market_ohlcv(start, end, ticker)
         time.sleep(0.3)
     except Exception as e:
-        print("pykrx-err:{}".format(e), end=" ")
-        return pd.DataFrame()
+        return None, None
 
     if df is None or df.empty:
-        return pd.DataFrame()
+        return None, None
 
     df.index.name = "date_idx"
     df = df.reset_index()
@@ -131,45 +234,31 @@ def fetch_ohlcv_per_ticker(ticker, start, end):
     }
     df = df.rename(columns=col_map)
 
-    # Convert date index to ISO string
+    # Convert date to ISO string
     if "date_raw" in df.columns:
         df["date"] = pd.to_datetime(df["date_raw"]).dt.strftime("%Y-%m-%d")
     else:
-        # Index was already datetime
         df["date"] = df.index.strftime("%Y-%m-%d") if hasattr(df.index, "strftime") else df.index
 
     df["ticker"] = ticker
+    df["market_cap"] = None
+    df["shares_outstanding"] = None
+    df["trading_value"] = None
 
-    return df
-
-
-def fetch_market_cap_fdr(ticker, start, end):
-    """Try to get market cap from FinanceDataReader."""
-    try:
-        import FinanceDataReader as fdr
-        # FDR uses YYYY-MM-DD
-        iso_start = to_iso(start)
-        iso_end = to_iso(end)
-        df = fdr.DataReader(ticker, iso_start, iso_end)
-        if df is not None and not df.empty and "Marcap" in df.columns:
-            result = df[["Marcap"]].copy()
-            result.columns = ["market_cap"]
-            result.index.name = "date"
-            result = result.reset_index()
-            result["date"] = pd.to_datetime(result["date"]).dt.strftime("%Y-%m-%d")
-            return result
-    except Exception:
-        pass
-    return pd.DataFrame()
+    return df, "pykrx"
 
 
 # ---------------------------------------------------------------------------
 # Upsert
 # ---------------------------------------------------------------------------
 
-def upsert_prices(conn, df):
+def upsert_prices(conn, df, dry_run=False):
+    """Upsert price data, filtering valid rows."""
     if df.empty:
         return 0
+
+    if dry_run:
+        return len(df)
 
     cur = conn.cursor()
     values = []
@@ -184,7 +273,7 @@ def upsert_prices(conn, df):
             row.get("trading_value"),
             row.get("market_cap"),
             row.get("shares_outstanding"),
-            "pykrx",
+            row.get("source", "unknown"),
         ))
 
     if not values:
@@ -200,7 +289,8 @@ def upsert_prices(conn, df):
         close = EXCLUDED.close, volume = EXCLUDED.volume,
         trading_value = COALESCE(EXCLUDED.trading_value, daily_prices.trading_value),
         market_cap = COALESCE(EXCLUDED.market_cap, daily_prices.market_cap),
-        shares_outstanding = COALESCE(EXCLUDED.shares_outstanding, daily_prices.shares_outstanding)
+        shares_outstanding = COALESCE(EXCLUDED.shares_outstanding, daily_prices.shares_outstanding),
+        source = EXCLUDED.source
     """
     execute_values(cur, query, values)
     conn.commit()
@@ -217,37 +307,48 @@ if __name__ == "__main__":
     parser.add_argument("--tickers", help="Comma-separated tickers (e.g. 005930,000660)")
     parser.add_argument("--start-date", help="Start date YYYY-MM-DD (default: 7 days ago)")
     parser.add_argument("--end-date", help="End date YYYY-MM-DD (default: today)")
+    parser.add_argument("--market", help="Filter by market: KOSPI,KOSDAQ")
     parser.add_argument("--limit", type=int, help="Max tickers to process from DB")
+    parser.add_argument("--batch-size", type=int, default=25, help="Upsert every N tickers (default: 25)")
     parser.add_argument("--full", action="store_true", help="Full history from 2015 (SLOW)")
+    parser.add_argument("--resume", action="store_true", help="Skip tickers with full date range coverage")
+    parser.add_argument("--dry-run", action="store_true", help="Print what would be inserted but don't write")
     args = parser.parse_args()
 
     conn = psycopg2.connect(DATABASE_URL)
 
-    # Resolve date range (internal format: YYYYMMDD)
+    # Resolve date range (internal format: YYYY-MM-DD)
     if args.full:
-        start = "20150101"
+        start = "2015-01-01"
     elif args.start_date:
         start = normalize_date(args.start_date)
     else:
-        start = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
-    end = normalize_date(args.end_date) if args.end_date else datetime.now().strftime("%Y%m%d")
+    end = normalize_date(args.end_date) if args.end_date else datetime.now().strftime("%Y-%m-%d")
 
     # Resolve tickers
     if args.tickers:
         tickers = args.tickers.split(",")
     else:
-        tickers = get_db_tickers(conn, args.limit)
+        tickers = get_db_tickers(conn, args.limit, args.market)
         if not tickers:
             print("WARNING: No active tickers in stocks table. Use --tickers or run ingest_universe.py first.")
 
     log_id = log_start(conn, {
         "start": start, "end": end,
-        "tickers": ",".join(tickers[:20]), "count": len(tickers),
-        "limit": args.limit, "full": args.full,
+        "tickers": ",".join(tickers[:20] if len(tickers) > 20 else tickers),
+        "count": len(tickers),
+        "market": args.market,
+        "limit": args.limit,
+        "batch_size": args.batch_size,
+        "full": args.full,
+        "resume": args.resume,
+        "dry_run": args.dry_run,
     })
 
     total_rows = 0
+    batch_data = []
 
     try:
         print("Ingesting prices from {} to {} for {} tickers...".format(start, end, len(tickers)))
@@ -255,33 +356,52 @@ if __name__ == "__main__":
         for i, ticker in enumerate(tickers):
             print("  [{}/{}] {}...".format(i + 1, len(tickers), ticker), end=" ", flush=True)
 
-            # 1. Get OHLCV from pykrx (per-ticker, works in 1.0.51)
-            df = fetch_ohlcv_per_ticker(ticker, start, end)
+            # Check --resume condition
+            if args.resume:
+                latest = get_latest_date_for_ticker(conn, ticker)
+                if latest and latest >= pd.to_datetime(end).date():
+                    print("skip (covered)")
+                    continue
 
-            if df.empty:
+            # 1. Try FDR first (primary source)
+            df, source = fetch_from_fdr(ticker, start, end)
+
+            # 2. Fallback to pykrx if FDR failed or empty
+            if df is None or df.empty:
+                yyyymmdd_start = to_yyyymmdd(start)
+                yyyymmdd_end = to_yyyymmdd(end)
+                df, source = fetch_from_pykrx(ticker, yyyymmdd_start, yyyymmdd_end)
+
+            if df is None or df.empty:
                 print("no data")
                 continue
 
-            # 2. Try to get market cap from FDR
-            mcap_df = fetch_market_cap_fdr(ticker, start, end)
-            if not mcap_df.empty:
-                df = df.merge(mcap_df, on="date", how="left")
-                print("ohlcv={} +mcap".format(len(df)), end=" ", flush=True)
+            # Add source column if not present
+            if "source" not in df.columns:
+                df["source"] = source
+
+            rows = len(df)
+
+            if not args.dry_run:
+                n = upsert_prices(conn, df, dry_run=False)
+                total_rows += n
+                print("{}: {} rows -> {} upserted".format(source, rows, n))
+                batch_data.append((ticker, n))
             else:
-                df["market_cap"] = None
-                print("ohlcv={}".format(len(df)), end=" ", flush=True)
-
-            # Fill missing columns
-            for col in ["trading_value", "shares_outstanding"]:
-                if col not in df.columns:
-                    df[col] = None
-
-            # 3. Upsert
-            n = upsert_prices(conn, df)
-            total_rows += n
-            print("-> {} rows".format(n))
+                print("{}: {} rows".format(source, rows))
+                total_rows += rows
 
             time.sleep(0.2)  # be nice to KRX servers
+
+        # Final batch summary
+        if not args.dry_run:
+            print("\n  Batch summary: {} rows total".format(total_rows))
+
+        if total_rows == 0:
+            print("\nWARNING: Zero rows inserted. Possible causes:")
+            print("  - FinanceDataReader/pykrx could not reach servers")
+            print("  - Date range has no trading days")
+            print("  - All tickers skipped by --resume")
 
         log_finish(conn, log_id, "success",
                    rows_processed=len(tickers), rows_inserted=total_rows)
@@ -295,8 +415,3 @@ if __name__ == "__main__":
         conn.close()
 
     print("\nDone! Inserted/updated {} price records for {} tickers.".format(total_rows, len(tickers)))
-    if total_rows == 0:
-        print("WARNING: Zero rows inserted. Possible causes:")
-        print("  - pykrx could not reach KRX servers")
-        print("  - Date range has no trading days")
-        print("  - Run: python debug_pykrx.py to diagnose")

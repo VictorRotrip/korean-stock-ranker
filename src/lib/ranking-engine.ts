@@ -38,13 +38,13 @@ import type {
 
 import { FACTOR_REGISTRY, type FactorInput } from "./factors";
 import {
-  getStocksSync as getStocks,
-  getLatestPricesSync as getLatestPrices,
-  getLatestFinancialsSync as getLatestFinancials,
-  getPriorFinancialsSync as getPriorFinancials,
-  getStockPriceHistorySync as getStockPriceHistory,
-  getShortSellingDataSync as getShortSellingData,
-} from "./data-service";
+  getStocks,
+  getLatestPrices,
+  getLatestFinancials,
+  getPriorFinancials,
+  getStockPriceHistory,
+  getShortSellingData,
+} from "./mock-data";
 
 // ---------------------------------------------------------------------------
 // 1. Universe Filtering
@@ -565,10 +565,10 @@ export const DEFAULT_RANKING_SYSTEM: RankingSystem = {
         name: "Value",
         weight: 30,
         children: [
-          { id: "f-ey", type: "factor", name: "Earnings Yield", weight: 35, factorId: "earnings_yield" },
-          { id: "f-bm", type: "factor", name: "Book-to-Market", weight: 25, factorId: "book_to_market" },
-          { id: "f-ev", type: "factor", name: "EV/EBITDA (inv)", weight: 25, factorId: "ev_ebitda" },
-          { id: "f-cfy", type: "factor", name: "Cash Flow Yield", weight: 15, factorId: "cf_yield" },
+          { id: "f-ey", type: "factor", name: "Earnings Yield", weight: 35, factorId: "pe_ttm_inv" },
+          { id: "f-bm", type: "factor", name: "Book-to-Market", weight: 25, factorId: "price_book" },
+          { id: "f-ev", type: "factor", name: "EV/EBITDA (inv)", weight: 25, factorId: "ebitda_ev" },
+          { id: "f-cfy", type: "factor", name: "Cash Flow Yield", weight: 15, factorId: "fcf_mcap" },
         ],
       },
       {
@@ -577,9 +577,9 @@ export const DEFAULT_RANKING_SYSTEM: RankingSystem = {
         name: "Quality",
         weight: 25,
         children: [
-          { id: "f-roe", type: "factor", name: "ROE", weight: 35, factorId: "roe" },
-          { id: "f-gp", type: "factor", name: "Gross Profitability", weight: 30, factorId: "gross_profitability" },
-          { id: "f-om", type: "factor", name: "Operating Margin", weight: 20, factorId: "operating_margin" },
+          { id: "f-roe", type: "factor", name: "ROE", weight: 35, factorId: "roe_ttm" },
+          { id: "f-gp", type: "factor", name: "Gross Profitability", weight: 30, factorId: "gross_profit_assets" },
+          { id: "f-om", type: "factor", name: "Operating Margin", weight: 20, factorId: "operating_margin_ttm" },
           { id: "f-de", type: "factor", name: "Debt/Equity", weight: 15, factorId: "debt_to_equity" },
         ],
       },
@@ -589,9 +589,9 @@ export const DEFAULT_RANKING_SYSTEM: RankingSystem = {
         name: "Growth",
         weight: 20,
         children: [
-          { id: "f-revg", type: "factor", name: "Revenue Growth", weight: 40, factorId: "revenue_growth" },
-          { id: "f-epsg", type: "factor", name: "EPS Growth", weight: 35, factorId: "eps_growth" },
-          { id: "f-opg", type: "factor", name: "Op Income Growth", weight: 25, factorId: "op_income_growth" },
+          { id: "f-revg", type: "factor", name: "Revenue Growth", weight: 40, factorId: "sales_growth_yoy" },
+          { id: "f-epsg", type: "factor", name: "EPS Growth", weight: 35, factorId: "eps_growth_yoy" },
+          { id: "f-opg", type: "factor", name: "Op Income Growth", weight: 25, factorId: "op_income_growth_yoy" },
         ],
       },
       {

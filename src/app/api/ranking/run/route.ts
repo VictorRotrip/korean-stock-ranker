@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import type { RankingSystem } from "@/types";
 import { runRanking } from "@/lib/ranking-engine";
 
+export const runtime = "nodejs";
+
 /**
  * POST /api/ranking/run
  * Body: { system: RankingSystem, date?: string }

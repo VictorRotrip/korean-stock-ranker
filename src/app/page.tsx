@@ -3,7 +3,7 @@ import { Layers, TrendingUp, List, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { getStocksSync as getStocks, getLatestPricesSync as getLatestPrices } from "@/lib/data-service";
+import { getStocks, getLatestPrices } from "@/lib/mock-data";
 import { getFactorDefinitions, getCategories, CATEGORY_LABELS } from "@/lib/factors";
 import { formatKRW } from "@/lib/utils";
 

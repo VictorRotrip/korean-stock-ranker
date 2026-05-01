@@ -1,9 +1,8 @@
 """
-Calculate factor values from ingested data and store in factor_snapshots.
+Calculate factor values from ingested data using the P123-inspired factor registry.
 
-This script reads from daily_prices, financial_statements, pykrx_fundamentals,
-and short_selling tables, computes raw factor values and percentile ranks,
-and writes to the factor_snapshots table.
+Reads from daily_prices, financial_statements, and short_selling tables.
+Computes raw factor values and percentile ranks, writes to factor_snapshots.
 
 Usage:
     python calculate_factors.py --tickers 005930,000660,035420,051910,005380 --as-of-date 2024-12-31
@@ -14,12 +13,15 @@ Usage:
 import os
 import sys
 import argparse
-import math
 from datetime import datetime
+from collections import defaultdict
 
 import psycopg2
 from psycopg2.extras import execute_values, Json
 from dotenv import load_dotenv
+
+from factor_definitions import FACTORS, get_implemented_factors
+from factor_calculators import technical, fundamental, industry, sentiment
 
 load_dotenv()
 
@@ -76,32 +78,36 @@ def get_active_tickers(conn, tickers_filter=None, limit=None):
     else:
         q = "SELECT ticker FROM stocks WHERE is_active = TRUE ORDER BY ticker"
         if limit:
-            q += f" LIMIT {int(limit)}"
+            q += " LIMIT {0}".format(int(limit))
         cur.execute(q)
     tickers = [r[0] for r in cur.fetchall()]
     cur.close()
     return tickers
 
 
-def get_latest_price(conn, ticker, as_of):
+def get_stock_metadata(conn, ticker):
+    """Get sector and industry for scope-aware ranking."""
     cur = conn.cursor()
     cur.execute("""
-        SELECT close, market_cap, shares_outstanding, volume
-        FROM daily_prices WHERE ticker = %s AND date <= %s
-        ORDER BY date DESC LIMIT 1
-    """, (ticker, as_of))
+        SELECT sector, industry FROM stocks WHERE ticker = %s
+    """, (ticker,))
     row = cur.fetchone()
     cur.close()
     if row:
-        return {"close": row[0], "market_cap": row[1], "shares_outstanding": row[2], "volume": row[3]}
-    return None
+        return {"sector": row[0], "industry": row[1]}
+    return {"sector": None, "industry": None}
 
 
 def get_price_history(conn, ticker, as_of, days=260):
-    """Get up to `days` trading days of price history ending at as_of."""
+    """Get up to `days` trading days of price history ending at as_of.
+
+    Returns list of tuples: (date, open, high, low, close, volume, trading_value, market_cap, shares_outstanding)
+    Sorted oldest-first.
+    """
     cur = conn.cursor()
     cur.execute("""
-        SELECT date, close, high, volume FROM daily_prices
+        SELECT date, open, high, low, close, volume, trading_value, market_cap, shares_outstanding
+        FROM daily_prices
         WHERE ticker = %s AND date <= %s
         ORDER BY date DESC LIMIT %s
     """, (ticker, as_of, days))
@@ -111,7 +117,10 @@ def get_price_history(conn, ticker, as_of, days=260):
 
 
 def get_latest_financials(conn, ticker, as_of):
-    """Point-in-time safe: only returns data where data_available_date <= as_of."""
+    """Point-in-time safe: only returns data where data_available_date <= as_of.
+
+    Returns dict with financial statement fields.
+    """
     cur = conn.cursor()
     cur.execute("""
         SELECT revenue, cost_of_revenue, gross_profit, operating_income, net_income,
@@ -139,9 +148,15 @@ def get_latest_financials(conn, ticker, as_of):
 
 
 def get_prior_financials(conn, ticker, as_of, latest_period_end):
+    """Get previous year financial statement (point-in-time safe)."""
     cur = conn.cursor()
     cur.execute("""
-        SELECT revenue, operating_income, net_income, eps, free_cash_flow
+        SELECT revenue, cost_of_revenue, gross_profit, operating_income, net_income,
+               eps, total_assets, total_liabilities, total_equity,
+               current_assets, current_liabilities, cash, total_debt,
+               operating_cash_flow, capital_expenditure, free_cash_flow,
+               dividends_paid, ebitda, interest_expense, depreciation,
+               shares_outstanding, period_end
         FROM financial_statements
         WHERE ticker = %s AND data_available_date <= %s
               AND statement_type = 'annual' AND consolidated_or_separate = 'consolidated'
@@ -151,12 +166,18 @@ def get_prior_financials(conn, ticker, as_of, latest_period_end):
     row = cur.fetchone()
     cur.close()
     if row:
-        return {"revenue": row[0], "operating_income": row[1], "net_income": row[2],
-                "eps": row[3], "free_cash_flow": row[4]}
+        cols = ["revenue", "cost_of_revenue", "gross_profit", "operating_income", "net_income",
+                "eps", "total_assets", "total_liabilities", "total_equity",
+                "current_assets", "current_liabilities", "cash", "total_debt",
+                "operating_cash_flow", "capital_expenditure", "free_cash_flow",
+                "dividends_paid", "ebitda", "interest_expense", "depreciation",
+                "shares_outstanding", "period_end"]
+        return dict(zip(cols, row))
     return None
 
 
 def get_short_selling(conn, ticker, as_of):
+    """Get latest short selling data."""
     cur = conn.cursor()
     cur.execute("""
         SELECT short_volume, short_value, short_balance, short_balance_value, short_ratio
@@ -172,158 +193,225 @@ def get_short_selling(conn, ticker, as_of):
 
 
 # ---------------------------------------------------------------------------
-# Factor computations
+# Factor computation orchestration
 # ---------------------------------------------------------------------------
 
-def safe_div(a, b):
-    if a is None or b is None or b == 0:
-        return None
-    return a / b
-
-
-def compute_return(prices, days_back, skip=0):
-    """Compute return from price history [(date, close, high, volume), ...]"""
-    if len(prices) < days_back + skip + 1:
-        return None
-    end_idx = len(prices) - 1 - skip
-    start_idx = end_idx - days_back
-    if start_idx < 0 or end_idx < 0:
-        return None
-    p_start = prices[start_idx][1]  # close
-    p_end = prices[end_idx][1]
-    if not p_start or p_start == 0:
-        return None
-    return (p_end - p_start) / p_start
-
-
-def compute_volatility(prices, window=60):
-    recent = prices[-(window + 1):]
-    if len(recent) < 30:
-        return None
-    returns = []
-    for i in range(1, len(recent)):
-        prev = recent[i - 1][1]
-        curr = recent[i][1]
-        if prev and prev > 0:
-            returns.append((curr - prev) / prev)
-    if len(returns) < 20:
-        return None
-    mean = sum(returns) / len(returns)
-    var = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
-    return math.sqrt(var) * math.sqrt(252)
-
-
 def compute_all_factors(conn, ticker, as_of):
-    """Compute all factors for a single stock. Returns dict of factorId → rawValue."""
-    price = get_latest_price(conn, ticker, as_of)
-    if not price or not price["close"]:
-        return {}
+    """Compute all implemented factors for a single stock.
 
+    Returns:
+        dict: {factorId: rawValue or None, ...}
+        dict: {factorId: missingReason or None, ...}
+    """
     prices = get_price_history(conn, ticker, as_of)
     fin = get_latest_financials(conn, ticker, as_of)
-    prior = get_prior_financials(conn, ticker, as_of, fin["period_end"]) if fin else None
+    prior = None
+    if fin:
+        prior = get_prior_financials(conn, ticker, as_of, fin["period_end"])
     short = get_short_selling(conn, ticker, as_of)
 
-    mcap = price["market_cap"]
+    # Determine latest market cap and shares outstanding
+    market_cap = None
+    shares_outstanding = None
+    if prices:
+        for p in reversed(prices):
+            if p[7] is not None and p[7] > 0:  # market_cap
+                market_cap = p[7]
+            if p[8] is not None and p[8] > 0:  # shares_outstanding
+                shares_outstanding = p[8]
+            if market_cap and shares_outstanding:
+                break
+
     factors = {}
+    missing_reasons = {}
 
-    # --- Value ---
-    if fin and mcap:
-        factors["earnings_yield"] = safe_div(fin["net_income"], mcap)
-        factors["book_to_market"] = safe_div(fin["total_equity"], mcap)
-        factors["sales_yield"] = safe_div(fin["revenue"], mcap)
-        factors["cf_yield"] = safe_div(fin["free_cash_flow"], mcap)
-        cash = fin["cash"] or 0
-        debt = fin["total_debt"] or 0
-        ev = mcap + debt - cash
-        factors["ev_ebitda"] = safe_div(fin["ebitda"], ev) if ev and ev > 0 else None
-        factors["dividend_yield"] = safe_div(abs(fin["dividends_paid"]) if fin["dividends_paid"] else None, mcap)
+    implemented = get_implemented_factors()
 
-    # --- Quality ---
-    if fin:
-        factors["roe"] = safe_div(fin["net_income"], fin["total_equity"])
-        factors["roa"] = safe_div(fin["net_income"], fin["total_assets"])
-        factors["gross_profitability"] = safe_div(fin["gross_profit"], fin["total_assets"])
-        factors["operating_margin"] = safe_div(fin["operating_income"], fin["revenue"])
-        factors["debt_to_equity"] = safe_div(fin["total_debt"], fin["total_equity"])
-        factors["interest_coverage"] = safe_div(
-            fin["ebitda"], abs(fin["interest_expense"]) if fin["interest_expense"] else None)
+    for factor_id, factor_meta in implemented.items():
+        compute_fn_name = factor_meta.get("compute_function")
+        if not compute_fn_name:
+            factors[factor_id] = None
+            missing_reasons[factor_id] = "unavailable"
+            continue
 
-    # --- Growth ---
-    if fin and prior:
-        factors["revenue_growth"] = safe_div(
-            (fin["revenue"] or 0) - (prior["revenue"] or 0),
-            abs(prior["revenue"]) if prior["revenue"] else None)
-        factors["eps_growth"] = safe_div(
-            (fin["eps"] or 0) - (prior["eps"] or 0),
-            abs(prior["eps"]) if prior["eps"] else None)
-        factors["op_income_growth"] = safe_div(
-            (fin["operating_income"] or 0) - (prior["operating_income"] or 0),
-            abs(prior["operating_income"]) if prior["operating_income"] else None)
-        factors["fcf_growth"] = safe_div(
-            (fin["free_cash_flow"] or 0) - (prior["free_cash_flow"] or 0),
-            abs(prior["free_cash_flow"]) if prior["free_cash_flow"] else None)
+        try:
+            raw_value = _compute_single_factor(
+                factor_id, factor_meta, compute_fn_name,
+                prices, fin, prior, market_cap, shares_outstanding, short
+            )
 
-    # --- Momentum ---
-    factors["momentum_12_1"] = compute_return(prices, 231, skip=21)
-    factors["momentum_6m"] = compute_return(prices, 126)
-    factors["momentum_3m"] = compute_return(prices, 63)
-    factors["reversal_1m"] = compute_return(prices, 21)
+            if raw_value is None:
+                missing_reasons[factor_id] = _get_missing_reason(
+                    factor_id, factor_meta, prices, fin, prior, market_cap, shares_outstanding
+                )
+            factors[factor_id] = raw_value
 
-    if len(prices) >= 20:
-        high_52w = max(p[2] for p in prices[-252:] if p[2])  # high column
-        if high_52w and high_52w > 0:
-            factors["dist_52w_high"] = price["close"] / high_52w
+        except Exception as e:
+            factors[factor_id] = None
+            missing_reasons[factor_id] = "computation_error: {0}".format(str(e))
 
-    # --- Risk ---
-    factors["volatility_60d"] = compute_volatility(prices, 60)
+    return factors, missing_reasons
 
-    # --- Liquidity ---
-    recent_30 = prices[-30:]
-    if len(recent_30) >= 10 and price["shares_outstanding"] and price["shares_outstanding"] > 0:
-        avg_vol = sum(p[3] for p in recent_30 if p[3]) / len(recent_30)
-        factors["turnover_ratio"] = avg_vol / price["shares_outstanding"]
 
-    # --- Short Interest ---
-    if short:
-        factors["short_ratio"] = (short["short_ratio"] or 0) / 100.0
-        if short["short_balance"] and price["shares_outstanding"] and price["shares_outstanding"] > 0:
-            factors["short_balance_ratio"] = short["short_balance"] / price["shares_outstanding"]
+def _compute_single_factor(factor_id, factor_meta, compute_fn_name,
+                           prices, fin, prior, market_cap, shares_outstanding, short):
+    """Compute a single factor by dispatching to the appropriate calculator."""
+    data_source = factor_meta.get("data_source")
+    params = factor_meta.get("params", {})
 
-    # Filter out None values
-    return {k: v for k, v in factors.items() if v is not None}
+    if data_source == "price":
+        # Technical factors
+        if not prices or len(prices) < factor_meta.get("lookback_days", 0):
+            return None
+
+        fn = getattr(technical, compute_fn_name, None)
+        if not fn:
+            return None
+
+        if params:
+            return fn(prices, **params)
+        else:
+            return fn(prices)
+
+    elif data_source == "dart":
+        # Fundamental factors
+        if not fin:
+            return None
+
+        fn = getattr(fundamental, compute_fn_name, None)
+        if not fn:
+            return None
+
+        return fn(fin, prior, market_cap, shares_outstanding)
+
+    elif data_source == "short_interest":
+        # Short interest factors
+        fn = getattr(sentiment, compute_fn_name, None)
+        if not fn:
+            return None
+
+        return fn(short, shares_outstanding)
+
+    elif data_source == "estimates":
+        # Sentiment factors (unavailable)
+        fn = getattr(sentiment, compute_fn_name, None)
+        if not fn:
+            return None
+        return fn()
+
+    elif data_source == "derived":
+        # Industry/derived factors (computed in post-processing)
+        return None
+
+    return None
+
+
+def _get_missing_reason(factor_id, factor_meta, prices, fin, prior, market_cap, shares_outstanding):
+    """Determine why a factor is missing."""
+    data_source = factor_meta.get("data_source")
+    lookback = factor_meta.get("lookback_days", 0)
+
+    if data_source == "price":
+        if not prices:
+            return "no_price_data"
+        if len(prices) < lookback:
+            return "insufficient_history"
+        return "no_data"
+
+    elif data_source == "dart":
+        if not fin:
+            return "no_financial_data"
+        return "no_data"
+
+    elif data_source == "short_interest":
+        return "no_short_data"
+
+    elif data_source == "estimates":
+        return "data_unavailable"
+
+    elif data_source == "derived":
+        return "requires_postprocessing"
+
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
 # Percentile ranking
 # ---------------------------------------------------------------------------
 
-# direction: higher raw = higher rank, except for these
-LOWER_IS_BETTER = {"debt_to_equity", "volatility_60d", "short_ratio", "short_balance_ratio", "reversal_1m"}
+def percentile_rank(values_dict, factor_meta):
+    """Rank a factor using provided direction (higher or lower).
 
+    Args:
+        values_dict: {ticker: value} with value or None
+        factor_meta: factor metadata with rank_direction
 
-def percentile_rank_all(ticker_factors, factor_id):
-    """Rank a factor across all tickers. Returns dict ticker → percentile (0-100)."""
-    items = [(t, v) for t, v in ticker_factors.items() if v is not None]
+    Returns:
+        {ticker: percentile_rank (0-100)}
+    """
+    items = [(t, v) for t, v in values_dict.items() if v is not None]
     if len(items) < 2:
+        # If only 0 or 1 values, return 50% for the one that exists
         return {t: 50.0 for t, _ in items}
 
     items.sort(key=lambda x: x[1])
     n = len(items)
     ranks = {}
+
     i = 0
     while i < n:
         j = i
         while j < n and items[j][1] == items[i][1]:
             j += 1
-        avg_rank = (i + j - 1) / 2
+        avg_rank = (i + j - 1) / 2.0
+        pct = (avg_rank / (n - 1)) * 100.0 if n > 1 else 50.0
+
+        # Invert if lower is better
+        if factor_meta.get("rank_direction") == "lower":
+            pct = 100.0 - pct
+
         for k in range(i, j):
-            pct = (avg_rank / (n - 1)) * 100 if n > 1 else 50
-            if factor_id in LOWER_IS_BETTER:
-                pct = 100 - pct
             ranks[items[k][0]] = round(pct, 2)
+
         i = j
+
     return ranks
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: industry momentum and other derived factors
+# ---------------------------------------------------------------------------
+
+def compute_industry_factors(all_raw_factors, ticker_industry_map, tickers):
+    """Compute industry momentum factors after individual factors are done.
+
+    Updates all_raw_factors in place with industry_momentum_26w and industry_momentum_52w.
+    """
+    # Precompute individual returns for all tickers
+    price_returns_126d = {}
+    price_returns_252d = {}
+
+    for ticker in tickers:
+        ret_126 = all_raw_factors.get(ticker, {}).get("momentum_6m")
+        ret_252 = all_raw_factors.get(ticker, {}).get("price_change_180d")  # closest to 252d
+        if ret_126 is not None:
+            price_returns_126d[ticker] = ret_126
+        if ret_252 is not None:
+            price_returns_252d[ticker] = ret_252
+
+    # Compute industry momentum for each ticker
+    for ticker in tickers:
+        if "industry_momentum_26w" not in all_raw_factors.get(ticker, {}):
+            result = industry.calc_industry_momentum(
+                ticker, ticker_industry_map, price_returns_126d
+            )
+            all_raw_factors.setdefault(ticker, {})["industry_momentum_26w"] = result
+
+        if "industry_momentum_52w" not in all_raw_factors.get(ticker, {}):
+            result = industry.calc_industry_momentum(
+                ticker, ticker_industry_map, price_returns_252d
+            )
+            all_raw_factors.setdefault(ticker, {})["industry_momentum_52w"] = result
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +438,77 @@ def upsert_factor_snapshots(conn, rows):
 
 
 # ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def print_coverage_summary(all_raw_factors, all_missing_reasons, all_factor_ids, tickers):
+    """Print summary of factor coverage and computation."""
+    print("")
+    print("=== FACTOR COVERAGE SUMMARY ===")
+    print("")
+
+    category_coverage = defaultdict(lambda: {"computed": 0, "total": 0})
+    factor_coverage = {}
+
+    for factor_id in all_factor_ids:
+        factor_meta = FACTORS.get(factor_id, {})
+        category = factor_meta.get("category", "unknown")
+
+        computed = 0
+        missing = 0
+
+        for ticker in tickers:
+            if all_raw_factors.get(ticker, {}).get(factor_id) is not None:
+                computed += 1
+            else:
+                missing += 1
+
+        factor_coverage[factor_id] = {
+            "computed": computed,
+            "missing": missing,
+            "coverage_pct": round(100.0 * computed / len(tickers), 1) if tickers else 0,
+        }
+        category_coverage[category]["computed"] += computed
+        category_coverage[category]["total"] += len(tickers)
+
+    # Per-factor summary
+    print("Per-Factor Coverage:")
+    for factor_id in sorted(all_factor_ids):
+        cov = factor_coverage[factor_id]
+        factor_meta = FACTORS.get(factor_id, {})
+        print("  {0}: {1}/{2} ({3}%)".format(
+            factor_id,
+            cov["computed"],
+            len(tickers),
+            cov["coverage_pct"]
+        ))
+
+    # Per-category summary
+    print("")
+    print("Per-Category Coverage:")
+    for category in sorted(category_coverage.keys()):
+        cov = category_coverage[category]
+        pct = round(100.0 * cov["computed"] / cov["total"], 1) if cov["total"] > 0 else 0
+        print("  {0}: {1}/{2} ({3}%)".format(
+            category,
+            cov["computed"],
+            cov["total"],
+            pct
+        ))
+
+    # Overall
+    total_computed = sum(cov["computed"] for cov in factor_coverage.values())
+    total_possible = len(all_factor_ids) * len(tickers)
+    print("")
+    print("Overall: {0}/{1} factor-stock combinations computed ({2}%)".format(
+        total_computed,
+        total_possible,
+        round(100.0 * total_computed / total_possible, 1) if total_possible > 0 else 0
+    ))
+    print("")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -368,44 +527,61 @@ if __name__ == "__main__":
 
     log_id = log_start(conn, {"as_of_date": as_of, "tickers": args.tickers, "limit": args.limit})
 
-    print(f"Calculating factors for {len(tickers)} stocks as of {as_of}...")
+    print("Calculating factors for {0} stocks as of {1}...".format(len(tickers), as_of))
 
     try:
-        # Step 1: compute raw values for all tickers
-        all_raw = {}  # ticker → {factorId → rawValue}
-        for i, ticker in enumerate(tickers):
-            factors = compute_all_factors(conn, ticker, as_of)
-            all_raw[ticker] = factors
-            n_factors = len(factors)
-            if (i + 1) % 50 == 0 or i == len(tickers) - 1:
-                print(f"  [{i+1}/{len(tickers)}] {ticker}: {n_factors} factors computed")
+        # Step 1: Load stock metadata for industry/sector grouping
+        ticker_metadata = {}
+        ticker_industry_map = {}
+        for ticker in tickers:
+            meta = get_stock_metadata(conn, ticker)
+            ticker_metadata[ticker] = meta
+            ticker_industry_map[ticker] = meta.get("industry") or meta.get("sector") or ticker
 
-        # Step 2: collect all factor IDs
+        # Step 2: Compute raw values for all tickers
+        all_raw = {}  # ticker -> {factorId: rawValue}
+        all_missing = {}  # ticker -> {factorId: missingReason}
+        for i, ticker in enumerate(tickers):
+            factors, missing = compute_all_factors(conn, ticker, as_of)
+            all_raw[ticker] = factors
+            all_missing[ticker] = missing
+            n_factors = sum(1 for v in factors.values() if v is not None)
+            if (i + 1) % 50 == 0 or i == len(tickers) - 1:
+                print("  [{0}/{1}] {2}: {3} factors computed".format(i + 1, len(tickers), ticker, n_factors))
+
+        # Step 3: Compute industry momentum
+        compute_industry_factors(all_raw, ticker_industry_map, tickers)
+
+        # Step 4: Collect all factor IDs
         all_factor_ids = set()
         for factors in all_raw.values():
             all_factor_ids.update(factors.keys())
 
-        print(f"  {len(all_factor_ids)} unique factors across {len(tickers)} stocks")
+        print("  {0} unique factors across {1} stocks".format(len(all_factor_ids), len(tickers)))
 
-        # Step 3: percentile rank each factor
+        # Step 5: Percentile rank each factor (universe scope only for now)
         snapshot_rows = []
         for factor_id in sorted(all_factor_ids):
-            raw_by_ticker = {t: fs.get(factor_id) for t, fs in all_raw.items() if factor_id in fs}
-            ranks = percentile_rank_all(raw_by_ticker, factor_id)
+            factor_meta = FACTORS.get(factor_id, {})
+            raw_by_ticker = {t: fs.get(factor_id) for t, fs in all_raw.items()}
+            ranks = percentile_rank(raw_by_ticker, factor_meta)
 
-            for ticker, pct in ranks.items():
+            for ticker, pct_rank in ranks.items():
                 raw = raw_by_ticker[ticker]
-                snapshot_rows.append((ticker, factor_id, as_of, raw, pct, "calculated"))
+                snapshot_rows.append((ticker, factor_id, as_of, raw, pct_rank, "calculated"))
 
-        # Step 4: upsert
+        # Step 6: Upsert
         n = upsert_factor_snapshots(conn, snapshot_rows)
-        print(f"  Upserted {n} factor snapshot rows")
+        print("  Upserted {0} factor snapshot rows".format(n))
+
+        # Step 7: Print coverage summary
+        print_coverage_summary(all_raw, all_missing, all_factor_ids, tickers)
 
         log_finish(conn, log_id, "success", rows_processed=len(tickers), rows_inserted=n)
 
     except Exception as e:
         log_finish(conn, log_id, "error", error_message=str(e))
-        print(f"ERROR: {e}")
+        print("ERROR: {0}".format(e))
         raise
     finally:
         conn.close()

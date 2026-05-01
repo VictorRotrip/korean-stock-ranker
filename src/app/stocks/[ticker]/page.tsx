@@ -8,7 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { getStocksSync as getStocks, getStockPriceHistorySync as getStockPriceHistory, getLatestFinancialsSync as getLatestFinancials, getLatestPricesSync as getLatestPrices } from "@/lib/data-service";
+import { getStocks, getStockPriceHistory, getLatestFinancials, getLatestPrices } from "@/lib/mock-data";
 import { FACTOR_REGISTRY, type FactorInput } from "@/lib/factors";
 import { formatKRW, formatPercent, formatNumber, cn, scoreColor } from "@/lib/utils";
 import type { Stock, FinancialStatement } from "@/types";

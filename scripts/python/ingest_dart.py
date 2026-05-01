@@ -8,6 +8,10 @@ This script:
 2. Stores periodEnd, filingDate, AND dataAvailableDate for point-in-time safety
 3. Extracts all major financial line items (IS, BS, CF)
 4. Uses consolidated statements when available, separate as fallback
+5. Downloads and caches corpCode.xml for unknown tickers
+6. Supports --resume to skip already-ingested data
+7. Supports --dry-run for preview
+8. Retries with exponential backoff on failures
 
 Usage:
     python ingest_dart.py --tickers 005930 --year 2024
@@ -17,6 +21,11 @@ Usage:
     python ingest_dart.py --full                  # All years 2015-present
     python ingest_dart.py --quarterly --year 2024 # Include quarterly reports
     python ingest_dart.py --timeout 30            # Per-request timeout in seconds
+    python ingest_dart.py --resume                # Skip already-ingested ticker/year/report combos
+    python ingest_dart.py --skip-existing         # Alias for --resume
+    python ingest_dart.py --rate-limit 2.0        # Seconds between API calls
+    python ingest_dart.py --dry-run               # Show what would be fetched
+    python ingest_dart.py --retry 3               # Retry failed requests 3 times
 
 Rate limit: DART API allows ~1000 requests/day for free keys.
 """
@@ -28,7 +37,10 @@ import argparse
 import time
 import urllib.request
 import urllib.error
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from io import BytesIO
 
 # Windows console UTF-8 fix
 try:
@@ -50,6 +62,7 @@ SCRIPT_NAME = "ingest_dart"
 
 DART_API_BASE = "https://opendart.fss.or.kr/api"
 DEFAULT_TIMEOUT = 30
+DART_CORP_CODES_CACHE = "scripts/python/.dart_corp_codes.json"
 
 # DART report type codes
 REPORT_TYPES = {
@@ -80,45 +93,137 @@ KNOWN_CORP_CODES = {
 
 
 # ---------------------------------------------------------------------------
-# DART API helpers (direct HTTP, no OpenDartReader)
+# Corp code resolution (download + cache corpCode.xml)
 # ---------------------------------------------------------------------------
 
-def dart_api_call(endpoint, params, timeout):
-    """Make a DART API call, return parsed JSON or None."""
-    params["crtfc_key"] = DART_API_KEY
-    query = "&".join("{}={}".format(k, v) for k, v in params.items())
-    url = "{}/{}.json?{}".format(DART_API_BASE, endpoint, query)
+def download_corp_codes(timeout):
+    """Download and cache DART corpCode.xml to .dart_corp_codes.json.
+
+    Returns: dict of {stock_code: corp_code} or {} if download fails.
+    Uses cached JSON if available.
+    """
+    # Check cache first
+    if os.path.exists(DART_CORP_CODES_CACHE):
+        try:
+            with open(DART_CORP_CODES_CACHE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached and isinstance(cached, dict):
+                print("  Using cached corp codes ({} entries)".format(len(cached)))
+                return cached
+        except Exception as e:
+            print("  Cache read error: {}".format(e))
+
+    # Download corpCode.xml as ZIP
+    print("  Downloading DART corpCode.xml...", end=" ", flush=True)
+    url = "{}/corpCode.xml?crtfc_key={}".format(DART_API_BASE, DART_API_KEY)
 
     try:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data
-    except urllib.error.URLError as e:
-        print("network error: {}".format(e.reason), end=" ", flush=True)
-        return None
+            zip_data = resp.read()
+        print("OK", flush=True)
     except Exception as e:
-        if "timed out" in str(e).lower() or "timeout" in str(e).lower():
-            print("TIMEOUT({}s)".format(timeout), end=" ", flush=True)
-            return None
-        print("error: {}".format(str(e)[:60]), end=" ", flush=True)
-        return None
+        print("FAILED: {}".format(str(e)[:40]), flush=True)
+        return {}
+
+    # Extract and parse CORPCODE.xml from ZIP
+    try:
+        with zipfile.ZipFile(BytesIO(zip_data)) as zf:
+            xml_content = zf.read("CORPCODE.xml").decode("utf-8")
+    except Exception as e:
+        print("  ZIP extraction error: {}".format(e))
+        return {}
+
+    # Parse XML
+    result = {}
+    try:
+        root = ET.fromstring(xml_content)
+        for item in root.findall("list"):
+            stock_code = item.findtext("stock_code", "").strip()
+            corp_code = item.findtext("corp_code", "").strip()
+            # Only include listed companies (stock_code non-empty)
+            if stock_code and corp_code:
+                result[stock_code] = corp_code
+    except Exception as e:
+        print("  XML parse error: {}".format(e))
+        return {}
+
+    # Cache to file
+    try:
+        os.makedirs(os.path.dirname(DART_CORP_CODES_CACHE), exist_ok=True)
+        with open(DART_CORP_CODES_CACHE, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+        print("  Cached {} corp codes to {}".format(len(result), DART_CORP_CODES_CACHE))
+    except Exception as e:
+        print("  Cache write error: {}".format(e))
+
+    return result
 
 
-def resolve_corp_code(ticker, timeout):
+# ---------------------------------------------------------------------------
+# DART API helpers (direct HTTP, no OpenDartReader)
+# ---------------------------------------------------------------------------
+
+def dart_api_call(endpoint, params, timeout, retry_count=2):
+    """Make a DART API call with retry on failure.
+
+    Returns parsed JSON or None.
+    On failure, retries up to retry_count times with exponential backoff (1s, 2s, 4s).
+    """
+    params["crtfc_key"] = DART_API_KEY
+    query = "&".join("{}={}".format(k, v) for k, v in params.items())
+    url = "{}/{}.json?{}".format(DART_API_BASE, endpoint, query)
+
+    attempt = 0
+    while attempt <= retry_count:
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data
+        except urllib.error.URLError as e:
+            if attempt < retry_count:
+                backoff = 2 ** attempt
+                print("retry({}s)".format(backoff), end=" ", flush=True)
+                time.sleep(backoff)
+                attempt += 1
+            else:
+                print("network error: {}".format(str(e.reason)[:30]), end=" ", flush=True)
+                return None
+        except Exception as e:
+            if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                if attempt < retry_count:
+                    backoff = 2 ** attempt
+                    print("retry({}s)".format(backoff), end=" ", flush=True)
+                    time.sleep(backoff)
+                    attempt += 1
+                else:
+                    print("TIMEOUT({}s)".format(timeout), end=" ", flush=True)
+                    return None
+            else:
+                if attempt < retry_count:
+                    backoff = 2 ** attempt
+                    print("retry({}s)".format(backoff), end=" ", flush=True)
+                    time.sleep(backoff)
+                    attempt += 1
+                else:
+                    print("error: {}".format(str(e)[:30]), end=" ", flush=True)
+                    return None
+
+
+def resolve_corp_code(ticker, corp_code_map):
     """Get DART corp_code for a stock ticker.
-    Uses KNOWN_CORP_CODES cache first, then API lookup."""
+
+    Uses KNOWN_CORP_CODES cache first, then corp_code_map (from XML download).
+    """
     if ticker in KNOWN_CORP_CODES:
         return KNOWN_CORP_CODES[ticker]
-
-    # Try the company search API
-    data = dart_api_call("company", {"corp_code": ""}, timeout)
-    # This won't work without corp_code — we need the XML for unknown tickers.
-    # For unknown tickers, try listing filings by stock code instead.
+    if ticker in corp_code_map:
+        return corp_code_map[ticker]
     return None
 
 
-def find_filing(ticker, corp_code, year, report_code, timeout):
+def find_filing(ticker, corp_code, year, report_code, timeout, retry_count=2):
     """Find a filing and return (filing_date, receipt_no) or (None, None)."""
     params = {
         "corp_code": corp_code,
@@ -129,7 +234,7 @@ def find_filing(ticker, corp_code, year, report_code, timeout):
     }
 
     print("    list...", end=" ", flush=True)
-    data = dart_api_call("list", params, timeout)
+    data = dart_api_call("list", params, timeout, retry_count)
 
     if not data or data.get("status") != "000":
         status = data.get("status", "?") if data else "no response"
@@ -190,7 +295,7 @@ def find_filing(ticker, corp_code, year, report_code, timeout):
     return filing_date, receipt_no
 
 
-def fetch_finstate(corp_code, year, report_code, fs_div, timeout):
+def fetch_finstate(corp_code, year, report_code, fs_div, timeout, retry_count=2):
     """Fetch financial statement data. Returns list of account dicts or None."""
     params = {
         "corp_code": corp_code,
@@ -199,7 +304,7 @@ def fetch_finstate(corp_code, year, report_code, fs_div, timeout):
         "fs_div": fs_div,
     }
 
-    data = dart_api_call("fnlttSinglAcntAll", params, timeout)
+    data = dart_api_call("fnlttSinglAcntAll", params, timeout, retry_count)
 
     if not data or data.get("status") != "000":
         return None
@@ -299,8 +404,10 @@ ACCOUNT_MAP = {
     "매출액": "revenue",
     "수익(매출액)": "revenue",
     "영업수익": "revenue",
+    "이자수익": "interest_income",
     "매출원가": "cost_of_revenue",
     "매출총이익": "gross_profit",
+    "매출총이익(손실)": "gross_profit",
     "영업이익": "operating_income",
     "영업이익(손실)": "operating_income",
     "당기순이익": "net_income",
@@ -314,21 +421,36 @@ ACCOUNT_MAP = {
     "유동자산": "current_assets",
     "유동부채": "current_liabilities",
     "현금및현금성자산": "cash",
+    "현금": "cash",
     "단기차입금": "short_term_debt",
+    "장기차입금": "long_term_debt",
+    "사채": "bonds_payable",
+    "차입금": "total_debt",
+    "재고자산": "inventory",
+    "이익잉여금": "retained_earnings",
     # Cash Flow
     "영업활동현금흐름": "operating_cash_flow",
     "영업활동으로인한현금흐름": "operating_cash_flow",
     "투자활동현금흐름": "investing_cash_flow",
+    "유형자산의 취득": "capex_tangible",
+    "무형자산의 취득": "capex_intangible",
+    "감가상각비": "depreciation",
+    "무형자산상각비": "amortization",
+    "이자비용": "interest_expense",
+    "배당금지급": "dividends_paid",
+    "배당금의지급": "dividends_paid",
+    # Shares
+    "발행주식수": "shares_outstanding",
 }
 
 
-def fetch_financials(ticker, corp_code, year, report_code, timeout):
+def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=2):
     """Fetch a single financial statement from DART via direct API.
     Returns a dict or None."""
     rt = REPORT_TYPES[report_code]
 
     # 1. Find filing date
-    filing_date, receipt_no = find_filing(ticker, corp_code, year, report_code, timeout)
+    filing_date, receipt_no = find_filing(ticker, corp_code, year, report_code, timeout, retry_count)
     if not filing_date:
         return None
 
@@ -339,11 +461,11 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout):
     # 2. Fetch financial statement — try consolidated first
     consolidated = "consolidated"
     print("CFS...", end=" ", flush=True)
-    accounts = fetch_finstate(corp_code, year, report_code, "CFS", timeout)
+    accounts = fetch_finstate(corp_code, year, report_code, "CFS", timeout, retry_count)
 
     if not accounts:
         print("OFS...", end=" ", flush=True)
-        accounts = fetch_finstate(corp_code, year, report_code, "OFS", timeout)
+        accounts = fetch_finstate(corp_code, year, report_code, "OFS", timeout, retry_count)
         consolidated = "separate"
 
     if not accounts:
@@ -379,6 +501,47 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout):
         result.setdefault("gross_profit", result["revenue"] - result["cost_of_revenue"])
     if "total_assets" in result and "total_liabilities" in result:
         result.setdefault("total_equity", result["total_assets"] - result["total_liabilities"])
+
+    # total_debt = short_term_debt + long_term_debt + bonds_payable
+    if "total_debt" not in result:
+        total_debt = 0
+        if "short_term_debt" in result:
+            total_debt += result["short_term_debt"]
+        if "long_term_debt" in result:
+            total_debt += result["long_term_debt"]
+        if "bonds_payable" in result:
+            total_debt += result["bonds_payable"]
+        if total_debt > 0:
+            result["total_debt"] = total_debt
+
+    # capex = capex_tangible + capex_intangible (negative = outflows)
+    if "capex" not in result:
+        capex = 0
+        if "capex_tangible" in result:
+            capex += result["capex_tangible"]
+        if "capex_intangible" in result:
+            capex += result["capex_intangible"]
+        if capex != 0:
+            result["capex"] = capex
+
+    # free_cash_flow = operating_cash_flow - abs(capex)
+    if "free_cash_flow" not in result:
+        if "operating_cash_flow" in result and ("capex" in result or "capital_expenditure" in result):
+            ocf = result.get("operating_cash_flow", 0)
+            capex_val = result.get("capex") or result.get("capital_expenditure", 0)
+            result["free_cash_flow"] = ocf - abs(capex_val)
+
+    # ebitda = operating_income + depreciation + amortization
+    if "ebitda" not in result:
+        ebitda = 0
+        if "operating_income" in result:
+            ebitda += result["operating_income"]
+        if "depreciation" in result:
+            ebitda += result["depreciation"]
+        if "amortization" in result:
+            ebitda += result["amortization"]
+        if ebitda != 0:
+            result["ebitda"] = ebitda
 
     field_count = sum(1 for k in result if k not in (
         "ticker", "period_end", "filing_date", "data_available_date",
@@ -475,6 +638,47 @@ def upsert_dart_filing(conn, record):
     cur.close()
 
 
+def log_ingestion_error(conn, ticker, error_type, error_message, parameters=None):
+    """Log a per-ticker ingestion error."""
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ingestion_errors (script_name, ticker, error_type, error_message, parameters)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (SCRIPT_NAME, ticker, error_type, error_message, psycopg2.extras.Json(parameters)))
+    conn.commit()
+    cur.close()
+
+
+def get_already_ingested(conn, tickers, years, report_codes):
+    """Get set of (ticker, year, report_code) already in financial_statements."""
+    if not tickers:
+        return set()
+
+    placeholders = ",".join(["%s"] * len(tickers))
+    query = """
+        SELECT DISTINCT ticker, fiscal_year, statement_type
+        FROM financial_statements
+        WHERE ticker IN ({})
+        AND fiscal_year IN ({})
+    """.format(
+        placeholders,
+        ",".join(["%s"] * len(years))
+    )
+    cur = conn.cursor()
+    cur.execute(query, tickers + years)
+    results = cur.fetchall()
+    cur.close()
+
+    # Map statement_type back to report_code
+    type_to_code = {
+        "annual": "11011",
+        "Q1": "11013",
+        "Q2": "11012",
+        "Q3": "11014",
+    }
+    return {(r[0], r[1], type_to_code.get(r[2], r[2])) for r in results}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -491,6 +695,16 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, help="Max tickers from DB")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                         help="Per-request timeout in seconds (default: {})".format(DEFAULT_TIMEOUT))
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip ticker/year/report combos already in financial_statements")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Alias for --resume")
+    parser.add_argument("--rate-limit", type=float, default=1.0,
+                        help="Seconds between API calls (default: 1.0)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be fetched without making API calls")
+    parser.add_argument("--retry", type=int, default=2,
+                        help="Number of retries per failed request (default: 2)")
     args = parser.parse_args()
 
     if not DATABASE_URL:
@@ -513,11 +727,17 @@ if __name__ == "__main__":
         if args.limit:
             tickers = tickers[:args.limit]
 
-    # --- Resolve corp codes (skip tickers without known corp codes) ---
+    # --- Download corp codes (cache to file) ---
+    print()
+    print("Corp Code Resolution")
+    print("=" * 50)
+    corp_code_map = download_corp_codes(args.timeout)
+
+    # --- Resolve corp codes ---
     ticker_corp = {}
     skipped_tickers = []
     for t in tickers:
-        cc = KNOWN_CORP_CODES.get(t)
+        cc = resolve_corp_code(t, corp_code_map)
         if cc:
             ticker_corp[t] = cc
         else:
@@ -526,7 +746,6 @@ if __name__ == "__main__":
     if skipped_tickers:
         print("Warning: No DART corp code for {} tickers (skipping): {}".format(
             len(skipped_tickers), ", ".join(skipped_tickers[:10])))
-        print("  Add them to KNOWN_CORP_CODES in ingest_dart.py or use OpenDartReader for bulk lookup.")
 
     if not ticker_corp:
         print("No tickers with known DART corp codes. Nothing to do.")
@@ -558,19 +777,35 @@ if __name__ == "__main__":
             report_codes += ["11013", "11012", "11014"]
 
     timeout_secs = args.timeout
+    rate_limit = args.rate_limit
+    retry_count = args.retry
+    dry_run = args.dry_run
+    resume = args.resume or args.skip_existing
+
     active_tickers = list(ticker_corp.keys())
     total_calls = len(active_tickers) * len(years) * len(report_codes)
+
+    # Get already-ingested combos if resuming
+    already_ingested = set()
+    if resume:
+        already_ingested = get_already_ingested(conn, active_tickers, years, report_codes)
+        print("Resume mode: skipping {} already-ingested combos".format(len(already_ingested)))
 
     log_id = log_start(conn, {
         "tickers": ",".join(active_tickers),
         "years": years,
         "reports": report_codes,
         "timeout": timeout_secs,
+        "rate_limit": rate_limit,
+        "retry": retry_count,
+        "dry_run": dry_run,
+        "resume": resume,
     })
 
     total_processed = 0
     total_inserted = 0
     total_skipped = 0
+    total_errors = 0
 
     try:
         print()
@@ -584,7 +819,13 @@ if __name__ == "__main__":
             report_codes,
             ", ".join(REPORT_TYPES[rc]["label"] for rc in report_codes)))
         print("  Timeout: {}s per request".format(timeout_secs))
-        print("  Total API calls: ~{}".format(total_calls))
+        print("  Rate limit: {}s between calls".format(rate_limit))
+        print("  Retries: {} per failed request".format(retry_count))
+        print("  Total potential API calls: ~{}".format(total_calls))
+        if dry_run:
+            print("  DRY RUN: no API calls will be made")
+        if resume:
+            print("  RESUME: skipping already-ingested combos")
         print("=" * 50)
         print()
 
@@ -594,20 +835,44 @@ if __name__ == "__main__":
             for year in years:
                 for report_code in report_codes:
                     label = REPORT_TYPES[report_code]["label"]
+
+                    # Skip if already ingested
+                    if (ticker, year, report_code) in already_ingested:
+                        total_skipped += 1
+                        print("  [{}/{}] {} / {} / {} -- SKIPPED (already ingested)".format(
+                            total_processed + 1, total_calls, ticker, year, label))
+                        total_processed += 1
+                        continue
+
                     total_processed += 1
                     print("  [{}/{}] {} / {} / {}  ".format(
                         total_processed, total_calls, ticker, year, label),
                         end="", flush=True)
 
-                    result = fetch_financials(ticker, corp_code, year, report_code, timeout_secs)
-
-                    if result:
-                        records.append(result)
-                        upsert_dart_filing(conn, result)
+                    if dry_run:
+                        print("DRY RUN (would fetch)", flush=True)
                     else:
-                        total_skipped += 1
+                        try:
+                            result = fetch_financials(ticker, corp_code, year, report_code,
+                                                     timeout_secs, retry_count)
 
-                    time.sleep(1.0)  # Rate limiting
+                            if result:
+                                records.append(result)
+                                upsert_dart_filing(conn, result)
+                            else:
+                                total_skipped += 1
+                                log_ingestion_error(conn, ticker, "no_data",
+                                                   "fetch_financials returned None",
+                                                   {"year": year, "report_code": report_code})
+                        except Exception as e:
+                            total_errors += 1
+                            error_msg = str(e)[:200]
+                            print("\nERROR: {}".format(error_msg))
+                            log_ingestion_error(conn, ticker, "fetch_error",
+                                               error_msg,
+                                               {"year": year, "report_code": report_code})
+
+                        time.sleep(rate_limit)
 
             # Batch upsert every 50 records
             if len(records) >= 50:
@@ -617,7 +882,7 @@ if __name__ == "__main__":
                 records = []
 
         # Final upsert
-        if records:
+        if records and not dry_run:
             n = upsert_financials(conn, records)
             total_inserted += n
             print("  -> Upserted {} records".format(n))
@@ -654,5 +919,5 @@ if __name__ == "__main__":
         conn.close()
 
     print()
-    print("Done! Processed {}, inserted {}, skipped {}.".format(
-        total_processed, total_inserted, total_skipped))
+    print("Done! Processed {}, inserted {}, skipped {}, errors {}.".format(
+        total_processed, total_inserted, total_skipped, total_errors))

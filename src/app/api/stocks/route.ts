@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
-import { getStocksSync as getStocks, getLatestPricesSync as getLatestPrices } from "@/lib/data-service";
+import { getStocks, getLatestPrices } from "@/lib/mock-data";
+
+export const runtime = "nodejs";
 
 /**
  * GET /api/stocks
