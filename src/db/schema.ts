@@ -285,6 +285,7 @@ export const rankingSnapshots = pgTable("ranking_snapshots", {
   date: date("date").notNull(),
   results: jsonb("results").notNull(),
   universeSize: integer("universe_size"),
+  universeName: text("universe_name"),
   computedAt: timestamp("computed_at").defaultNow(),
 }, (table) => ({
   systemDateIdx: index("rs_system_date_idx").on(table.rankingSystemId, table.date),
@@ -294,7 +295,14 @@ export const rankingSnapshots = pgTable("ranking_snapshots", {
 // Factor Snapshots (precomputed factor values per stock per date)
 // ---------------------------------------------------------------------------
 
+// Factor snapshots are universe-scoped: percentile ranks depend on the
+// peer set, so the same (ticker, factor_id, date) can have different
+// percentile_ranks under "test_50" and "test_200_large". The
+// universe_name column was added by migration 004; the old PK on
+// (ticker, factor_id, date) must be dropped manually in Supabase SQL
+// Editor (see scripts/sql/004_universe_aware_factor_snapshots.sql).
 export const factorSnapshots = pgTable("factor_snapshots", {
+  universeName: text("universe_name"),
   ticker: varchar("ticker", { length: 10 }).notNull(),
   factorId: varchar("factor_id", { length: 50 }).notNull(),
   date: date("date").notNull(),
@@ -305,8 +313,9 @@ export const factorSnapshots = pgTable("factor_snapshots", {
   scopeFallback: boolean("scope_fallback").default(false), // true if fell back to universe scope
   missingReason: varchar("missing_reason", { length: 30 }), // null if present, "no_data" | "insufficient_history" | "unavailable"
 }, (table) => ({
-  pk: primaryKey({ columns: [table.ticker, table.factorId, table.date] }),
+  pk: primaryKey({ columns: [table.universeName, table.ticker, table.factorId, table.date] }),
   dateIdx: index("factor_snap_date_idx").on(table.date),
+  universeDateIdx: index("factor_snapshots_universe_date_idx").on(table.universeName, table.date),
 }));
 
 // ---------------------------------------------------------------------------

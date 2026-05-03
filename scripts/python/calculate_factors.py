@@ -2,12 +2,28 @@
 Calculate factor values from ingested data using the P123-inspired factor registry.
 
 Reads from daily_prices, financial_statements, and short_selling tables.
-Computes raw factor values and percentile ranks, writes to factor_snapshots.
+Computes raw factor values AND percentile ranks within the universe, then
+writes both to factor_snapshots.
+
+SCORING METHOD: percentile_rank (NOT z-score)
+    - Each factor is ranked 0-100 within the universe scope.
+    - Direction is honored via factor_definitions.rank_direction
+      ("higher" = higher raw value gets higher rank;
+       "lower"  = lower raw value gets higher rank, e.g. for P/E or volatility).
+    - Tied raw values get the average percentile rank.
+    - Missing raw values stay missing (None) and are excluded from ranking.
+      They are NOT silently coerced to 0 or 50 here; missing-data policy
+      is applied later in run_ranking_snapshot.py.
+
+The factor_snapshots table stores raw_value separately from percentile_rank,
+so downstream consumers can re-rank with different scopes (sector / industry)
+without losing the underlying signal.
 
 Usage:
     python calculate_factors.py --tickers 005930,000660,035420,051910,005380 --as-of-date 2024-12-31
     python calculate_factors.py --as-of-date 2024-12-31              # all active stocks
     python calculate_factors.py --as-of-date 2024-12-31 --limit 50   # first 50 tickers
+    python calculate_factors.py --universe test_200_large --as-of-date 2024-12-30
 """
 
 import os
@@ -222,6 +238,22 @@ def compute_all_factors(conn, ticker, as_of):
             if market_cap and shares_outstanding:
                 break
 
+    # Fallback: compute market_cap from shares * close if not available from prices
+    if market_cap is None and prices:
+        latest_close = None
+        for p in reversed(prices):
+            if p[4] is not None and p[4] > 0:  # close
+                latest_close = p[4]
+                break
+        if latest_close:
+            # Try shares from financial statements first
+            if fin and fin.get("shares_outstanding") and fin["shares_outstanding"] > 0:
+                shares_outstanding = fin["shares_outstanding"]
+                market_cap = latest_close * shares_outstanding
+            # Try shares from daily_prices
+            elif shares_outstanding and shares_outstanding > 0:
+                market_cap = latest_close * shares_outstanding
+
     factors = {}
     missing_reasons = {}
 
@@ -419,14 +451,30 @@ def compute_industry_factors(all_raw_factors, ticker_industry_map, tickers):
 # ---------------------------------------------------------------------------
 
 def upsert_factor_snapshots(conn, rows):
-    """rows: list of (ticker, factor_id, date, raw_value, percentile_rank, source)"""
+    """Write factor snapshot rows, scoped by universe_name.
+
+    Args:
+        rows: list of (universe_name, ticker, factor_id, date, raw_value,
+                       percentile_rank, source)
+
+    Universe-awareness: percentile ranks depend on the universe in which the
+    stock was ranked, so the unique key includes universe_name. Two universes
+    can both have a factor_snapshot row for the same (ticker, factor_id, date)
+    with different percentile ranks -- they live side by side.
+
+    Requires migration 004 (adds universe_name column and unique index).
+    The OLD primary key on (ticker, factor_id, date) must be dropped manually
+    in Supabase SQL Editor; see scripts/sql/004_universe_aware_factor_snapshots.sql
+    for the exact statement.
+    """
     if not rows:
         return 0
     cur = conn.cursor()
     query = """
-    INSERT INTO factor_snapshots (ticker, factor_id, date, raw_value, percentile_rank, source)
+    INSERT INTO factor_snapshots
+        (universe_name, ticker, factor_id, date, raw_value, percentile_rank, source)
     VALUES %s
-    ON CONFLICT (ticker, factor_id, date) DO UPDATE SET
+    ON CONFLICT (universe_name, ticker, factor_id, date) DO UPDATE SET
         raw_value = EXCLUDED.raw_value,
         percentile_rank = EXCLUDED.percentile_rank,
         source = EXCLUDED.source
@@ -516,18 +564,67 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calculate factor values from DB data")
     parser.add_argument("--as-of-date", required=True, help="Ranking date YYYY-MM-DD")
     parser.add_argument("--tickers", help="Comma-separated tickers")
+    parser.add_argument("--universe", help="Use named universe from universe_memberships table")
     parser.add_argument("--limit", type=int, help="Max tickers to process")
+    parser.add_argument("--exclude-financials", action="store_true",
+                        help="Exclude financial-sector stocks (banks, insurance, securities)")
     args = parser.parse_args()
 
     as_of = args.as_of_date
-    tickers_filter = args.tickers.split(",") if args.tickers else None
+    tickers_filter = None
+
+    # Universe scoping for factor_snapshots writes.
+    # If --universe is set, percentile ranks are tagged with that universe.
+    # Otherwise we use a synthetic name so legacy CLI flows still write
+    # somewhere, but they won't pollute named-universe rankings.
+    if args.universe:
+        universe_name_for_scope = args.universe
+    elif args.tickers:
+        universe_name_for_scope = "__tickers_filter__"
+    else:
+        universe_name_for_scope = "__all_active__"
+
+    if args.tickers:
+        tickers_filter = args.tickers.split(",")
+    elif args.universe:
+        cur = psycopg2.connect(DATABASE_URL).cursor()
+        cur.execute("SELECT ticker FROM universe_memberships WHERE universe_name = %s ORDER BY ticker", (args.universe,))
+        tickers_filter = [r[0] for r in cur.fetchall()]
+        cur.close()
+        if not tickers_filter:
+            print("ERROR: Universe '{}' not found or empty".format(args.universe))
+            sys.exit(1)
+        print("  Universe '{}': {} tickers".format(args.universe, len(tickers_filter)))
 
     conn = psycopg2.connect(DATABASE_URL)
     tickers = get_active_tickers(conn, tickers_filter, args.limit)
 
-    log_id = log_start(conn, {"as_of_date": as_of, "tickers": args.tickers, "limit": args.limit})
+    # Exclude financial-sector stocks if requested
+    if args.exclude_financials:
+        cur = conn.cursor()
+        placeholders = ",".join(["%s"] * len(tickers))
+        cur.execute("""
+            SELECT ticker FROM stocks
+            WHERE ticker IN ({0})
+              AND (is_financial = TRUE
+                   OR sector ILIKE '%%금융%%' OR sector ILIKE '%%bank%%'
+                   OR sector ILIKE '%%보험%%' OR sector ILIKE '%%insurance%%'
+                   OR industry ILIKE '%%금융%%' OR industry ILIKE '%%은행%%'
+                   OR industry ILIKE '%%증권%%' OR industry ILIKE '%%securities%%')
+        """.format(placeholders), tuple(tickers))
+        financial_tickers = set(r[0] for r in cur.fetchall())
+        cur.close()
+        if financial_tickers:
+            tickers = [t for t in tickers if t not in financial_tickers]
+            print("Excluded {0} financial-sector stocks: {1}".format(
+                len(financial_tickers), ", ".join(sorted(financial_tickers))))
+
+    log_id = log_start(conn, {"as_of_date": as_of, "tickers": args.tickers, "limit": args.limit,
+                               "exclude_financials": args.exclude_financials})
 
     print("Calculating factors for {0} stocks as of {1}...".format(len(tickers), as_of))
+    print("  Scoring method: percentile_rank (0-100, ties get average rank)")
+    print("  Universe scope: {0}".format(universe_name_for_scope))
 
     try:
         # Step 1: Load stock metadata for industry/sector grouping
@@ -549,6 +646,10 @@ if __name__ == "__main__":
             if (i + 1) % 50 == 0 or i == len(tickers) - 1:
                 print("  [{0}/{1}] {2}: {3} factors computed".format(i + 1, len(tickers), ticker, n_factors))
 
+        # Diagnostic: market_cap source summary
+        mcap_count = sum(1 for t in tickers if all_raw.get(t, {}).get("market_cap") is not None)
+        print("  Market cap available: {0}/{1} stocks".format(mcap_count, len(tickers)))
+
         # Step 3: Compute industry momentum
         compute_industry_factors(all_raw, ticker_industry_map, tickers)
 
@@ -559,7 +660,9 @@ if __name__ == "__main__":
 
         print("  {0} unique factors across {1} stocks".format(len(all_factor_ids), len(tickers)))
 
-        # Step 5: Percentile rank each factor (universe scope only for now)
+        # Step 5: Percentile rank each factor within the chosen universe scope.
+        # Each row carries universe_name so multiple universes can store
+        # ranks for the same (ticker, factor_id, date) without collision.
         snapshot_rows = []
         for factor_id in sorted(all_factor_ids):
             factor_meta = FACTORS.get(factor_id, {})
@@ -568,7 +671,10 @@ if __name__ == "__main__":
 
             for ticker, pct_rank in ranks.items():
                 raw = raw_by_ticker[ticker]
-                snapshot_rows.append((ticker, factor_id, as_of, raw, pct_rank, "calculated"))
+                snapshot_rows.append((
+                    universe_name_for_scope, ticker, factor_id, as_of,
+                    raw, pct_rank, "calculated",
+                ))
 
         # Step 6: Upsert
         n = upsert_factor_snapshots(conn, snapshot_rows)

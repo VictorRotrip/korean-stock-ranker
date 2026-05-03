@@ -278,25 +278,69 @@ export interface RankingResult {
   /** Metadata */
   universeSize: number;
   computedAt: string;
+  // ----- Snapshot-level coverage / scoring metadata (DB mode only) -----
+  universeName?: string | null;
+  scoringMethod?: string;            // e.g. "percentile_rank"
+  missingCategoryPolicy?: string;    // "neutral" | "exclude" | "renormalize"
+  thresholds?: {
+    min_active_weight_coverage?: number;
+    min_category_count?: number;
+    min_factor_count?: number;
+  } | null;
+  globallyUnavailableCategories?: string[];
+  globallyActiveCategories?: string[];
+  categoryWeights?: Record<string, number> | null;
+  passedCount?: number;
+  insufficientCount?: number;
+  includeInsufficientCoverage?: boolean;
+}
+
+export type CategoryStatus =
+  | "available"
+  | "missing_imputed"
+  | "missing"
+  | "missing_renormalized"
+  | "globally_unavailable";
+
+export interface CategoryScoreDetail {
+  score: number | null;
+  weight: number;
+  coverage: string;        // e.g. "9/12"
+  status: CategoryStatus;
 }
 
 export interface StockRanking {
-  rank: number;
+  rank: number | null;
   ticker: string;
   name: string;
   market: Market;
   sector?: string;
   industry?: string;
   marketCap: number;
-  /** Final composite score (0-100) */
+  /** Final composite score (0-100). May be null if no composite computable. */
   compositeScore: number;
-  /** Scores per category node */
+  /** Scores per category node (legacy simple shape: {name: score}) */
   categoryScores: Record<string, number>;
+  /** Per-category detail with status flags (status: available/imputed/missing/etc) */
+  categoryDetails?: Record<string, CategoryScoreDetail>;
   /** Scores per individual factor */
   factorScores: Record<string, {
     rawValue: number | null;
     percentileRank: number;
   }>;
+  // ----- Coverage metadata (post-fix snapshots only) -----
+  /** "passed" = passed minimum coverage; "insufficient" = failed and excluded from main ranking */
+  coverageStatus?: "passed" | "insufficient";
+  passesMinimum?: boolean;
+  /** Real-data weight / globally-active total weight, in [0, 1] */
+  activeWeightCoverage?: number;
+  /** Includes neutral-imputed weight, in [0, 1] */
+  compositeWeightUsed?: number;
+  activeCategoryCount?: number;
+  activeCategories?: string[];
+  imputedCategories?: string[];
+  factorCount?: number;
+  failureReasons?: string[];
 }
 
 // ---------------------------------------------------------------------------

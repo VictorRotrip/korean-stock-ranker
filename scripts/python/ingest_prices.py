@@ -38,6 +38,9 @@ if not DATABASE_URL:
 
 SCRIPT_NAME = "ingest_prices"
 
+# Module-level flag to track if we've logged FDR columns yet
+_fdr_columns_logged = False
+
 
 # ---------------------------------------------------------------------------
 # Ingestion logging
@@ -118,21 +121,64 @@ def to_yyyymmdd(iso_date):
 
 
 # ---------------------------------------------------------------------------
+# Data fetching — pykrx market cap (supplemental)
+# ---------------------------------------------------------------------------
+
+def fetch_market_cap_from_pykrx(ticker, start_yyyymmdd, end_yyyymmdd, timeout=10):
+    """Fetch market cap + shares + trading value from pykrx per-ticker.
+
+    Args:
+        ticker: stock ticker
+        start_yyyymmdd: YYYYMMDD format
+        end_yyyymmdd: YYYYMMDD format
+        timeout: timeout in seconds (unused, but kept for compatibility)
+
+    Returns:
+        DataFrame with columns: date, market_cap, shares_outstanding, trading_value
+        or None if failed
+    """
+    from pykrx import stock
+    try:
+        df = stock.get_market_cap_by_date(start_yyyymmdd, end_yyyymmdd, ticker)
+        time.sleep(0.3)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    df.index.name = "date_idx"
+    df = df.reset_index()
+    col_map = {
+        "날짜": "date",
+        "date_idx": "date",
+        "시가총액": "market_cap",
+        "거래대금": "trading_value",
+        "상장주식수": "shares_outstanding",
+        "거래량": "volume_pykrx",
+    }
+    df = df.rename(columns=col_map)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Data fetching — FinanceDataReader (primary)
 # ---------------------------------------------------------------------------
 
-def fetch_from_fdr(ticker, start, end):
+def fetch_from_fdr(ticker, start, end, debug_columns=False):
     """Fetch OHLCV + Marcap from FinanceDataReader.
 
     Args:
         ticker: stock ticker
         start: YYYY-MM-DD format
         end: YYYY-MM-DD format
+        debug_columns: if True, always print columns; otherwise print only on first call
 
     Returns:
         tuple: (df, source) where source is "fdr" or None if failed
-               df columns: date, ticker, open, high, low, close, volume, market_cap, shares_outstanding
+               df columns: date, ticker, open, high, low, close, volume, market_cap, shares_outstanding, trading_value
     """
+    global _fdr_columns_logged
     try:
         import FinanceDataReader as fdr
         df = fdr.DataReader(ticker, start, end)
@@ -143,7 +189,13 @@ def fetch_from_fdr(ticker, start, end):
         df.index.name = "date_idx"
         df = df.reset_index()
 
+        # Debug: print columns on first call or if --debug-columns is set
+        if debug_columns or not _fdr_columns_logged:
+            print("  FDR columns for {}: {}".format(ticker, list(df.columns)), flush=True)
+            _fdr_columns_logged = True
+
         # Normalize column names (FDR uses English column names usually)
+        # Expanded to include more patterns: Amount/거래대금 -> trading_value, Stocks/상장주식수 -> shares_outstanding
         rename = {}
         for col in df.columns:
             lc = col.lower()
@@ -161,6 +213,11 @@ def fetch_from_fdr(ticker, start, end):
                 rename[col] = "volume"
             elif lc in ("marcap", "시가총액"):
                 rename[col] = "market_cap"
+            elif lc in ("amount", "거래대금"):
+                rename[col] = "trading_value"
+            elif lc in ("stocks", "상장주식수"):
+                rename[col] = "shares_outstanding"
+            # Ignore: changes, 등락률 (change_pct)
         df = df.rename(columns=rename)
 
         # Convert date to ISO string
@@ -171,17 +228,39 @@ def fetch_from_fdr(ticker, start, end):
 
         df["ticker"] = ticker
 
-        # Try to extract shares_outstanding from market_cap / close
-        if "market_cap" in df.columns and "close" in df.columns:
+        # Try to extract shares_outstanding from market_cap / close if not already present
+        if "market_cap" in df.columns and "close" in df.columns and "shares_outstanding" not in df.columns:
             df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
             df["close"] = pd.to_numeric(df["close"], errors="coerce")
             df["shares_outstanding"] = df.apply(
                 lambda r: int(r["market_cap"] / r["close"]) if r["market_cap"] > 0 and r["close"] > 0 else None,
                 axis=1
             )
-        else:
-            df["shares_outstanding"] = None
 
+        # Check if market_cap is actually populated
+        has_marcap = "market_cap" in df.columns and df["market_cap"].notna().any()
+        if not has_marcap:
+            # Try to supplement from pykrx
+            try:
+                mcap_df = fetch_market_cap_from_pykrx(ticker, to_yyyymmdd(start), to_yyyymmdd(end))
+                if mcap_df is not None and not mcap_df.empty:
+                    # Merge on date
+                    df = df.merge(
+                        mcap_df[["date", "market_cap", "shares_outstanding", "trading_value"]].drop_duplicates("date"),
+                        on="date", how="left", suffixes=("", "_pykrx")
+                    )
+                    # Use pykrx values where FDR is missing
+                    for col in ["market_cap", "shares_outstanding", "trading_value"]:
+                        pykrx_col = col + "_pykrx"
+                        if pykrx_col in df.columns:
+                            df[col] = df[col].fillna(df[pykrx_col])
+                            df.drop(columns=[pykrx_col], inplace=True)
+            except Exception:
+                pass
+
+        # Ensure these columns exist
+        if "shares_outstanding" not in df.columns:
+            df["shares_outstanding"] = None
         if "trading_value" not in df.columns:
             df["trading_value"] = None
 
@@ -196,7 +275,7 @@ def fetch_from_fdr(ticker, start, end):
 # ---------------------------------------------------------------------------
 
 def fetch_from_pykrx(ticker, start, end):
-    """Fetch OHLCV from pykrx (fallback only).
+    """Fetch OHLCV from pykrx (fallback only), and supplement with market cap data.
 
     Args:
         ticker: stock ticker
@@ -205,7 +284,7 @@ def fetch_from_pykrx(ticker, start, end):
 
     Returns:
         tuple: (df, source) where source is "pykrx" or None if failed
-               df columns: date, ticker, open, high, low, close, volume
+               df columns: date, ticker, open, high, low, close, volume, market_cap, shares_outstanding, trading_value
     """
     from pykrx import stock
 
@@ -241,9 +320,28 @@ def fetch_from_pykrx(ticker, start, end):
         df["date"] = df.index.strftime("%Y-%m-%d") if hasattr(df.index, "strftime") else df.index
 
     df["ticker"] = ticker
-    df["market_cap"] = None
-    df["shares_outstanding"] = None
-    df["trading_value"] = None
+
+    # Try to supplement with market cap data from pykrx
+    try:
+        mcap_df = fetch_market_cap_from_pykrx(ticker, start, end)
+        if mcap_df is not None and not mcap_df.empty:
+            df = df.merge(
+                mcap_df[["date", "market_cap", "shares_outstanding", "trading_value"]].drop_duplicates("date"),
+                on="date", how="left", suffixes=("", "_mcap")
+            )
+            # Remove any duplicate columns
+            for col in ["market_cap", "shares_outstanding", "trading_value"]:
+                mcap_col = col + "_mcap"
+                if mcap_col in df.columns:
+                    df.drop(columns=[mcap_col], inplace=True)
+        else:
+            df["market_cap"] = None
+            df["shares_outstanding"] = None
+            df["trading_value"] = None
+    except Exception:
+        df["market_cap"] = None
+        df["shares_outstanding"] = None
+        df["trading_value"] = None
 
     return df, "pykrx"
 
@@ -305,6 +403,7 @@ def upsert_prices(conn, df, dry_run=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest daily price data")
     parser.add_argument("--tickers", help="Comma-separated tickers (e.g. 005930,000660)")
+    parser.add_argument("--universe", help="Use named universe from universe_memberships table")
     parser.add_argument("--start-date", help="Start date YYYY-MM-DD (default: 7 days ago)")
     parser.add_argument("--end-date", help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--market", help="Filter by market: KOSPI,KOSDAQ")
@@ -313,6 +412,7 @@ if __name__ == "__main__":
     parser.add_argument("--full", action="store_true", help="Full history from 2015 (SLOW)")
     parser.add_argument("--resume", action="store_true", help="Skip tickers with full date range coverage")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be inserted but don't write")
+    parser.add_argument("--debug-columns", action="store_true", help="Print FDR columns for every ticker")
     args = parser.parse_args()
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -330,6 +430,15 @@ if __name__ == "__main__":
     # Resolve tickers
     if args.tickers:
         tickers = args.tickers.split(",")
+    elif args.universe:
+        cur = conn.cursor()
+        cur.execute("SELECT ticker FROM universe_memberships WHERE universe_name = %s ORDER BY ticker", (args.universe,))
+        tickers = [r[0] for r in cur.fetchall()]
+        cur.close()
+        if not tickers:
+            print("ERROR: Universe '{}' not found or empty".format(args.universe))
+            sys.exit(1)
+        print("  Universe '{}': {} tickers".format(args.universe, len(tickers)))
     else:
         tickers = get_db_tickers(conn, args.limit, args.market)
         if not tickers:
@@ -345,6 +454,7 @@ if __name__ == "__main__":
         "full": args.full,
         "resume": args.resume,
         "dry_run": args.dry_run,
+        "debug_columns": args.debug_columns,
     })
 
     total_rows = 0
@@ -364,7 +474,7 @@ if __name__ == "__main__":
                     continue
 
             # 1. Try FDR first (primary source)
-            df, source = fetch_from_fdr(ticker, start, end)
+            df, source = fetch_from_fdr(ticker, start, end, debug_columns=args.debug_columns)
 
             # 2. Fallback to pykrx if FDR failed or empty
             if df is None or df.empty:

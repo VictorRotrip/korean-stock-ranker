@@ -86,15 +86,29 @@ def log_finish(conn, log_id, status, rows_processed=0, rows_inserted=0,
 def fetch_raw_financials(conn, tickers=None, years=None, limit=None):
     """Fetch financial_statements rows, optionally filtered.
 
+    When limit is provided and tickers is not, first resolves distinct tickers
+    (to ensure exactly limit stocks, not limit rows).
+
     Yields: dict with financial statement data.
     """
     where_clauses = []
     params = []
 
-    if tickers:
-        placeholders = ",".join(["%s"] * len(tickers))
+    # If limit is provided and no tickers, first resolve tickers
+    resolved_tickers = tickers
+    if limit and not tickers:
+        cur2 = conn.cursor()
+        cur2.execute(
+            "SELECT DISTINCT ticker FROM financial_statements ORDER BY ticker LIMIT %s",
+            (limit,)
+        )
+        resolved_tickers = [r[0] for r in cur2.fetchall()]
+        cur2.close()
+
+    if resolved_tickers:
+        placeholders = ",".join(["%s"] * len(resolved_tickers))
         where_clauses.append("ticker IN ({})".format(placeholders))
-        params.extend(tickers)
+        params.extend(resolved_tickers)
 
     if years:
         placeholders = ",".join(["%s"] * len(years))
@@ -102,7 +116,6 @@ def fetch_raw_financials(conn, tickers=None, years=None, limit=None):
         params.extend(years)
 
     where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
-    limit_clause = "LIMIT {}".format(limit) if limit else ""
 
     query = """
         SELECT
@@ -120,8 +133,7 @@ def fetch_raw_financials(conn, tickers=None, years=None, limit=None):
         FROM financial_statements
         {where_clause}
         ORDER BY ticker, period_end, fiscal_quarter
-        {limit_clause}
-    """.format(where_clause=where_clause, limit_clause=limit_clause)
+    """.format(where_clause=where_clause)
 
     cur = conn.cursor()
     cur.execute(query, params)
@@ -294,12 +306,14 @@ def compute_coverage_stats(conn, tickers=None):
 
     Returns: dict with coverage ratios.
     """
-    where_clause = ""
+    conditions = []
     params = []
     if tickers:
         placeholders = ",".join(["%s"] * len(tickers))
-        where_clause = "WHERE ticker IN ({})".format(placeholders)
-        params = tickers
+        conditions.append("ticker IN ({})".format(placeholders))
+        params = list(tickers)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     total_query = "SELECT COUNT(DISTINCT ticker) FROM fundamental_snapshots " + where_clause
     cur = conn.cursor()
@@ -315,7 +329,9 @@ def compute_coverage_stats(conn, tickers=None):
 
     coverage = {}
     for field in fields:
-        query = "SELECT COUNT(DISTINCT ticker) FROM fundamental_snapshots WHERE {field} IS NOT NULL ".format(field=field) + where_clause
+        field_conditions = ["{} IS NOT NULL".format(field)] + conditions
+        field_where = "WHERE " + " AND ".join(field_conditions)
+        query = "SELECT COUNT(DISTINCT ticker) FROM fundamental_snapshots " + field_where
         cur = conn.cursor()
         cur.execute(query, params)
         count = cur.fetchone()[0]
@@ -333,7 +349,8 @@ def compute_coverage_stats(conn, tickers=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Normalize DART financials to fundamental_snapshots")
     parser.add_argument("--tickers", help="Comma-separated tickers (e.g. 005930,000660)")
-    parser.add_argument("--limit", type=int, help="Max rows to process")
+    parser.add_argument("--universe", help="Use named universe from universe_memberships table")
+    parser.add_argument("--limit", type=int, help="Max stocks to process")
     parser.add_argument("--years", help="Comma-separated fiscal years (e.g. 2022,2023,2024)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed without writing")
     args = parser.parse_args()
@@ -345,7 +362,19 @@ if __name__ == "__main__":
     conn = psycopg2.connect(DATABASE_URL)
 
     # Parse arguments
-    tickers = args.tickers.split(",") if args.tickers else None
+    tickers = None
+    if args.tickers:
+        tickers = args.tickers.split(",")
+    elif args.universe:
+        cur = conn.cursor()
+        cur.execute("SELECT ticker FROM universe_memberships WHERE universe_name = %s ORDER BY ticker", (args.universe,))
+        tickers = [r[0] for r in cur.fetchall()]
+        cur.close()
+        if not tickers:
+            print("ERROR: Universe '{}' not found or empty".format(args.universe))
+            sys.exit(1)
+        print("  Universe '{}': {} tickers".format(args.universe, len(tickers)))
+
     years = [int(y.strip()) for y in args.years.split(",")] if args.years else None
     limit = args.limit
     dry_run = args.dry_run

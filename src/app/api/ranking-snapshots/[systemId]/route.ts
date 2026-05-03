@@ -10,8 +10,18 @@ export const runtime = "nodejs";
  * Returns the latest ranking snapshot for the given system ID.
  * Enriches the raw DB results with stock metadata (name, market, sector).
  *
+ * Handles two snapshot result formats:
+ *
+ *   1. Legacy: results is a plain array of stock entries.
+ *   2. New (post coverage-aware ranking): results is an envelope with
+ *        { _meta: {...}, rankings: [...] }
+ *      where _meta carries scoring_method, missing_category_policy,
+ *      thresholds, globally_unavailable_categories, etc.
+ *
  * Response shape matches the RankingResult TypeScript type so the
- * results page can consume it directly.
+ * results page can consume it directly. The new fields
+ * (activeWeightCoverage, passesMinimum, etc.) are added per stock
+ * when present.
  */
 export async function GET(
   _request: NextRequest,
@@ -49,19 +59,70 @@ export async function GET(
   const snapshot = snapshots[0];
   console.log(`[ranking-snapshots] Found snapshot id=${snapshot.id}, date=${snapshot.date}, universe_size=${snapshot.universeSize}`);
 
-  // 2. Parse the results JSONB
-  const rawResults = snapshot.results as Array<{
-    ticker: string;
-    composite_score: number;
-    category_scores: Record<string, number>;
-    factor_count: number;
-    rank: number;
-  }>;
+  // 2. Detect envelope vs legacy format
+  type CategoryScoreDetail = {
+    score: number | null;
+    weight: number;
+    coverage: string;
+    status: "available" | "missing_imputed" | "missing" | "missing_renormalized" | "globally_unavailable";
+  };
 
-  console.log(`[ranking-snapshots] ${rawResults.length} rows in snapshot`);
+  type SnapshotEntry = {
+    ticker: string;
+    rank: number | null;
+    composite_score: number | null;
+    category_scores: Record<string, number> | Record<string, CategoryScoreDetail>;
+    category_scores_simple?: Record<string, number | null>;
+    factor_count?: number;
+    active_categories?: string[];
+    imputed_categories?: string[];
+    active_category_count?: number;
+    active_weight_coverage?: number;
+    composite_weight_used?: number;
+    passes_minimum?: boolean;
+    failure_reasons?: string[];
+    coverage_status?: "passed" | "insufficient";
+  };
+
+  type SnapshotMeta = {
+    scoring_method?: string;
+    missing_category_policy?: string;
+    thresholds?: {
+      min_active_weight_coverage?: number;
+      min_category_count?: number;
+      min_factor_count?: number;
+    };
+    globally_unavailable_categories?: string[];
+    globally_active_categories?: string[];
+    category_weights?: Record<string, number>;
+    passed_count?: number;
+    insufficient_count?: number;
+    include_insufficient_coverage?: boolean;
+    as_of_date?: string;
+    universe_name?: string | null;
+    system_id?: string;
+  };
+
+  const rawResultsEnvelope = snapshot.results as
+    | Array<SnapshotEntry>
+    | { _meta?: SnapshotMeta; rankings?: Array<SnapshotEntry> };
+
+  let rawEntries: Array<SnapshotEntry>;
+  let meta: SnapshotMeta | null = null;
+
+  if (Array.isArray(rawResultsEnvelope)) {
+    rawEntries = rawResultsEnvelope;
+  } else if (rawResultsEnvelope && typeof rawResultsEnvelope === "object" && "rankings" in rawResultsEnvelope) {
+    rawEntries = rawResultsEnvelope.rankings ?? [];
+    meta = rawResultsEnvelope._meta ?? null;
+  } else {
+    rawEntries = [];
+  }
+
+  console.log(`[ranking-snapshots] ${rawEntries.length} rows in snapshot (envelope=${meta !== null})`);
 
   // 3. Fetch stock metadata for all tickers in the snapshot
-  const tickers = rawResults.map(r => r.ticker);
+  const tickers = rawEntries.map(r => r.ticker);
   const stockRows = tickers.length > 0
     ? await db
         .select()
@@ -80,7 +141,6 @@ export async function GET(
   const priceMap = new Map<string, typeof schema.dailyPrices.$inferSelect>();
 
   if (tickers.length > 0) {
-    // For each ticker, get the most recent price on or before the snapshot date
     const latestPriceSubquery = db
       .select({
         ticker: schema.dailyPrices.ticker,
@@ -114,13 +174,25 @@ export async function GET(
 
   console.log(`[ranking-snapshots] Prices found: ${priceMap.size} tickers`);
 
-  // 5. Fetch factor_snapshots for this date to populate factorScores
-  const factorRows = await db
-    .select()
-    .from(schema.factorSnapshots)
-    .where(eq(schema.factorSnapshots.date, snapshot.date));
+  // 5. Fetch factor_snapshots for this date AND universe to populate factorScores.
+  // Percentile ranks depend on the universe used at calculation time, so reading
+  // unscoped would mix scores from multiple universes (e.g. test_50 + test_200_large).
+  const snapshotUniverse = snapshot.universeName ?? meta?.universe_name ?? null;
+  const factorRows = snapshotUniverse
+    ? await db
+        .select()
+        .from(schema.factorSnapshots)
+        .where(
+          and(
+            eq(schema.factorSnapshots.date, snapshot.date),
+            eq(schema.factorSnapshots.universeName, snapshotUniverse),
+          ),
+        )
+    : await db
+        .select()
+        .from(schema.factorSnapshots)
+        .where(eq(schema.factorSnapshots.date, snapshot.date));
 
-  // ticker -> factorId -> { rawValue, percentileRank }
   const factorMap = new Map<string, Record<string, { rawValue: number | null; percentileRank: number }>>();
   for (const f of factorRows) {
     if (!factorMap.has(f.ticker)) {
@@ -132,11 +204,48 @@ export async function GET(
     };
   }
 
-  // 6. Map to StockRanking shape
-  const rankings = rawResults.map(r => {
+  // 6. Helper: extract a simple {name: score} map from either envelope shape.
+  // Envelope shape stores per-category {score, weight, coverage, status}.
+  function flattenCategoryScores(entry: SnapshotEntry): Record<string, number> {
+    if (entry.category_scores_simple) {
+      const out: Record<string, number> = {};
+      for (const [k, v] of Object.entries(entry.category_scores_simple)) {
+        if (v !== null && typeof v === "number") out[k] = v;
+      }
+      return out;
+    }
+    const cs = entry.category_scores;
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(cs)) {
+      if (typeof v === "number") {
+        out[k] = v;
+      } else if (v && typeof v === "object" && typeof (v as CategoryScoreDetail).score === "number") {
+        out[k] = (v as CategoryScoreDetail).score as number;
+      }
+    }
+    return out;
+  }
+
+  function extractCategoryDetails(entry: SnapshotEntry): Record<string, CategoryScoreDetail> | undefined {
+    const cs = entry.category_scores;
+    const out: Record<string, CategoryScoreDetail> = {};
+    let isDetailed = false;
+    for (const [k, v] of Object.entries(cs)) {
+      if (v && typeof v === "object" && "status" in (v as object)) {
+        isDetailed = true;
+        out[k] = v as CategoryScoreDetail;
+      }
+    }
+    return isDetailed ? out : undefined;
+  }
+
+  // 7. Map to StockRanking shape (with extra coverage fields when available)
+  const rankings = rawEntries.map(r => {
     const stock = stockMap.get(r.ticker);
     const price = priceMap.get(r.ticker);
     const factors = factorMap.get(r.ticker) ?? {};
+    const categoryScores = flattenCategoryScores(r);
+    const categoryDetails = extractCategoryDetails(r);
 
     return {
       rank: r.rank,
@@ -146,22 +255,43 @@ export async function GET(
       sector: stock?.sector ?? undefined,
       industry: stock?.industry ?? undefined,
       marketCap: price?.marketCap ?? 0,
-      compositeScore: r.composite_score,
-      categoryScores: r.category_scores,
+      compositeScore: r.composite_score ?? 0,
+      categoryScores,
+      categoryDetails,
       factorScores: factors,
+      // Coverage metadata (new fields, optional)
+      coverageStatus: r.coverage_status,
+      passesMinimum: r.passes_minimum,
+      activeWeightCoverage: r.active_weight_coverage,
+      compositeWeightUsed: r.composite_weight_used,
+      activeCategoryCount: r.active_category_count,
+      activeCategories: r.active_categories,
+      imputedCategories: r.imputed_categories,
+      factorCount: r.factor_count,
+      failureReasons: r.failure_reasons,
     };
   });
 
-  // 7. Return as RankingResult
+  // 8. Return as RankingResult with metadata for the UI
   const result = {
     rankingSystemId: systemId,
     date: snapshot.date,
     rankings,
-    universeSize: snapshot.universeSize ?? rawResults.length,
+    universeSize: snapshot.universeSize ?? rawEntries.length,
+    universeName: snapshot.universeName ?? meta?.universe_name ?? null,
     computedAt: snapshot.computedAt?.toISOString() ?? new Date().toISOString(),
-    // Extra metadata for the UI
     snapshotId: snapshot.id,
     dataSource: "db" as const,
+    // Snapshot-level metadata
+    scoringMethod: meta?.scoring_method ?? "percentile_rank",
+    missingCategoryPolicy: meta?.missing_category_policy ?? null,
+    thresholds: meta?.thresholds ?? null,
+    globallyUnavailableCategories: meta?.globally_unavailable_categories ?? [],
+    globallyActiveCategories: meta?.globally_active_categories ?? [],
+    categoryWeights: meta?.category_weights ?? null,
+    passedCount: meta?.passed_count ?? rawEntries.filter(r => r.coverage_status !== "insufficient").length,
+    insufficientCount: meta?.insufficient_count ?? rawEntries.filter(r => r.coverage_status === "insufficient").length,
+    includeInsufficientCoverage: meta?.include_insufficient_coverage ?? false,
   };
 
   return NextResponse.json(result);
