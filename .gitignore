@@ -39,3 +39,8 @@ next-env.d.ts
 __pycache__/
 *.pyc
 .venv/
+
+# Local/generated DART caches
+scripts/python/.cache/
+scripts/python/.dart_corp_codes.json
+scripts/python/scripts/
