@@ -3,8 +3,12 @@ pykrx>=1.0.45
 opendartreader>=0.2.1
 finance-datareader>=0.9.50
 
-# Optional: bulk historical price data (faster than pykrx for full loads)
-# marcap>=0.3.2
+# Historical KRX market cap (point-in-time) is read directly from the
+# FinanceData/marcap GitHub dataset
+# (https://github.com/FinanceData/marcap), not via PyPI. Yearly Parquet
+# files are downloaded on demand into scripts/python/.cache/marcap/ by
+# scripts/python/data_sources/marcap_historical.py.
+pyarrow>=15
 
 # Database
 psycopg2-binary>=2.9.9

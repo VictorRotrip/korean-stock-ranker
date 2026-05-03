@@ -11,6 +11,7 @@ Usage:
 import os
 import sys
 import argparse
+from datetime import datetime
 
 import psycopg2
 from dotenv import load_dotenv
@@ -18,6 +19,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+def datetime_now_iso():
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def main():
@@ -344,22 +349,143 @@ def main():
             marker = " <- this run" if un == scope_universe else ""
             print("    {0}: {1} stocks{2}".format(un, stocks, marker))
 
-    # 9. Market cap source warning
+    # 9. Market cap source — point-in-time analysis
     print()
-    print("--- MARKET CAP SOURCE ---")
+    print("--- MARKET CAP SOURCE (point-in-time analysis) ---")
+
+    # Counts of each source label among rows that have market_cap, scoped to
+    # the universe and the as-of date.
     cur.execute("""
-        SELECT DISTINCT source FROM daily_prices
-        WHERE ticker = ANY(%s) AND date <= %s
-        AND market_cap IS NOT NULL AND market_cap > 0
+        SELECT source, COUNT(DISTINCT ticker) AS stocks
+        FROM daily_prices
+        WHERE ticker = ANY(%s)
+          AND date = %s
+          AND market_cap IS NOT NULL AND market_cap > 0
+        GROUP BY source
+        ORDER BY source
     """, (tickers, as_of))
-    sources = [r[0] for r in cur.fetchall()]
-    for src in sources:
-        print("  Source: {0}".format(src))
-    if any("marcap" in (s or "").lower() or "listing" in (s or "").lower()
-           or "snapshot" in (s or "").lower() for s in sources):
-        print("  WARNING: Market cap may come from a current snapshot")
-        print("  (fdr.StockListing), not point-in-time historical data.")
-        print("  OK for current ranking validation, not for backtests.")
+    src_rows_exact = cur.fetchall()
+
+    # Same but for the latest market_cap row on or before as_of, per ticker
+    cur.execute("""
+        WITH latest AS (
+            SELECT ticker, MAX(date) AS d
+            FROM daily_prices
+            WHERE ticker = ANY(%s)
+              AND date <= %s
+              AND market_cap IS NOT NULL AND market_cap > 0
+            GROUP BY ticker
+        )
+        SELECT dp.source, COUNT(*) AS stocks
+        FROM latest l
+        JOIN daily_prices dp
+          ON dp.ticker = l.ticker AND dp.date = l.d
+        GROUP BY dp.source
+        ORDER BY dp.source
+    """, (tickers, as_of))
+    src_rows_latest = cur.fetchall()
+
+    print("  As-of-date rows ({0}):".format(as_of))
+    if src_rows_exact:
+        for src, n in src_rows_exact:
+            print("    {0}: {1} stocks".format(src or "(null)", n))
+    else:
+        print("    (no rows on exact as-of date)")
+
+    print("  Effective source per ticker (latest row <= as-of):")
+    if src_rows_latest:
+        for src, n in src_rows_latest:
+            print("    {0}: {1} stocks".format(src or "(null)", n))
+    else:
+        print("    (no marcap data found)")
+
+    # Classification: which sources are PIT-correct?
+    PIT_SAFE = {"marcap_historical"}
+    NOT_PIT = {"fdr_listing_snapshot", "fdr+marcap", "fdr+marcap+marcap"}
+
+    pit_count = sum(n for src, n in src_rows_latest if src in PIT_SAFE)
+    snap_count = sum(n for src, n in src_rows_latest
+                     if src in NOT_PIT or (src and "snapshot" in src.lower()))
+    other_count = sum(n for src, n in src_rows_latest
+                      if src not in PIT_SAFE
+                      and src not in NOT_PIT
+                      and not (src and "snapshot" in src.lower()))
+
+    print()
+    print("  Point-in-time safety:")
+    print("    marcap_historical (PIT-safe):    {0}/{1} stocks".format(
+        pit_count, len(tickers)))
+    print("    snapshot (NOT PIT):              {0}/{1} stocks".format(
+        snap_count, len(tickers)))
+    if other_count:
+        print("    other / unknown source:          {0}/{1} stocks".format(
+            other_count, len(tickers)))
+
+    # Decide whether the as-of-date market cap is point-in-time safe overall
+    today_iso = datetime_now_iso()
+    is_historical_date = as_of < today_iso
+
+    if pit_count == len(tickers):
+        print()
+        print("  STATUS: PIT-safe. All {0} stocks have point-in-time market_cap "
+              "for {1}.".format(len(tickers), as_of))
+    elif pit_count > 0 and snap_count > 0:
+        print()
+        print("  STATUS: MIXED. Some stocks are PIT-safe, some are snapshot-only.")
+        if is_historical_date:
+            print("    WARNING: as-of-date {0} is historical but {1} stocks "
+                  "use snapshot.".format(as_of, snap_count))
+            print("    Run: python ingest_marcap.py --source historical "
+                  "--as-of-date {0} --universe <name>".format(as_of))
+    elif snap_count > 0 and pit_count == 0:
+        print()
+        print("  STATUS: SNAPSHOT-ONLY. Market cap is from current FDR listing,")
+        print("    NOT point-in-time. OK for current-ranking validation.")
+        if is_historical_date:
+            print("    WARNING: as-of-date {0} is historical. Backtests at this "
+                  "date will be biased.".format(as_of))
+            print("    Run: python ingest_marcap.py --source historical "
+                  "--as-of-date {0} --universe <name>".format(as_of))
+
+    # ---- 9b. Non-PIT ticker detail (the stocks that will be excluded from
+    # historical rankings under --require-pit-market-cap) ----
+    cur.execute("""
+        WITH latest AS (
+            SELECT ticker, MAX(date) AS d
+            FROM daily_prices
+            WHERE ticker = ANY(%s)
+              AND date <= %s
+              AND market_cap IS NOT NULL AND market_cap > 0
+            GROUP BY ticker
+        )
+        SELECT s.ticker, s.name, s.market, dp.source,
+               dp.close, dp.market_cap
+        FROM latest l
+        JOIN daily_prices dp ON dp.ticker = l.ticker AND dp.date = l.d
+        JOIN stocks s ON s.ticker = dp.ticker
+        WHERE dp.source IS DISTINCT FROM 'marcap_historical'
+        ORDER BY s.ticker
+    """, (tickers, as_of))
+    non_pit_rows = cur.fetchall()
+
+    if non_pit_rows:
+        print()
+        print("--- NON-PIT TICKERS (snapshot-only, would be excluded from historical ranking) ---")
+        print("  {0:<8} {1:<22} {2:<8} {3:<22} {4:>14} {5:>16}  Reason".format(
+            "Ticker", "Name", "Market", "Source", "Close", "MarketCap"))
+        print("  " + "-" * 110)
+        for t, nm, mkt, src, cl, mc in non_pit_rows:
+            print("  {0:<8} {1:<22} {2:<8} {3:<22} {4:>14} {5:>16}  missing_from_marcap_historical_on_asof".format(
+                t,
+                (nm or "?")[:22],
+                mkt or "?",
+                (src or "?")[:22],
+                "{0:,.0f}".format(cl) if cl else "NULL",
+                "{0:,.0f}".format(mc) if mc else "NULL",
+            ))
+        print("  Tip: --require-pit-market-cap (default for historical dates) "
+              "will exclude these {0} stocks from the main ranking.".format(
+                  len(non_pit_rows)))
 
     print()
     print("=" * 70)

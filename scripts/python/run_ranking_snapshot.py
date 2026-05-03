@@ -39,11 +39,62 @@ import os
 import sys
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, date as date_cls
 
 import psycopg2
 from psycopg2.extras import Json as PgJson
 from dotenv import load_dotenv
+
+
+def _check_marcap_pit_safety(conn, as_of_date, ticker_list):
+    """Check whether market cap for the as-of-date is point-in-time safe.
+
+    Prints a clear warning if the as-of-date is historical (before today)
+    but market_cap data comes from a snapshot source rather than
+    'marcap_historical'. Does NOT block ranking — just warns loudly.
+    """
+    if not ticker_list:
+        return
+    cur = conn.cursor()
+    cur.execute("""
+        WITH latest AS (
+            SELECT ticker, MAX(date) AS d
+            FROM daily_prices
+            WHERE ticker = ANY(%s)
+              AND date <= %s
+              AND market_cap IS NOT NULL AND market_cap > 0
+            GROUP BY ticker
+        )
+        SELECT dp.source, COUNT(*) AS stocks
+        FROM latest l
+        JOIN daily_prices dp
+          ON dp.ticker = l.ticker AND dp.date = l.d
+        GROUP BY dp.source
+    """, (ticker_list, as_of_date))
+    rows = cur.fetchall()
+    cur.close()
+
+    pit_count = sum(n for src, n in rows if src == "marcap_historical")
+    snap_count = sum(n for src, n in rows
+                     if src and ("snapshot" in src.lower()
+                                 or src.startswith("fdr+marcap")))
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    is_historical = as_of_date < today_iso
+
+    if is_historical and snap_count > 0 and pit_count < len(ticker_list):
+        print("", flush=True)
+        print("  " + "!" * 60, flush=True)
+        print("  WARNING: as-of-date {0} is historical, but {1} of {2} "
+              "stocks have market_cap from a CURRENT SNAPSHOT, NOT "
+              "point-in-time.".format(as_of_date, snap_count, len(ticker_list)),
+              flush=True)
+        print("  Value factors (P/E, P/B, EV/EBITDA, dividend yield, "
+              "FCF yield, etc.) will be biased.", flush=True)
+        print("  Fix: python ingest_marcap.py --source historical "
+              "--as-of-date {0} --universe <name>".format(as_of_date),
+              flush=True)
+        print("  " + "!" * 60, flush=True)
+        print("", flush=True)
 
 load_dotenv()
 
@@ -652,6 +703,21 @@ if __name__ == "__main__":
         help=("Also include insufficient-coverage stocks in the main snapshot. "
               "Default False -- they're stored in a separate section only."))
 
+    # Point-in-time market cap enforcement
+    pit_group = parser.add_mutually_exclusive_group()
+    pit_group.add_argument(
+        "--require-pit-market-cap", dest="pit_mode",
+        action="store_const", const="require",
+        help=("Require point-in-time market cap. Stocks whose effective "
+              "market_cap source is not 'marcap_historical' are excluded "
+              "from the main ranking. Default for historical as-of dates."))
+    pit_group.add_argument(
+        "--allow-snapshot-market-cap", dest="pit_mode",
+        action="store_const", const="allow",
+        help=("Allow snapshot market cap. Use only for current-day "
+              "validation; produces biased value factors for historical dates."))
+    parser.set_defaults(pit_mode=None)  # auto
+
     args = parser.parse_args()
 
     as_of = args.as_of_date
@@ -712,27 +778,106 @@ if __name__ == "__main__":
         print("  Reading factor scores tagged with universe='{0}' ({1} rows)".format(
             scope_universe, len(rows)))
 
-        # Build ticker -> {factorId -> percentile}
+        # Build ticker -> {factorId -> percentile}.
+        # IMPORTANT: this dict is keyed only by tickers that have at least
+        # one factor row. The CANONICAL ticker list comes from
+        # universe_memberships below, NOT from factor_snapshots, so that
+        # stocks with zero factor rows still get classified (typically as
+        # insufficient coverage or non-PIT, instead of silently dropped).
         ticker_factors = {}
         for ticker, fid, pct in rows:
             if ticker not in ticker_factors:
                 ticker_factors[ticker] = {}
             ticker_factors[ticker][fid] = pct
 
-        tickers = sorted(ticker_factors.keys())
-
-        # Filter by universe if specified
+        # Canonical ticker list:
+        #   - With --universe: always start from universe_memberships so the
+        #     accounting (main + insufficient + non-PIT) sums to the universe
+        #     size, even for stocks that have zero factor rows.
+        #   - Without --universe: fall back to whatever has factor data (the
+        #     legacy unscoped flow).
         if args.universe:
-            cur.execute("SELECT ticker FROM universe_memberships WHERE universe_name = %s ORDER BY ticker", (args.universe,))
+            cur.execute(
+                "SELECT ticker FROM universe_memberships "
+                "WHERE universe_name = %s ORDER BY ticker",
+                (args.universe,))
             universe_tickers = [r[0] for r in cur.fetchall()]
             if not universe_tickers:
                 print("ERROR: Universe '{}' not found or empty".format(args.universe))
                 sys.exit(1)
-            tickers = [t for t in tickers if t in set(universe_tickers)]
-            print("  Universe '{}': filtered to {} tickers".format(args.universe, len(tickers)))
+            tickers = sorted(universe_tickers)
+            print("  Universe '{0}': {1} tickers (canonical from universe_memberships)".format(
+                args.universe, len(tickers)))
+            with_factors = sum(1 for t in tickers if t in ticker_factors)
+            without_factors = len(tickers) - with_factors
+            if without_factors > 0:
+                print("  -> {0} have factor rows, {1} have zero "
+                      "(will be classified as insufficient or non-PIT).".format(
+                          with_factors, without_factors))
+        else:
+            tickers = sorted(ticker_factors.keys())
+            print("  Using {0} tickers derived from factor_snapshots "
+                  "(no --universe specified)".format(len(tickers)))
 
         if args.limit:
             tickers = tickers[:args.limit]
+
+        # Ensure every canonical ticker has an entry in ticker_factors (the
+        # ranking pipeline indexes into this dict). Empty dict = no factor
+        # data for that stock; the pipeline handles this naturally.
+        for t in tickers:
+            if t not in ticker_factors:
+                ticker_factors[t] = {}
+
+        universe_member_count = len(tickers)
+
+        # Resolve PIT mode: explicit flag overrides; otherwise auto from date.
+        _today_iso = datetime.now().strftime("%Y-%m-%d")
+        _is_historical = as_of < _today_iso
+        if args.pit_mode == "require":
+            require_pit = True
+        elif args.pit_mode == "allow":
+            require_pit = False
+        else:
+            require_pit = _is_historical  # auto
+
+        # Build per-ticker PIT-safety map. A ticker is PIT-safe iff its
+        # effective (latest <= as_of) market_cap row carries
+        # source = 'marcap_historical'. Tickers with no daily_prices
+        # market_cap row at all are treated as non-PIT (no historical
+        # market cap available means we can't trust value factors for them).
+        cur.execute("""
+            WITH latest AS (
+                SELECT ticker, MAX(date) AS d
+                FROM daily_prices
+                WHERE ticker = ANY(%s)
+                  AND date <= %s
+                  AND market_cap IS NOT NULL AND market_cap > 0
+                GROUP BY ticker
+            )
+            SELECT dp.ticker, dp.source, dp.market_cap
+            FROM latest l
+            JOIN daily_prices dp ON dp.ticker = l.ticker AND dp.date = l.d
+        """, (tickers, as_of))
+        marcap_rows = cur.fetchall()
+        ticker_to_source = {t: src for t, src, _mc in marcap_rows}
+        ticker_to_mc = {t: mc for t, _src, mc in marcap_rows}
+
+        # Names come from `stocks` so that we can label non-PIT stocks even
+        # if they have no daily_prices market_cap row at all.
+        cur.execute(
+            "SELECT ticker, name FROM stocks WHERE ticker = ANY(%s)",
+            (tickers,))
+        ticker_to_name = {t: n for t, n in cur.fetchall()}
+
+        non_pit_tickers = set()
+        if require_pit:
+            for t in tickers:
+                src = ticker_to_source.get(t)
+                # 'marcap_historical' is the only PIT-safe label. None means
+                # the stock has no marcap row at all -- still non-PIT.
+                if src != "marcap_historical":
+                    non_pit_tickers.add(t)
 
         print("Ranking {0} stocks using system '{1}' as of {2}...".format(
             len(tickers), system_id, as_of))
@@ -742,6 +887,17 @@ if __name__ == "__main__":
         print("  Min active category count:      {0}".format(thresholds["min_category_count"]))
         print("  Min factor count:               {0}".format(thresholds["min_factor_count"]))
         print("  Include insufficient coverage:  {0}".format(args.include_insufficient_coverage))
+        print("  PIT market cap:                 {0} ({1} date)".format(
+            "REQUIRED" if require_pit else "snapshot allowed",
+            "historical" if _is_historical else "current"))
+        if require_pit and non_pit_tickers:
+            print("  -> {0} stocks will be excluded for non point-in-time "
+                  "market cap.".format(len(non_pit_tickers)))
+
+        # Warn if market_cap source is non-PIT for a historical as-of date.
+        # Does not block; just makes the bias visible if PIT not enforced.
+        if not require_pit:
+            _check_marcap_pit_safety(conn, as_of, tickers)
 
         # 4. Determine which categories are globally available across the universe
         scoped_factors = {t: ticker_factors[t] for t in tickers if t in ticker_factors}
@@ -770,11 +926,29 @@ if __name__ == "__main__":
             )
             r["ticker"] = ticker
             r["total_globally_active_categories"] = globally_available_count
+            r["mcap_source"] = ticker_to_source.get(ticker)
+            r["mcap_name"] = ticker_to_name.get(ticker)
+            r["non_pit_market_cap"] = ticker in non_pit_tickers
             all_results.append(r)
 
-        # 6. Split into pass/fail
-        passing = [r for r in all_results if r["passes_minimum"]]
-        failing = [r for r in all_results if not r["passes_minimum"]]
+        # 6. Split into pass / non-PIT excluded / coverage-fail.
+        # Non-PIT exclusion takes priority over coverage failure: a stock
+        # that's both non-PIT and low coverage shows up in the non-PIT
+        # bucket so the operator sees the more important reason.
+        non_pit_excluded = [r for r in all_results if r["non_pit_market_cap"]]
+        remaining = [r for r in all_results if not r["non_pit_market_cap"]]
+        passing = [r for r in remaining if r["passes_minimum"]]
+        failing = [r for r in remaining if not r["passes_minimum"]]
+
+        # Annotate non-PIT excluded stocks with explicit failure reason
+        for r in non_pit_excluded:
+            r["failure_reasons"] = list(r.get("failure_reasons", []))
+            r["failure_reasons"].insert(
+                0,
+                "non_pit_market_cap (source={0})".format(
+                    r.get("mcap_source") or "missing"),
+            )
+            r["passes_minimum"] = False
 
         # 7. Sort and assign ranks within the "passing" set
         passing.sort(
@@ -784,23 +958,58 @@ if __name__ == "__main__":
         for i, r in enumerate(passing):
             r["rank"] = i + 1
 
-        # 8. Failing stocks get None for rank but are sorted by their composite if available
+        # 8. Failing stocks get None for rank but are sorted by composite if available
         failing.sort(
             key=lambda x: (x["composite_score"] is not None, x["composite_score"] or 0),
             reverse=True,
         )
         for i, r in enumerate(failing):
-            r["rank"] = None  # not ranked in main list
+            r["rank"] = None
+            r["fallback_position"] = i + 1
+        for i, r in enumerate(non_pit_excluded):
+            r["rank"] = None
             r["fallback_position"] = i + 1
 
-        print("\n  Main ranking:        {0} stocks passed coverage requirements".format(len(passing)))
-        print("  Insufficient coverage: {0} stocks failed (excluded from main ranking)".format(len(failing)))
+        # Accounting: every stock in the canonical universe must land in
+        # exactly one of (passing | failing | non_pit_excluded). The total
+        # must equal universe_member_count.
+        total_accounted = len(passing) + len(failing) + len(non_pit_excluded)
+        print("\n  Universe:                        {0} tickers".format(
+            universe_member_count))
+        print("  Main ranking:                    {0} stocks".format(len(passing)))
+        print("  Insufficient coverage:           {0} stocks".format(len(failing)))
+        print("  Non point-in-time market cap:    {0} stocks".format(len(non_pit_excluded)))
+        print("  Total accounted:                 {0}/{1}".format(
+            total_accounted, universe_member_count))
+        if total_accounted != universe_member_count:
+            print("  ! WARNING: accounting mismatch ({0} != {1}). "
+                  "This is a bug.".format(total_accounted, universe_member_count))
 
         # 9. Print top of main ranking
         print_main_ranking(passing, top_n=10)
 
         # 10. Print insufficient-coverage section
         print_excluded_ranking(failing, max_n=20)
+
+        # 10b. Print non-PIT section
+        if non_pit_excluded:
+            print("\n  Excluded for non point-in-time market cap "
+                  "({0} stocks):".format(len(non_pit_excluded)))
+            print("  Ticker    Name                       Source                "
+                  "Reason")
+            print("  --------  -------------------------  --------------------  "
+                  + "-" * 30)
+            for r in non_pit_excluded[:30]:
+                src = r.get("mcap_source") or "(no marcap row)"
+                nm = (r.get("mcap_name") or "?")[:25]
+                print("  {0:<8}  {1:<25}  {2:<20}  {3}".format(
+                    r["ticker"], nm, src[:20], "missing_from_marcap_historical_on_asof"
+                ))
+            if len(non_pit_excluded) > 30:
+                print("  ... and {0} more".format(len(non_pit_excluded) - 30))
+            print("  WARNING: snapshot market cap is NOT point-in-time. "
+                  "These stocks would bias value factors at this historical date.")
+            print("  To include them anyway, re-run with --allow-snapshot-market-cap.")
 
         # 11. Build snapshot results JSON
         # Each entry mirrors the legacy fields for backward-compat plus the new ones.
@@ -837,9 +1046,10 @@ if __name__ == "__main__":
 
         results_main = [to_json(r, "passed") for r in passing]
         results_excluded = [to_json(r, "insufficient") for r in failing]
+        results_non_pit = [to_json(r, "non_pit_market_cap") for r in non_pit_excluded]
 
         if args.include_insufficient_coverage:
-            stored_results = results_main + results_excluded
+            stored_results = results_main + results_excluded + results_non_pit
         else:
             stored_results = results_main
 
@@ -851,8 +1061,19 @@ if __name__ == "__main__":
             "globally_unavailable_categories": globally_unavailable,
             "globally_active_categories": [c for c in all_cat_names if globally_active.get(c, False)],
             "category_weights": cat_weights,
+            # Canonical accounting: these four counts are guaranteed to sum
+            # to universe_member_count for any --universe-scoped run.
+            "universe_member_count": universe_member_count,
+            "ranked_count": len(passing),
+            "insufficient_coverage_count": len(failing),
+            "non_pit_excluded_count": len(non_pit_excluded),
+            "total_accounted_count": total_accounted,
+            # Legacy aliases (kept for backwards-compat with anything that
+            # already reads them):
             "passed_count": len(passing),
             "insufficient_count": len(failing),
+            "non_pit_excluded_tickers": [r["ticker"] for r in non_pit_excluded],
+            "require_pit_market_cap": require_pit,
             "include_insufficient_coverage": args.include_insufficient_coverage,
             "as_of_date": as_of,
             "universe_name": args.universe,

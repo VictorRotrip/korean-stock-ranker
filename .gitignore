@@ -40,7 +40,8 @@ __pycache__/
 *.pyc
 .venv/
 
-# Local/generated DART caches
+# Local/generated DART caches and historical marcap dataset
 scripts/python/.cache/
+scripts/python/.cache/marcap/
 scripts/python/.dart_corp_codes.json
 scripts/python/scripts/

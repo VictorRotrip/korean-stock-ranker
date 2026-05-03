@@ -114,6 +114,54 @@ def get_stock_metadata(conn, ticker):
     return {"sector": None, "industry": None}
 
 
+def get_pit_marcap_status(conn, tickers, as_of):
+    """For each ticker, determine the source of its effective market_cap row.
+
+    Returns dict {ticker: source_label} where source_label is what's stored
+    in daily_prices.source for the most recent market_cap row on or before
+    as_of. Tickers with no market_cap row are absent from the result.
+    """
+    if not tickers:
+        return {}
+    cur = conn.cursor()
+    cur.execute("""
+        WITH latest AS (
+            SELECT ticker, MAX(date) AS d
+            FROM daily_prices
+            WHERE ticker = ANY(%s)
+              AND date <= %s
+              AND market_cap IS NOT NULL AND market_cap > 0
+            GROUP BY ticker
+        )
+        SELECT dp.ticker, dp.source
+        FROM latest l
+        JOIN daily_prices dp ON dp.ticker = l.ticker AND dp.date = l.d
+    """, (list(tickers), as_of))
+    rows = cur.fetchall()
+    cur.close()
+    return {t: s for t, s in rows}
+
+
+# Factors that consume market_cap directly. When a stock's effective marcap
+# source isn't 'marcap_historical' AND we're in PIT-strict mode, these are
+# explicitly marked as missing with reason 'non_pit_market_cap' rather than
+# computed against biased market cap.
+MARKET_CAP_DEPENDENT_FACTORS = frozenset({
+    "market_cap",
+    "log_market_cap",
+    "pe_ttm_inv",
+    "price_book",
+    "price_sales_ttm_inv",
+    "ev_sales_ttm_inv",
+    "ebitda_ev",
+    "gross_profit_ev",
+    "ocf_mcap",
+    "fcf_mcap",
+    "ufcf_ev",
+    "dividend_yield",
+})
+
+
 def get_price_history(conn, ticker, as_of, days=260):
     """Get up to `days` trading days of price history ending at as_of.
 
@@ -212,8 +260,18 @@ def get_short_selling(conn, ticker, as_of):
 # Factor computation orchestration
 # ---------------------------------------------------------------------------
 
-def compute_all_factors(conn, ticker, as_of):
+def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
     """Compute all implemented factors for a single stock.
+
+    Args:
+        conn: psycopg2 connection
+        ticker: KRX ticker
+        as_of: ISO date string
+        mcap_pit_safe: True if this ticker's effective market_cap comes from a
+            point-in-time source ('marcap_historical'). When False AND we're
+            in PIT-strict mode (handled by the caller via the value passed
+            here), all market-cap-dependent factors are explicitly marked
+            missing with reason 'non_pit_market_cap'.
 
     Returns:
         dict: {factorId: rawValue or None, ...}
@@ -246,13 +304,17 @@ def compute_all_factors(conn, ticker, as_of):
                 latest_close = p[4]
                 break
         if latest_close:
-            # Try shares from financial statements first
             if fin and fin.get("shares_outstanding") and fin["shares_outstanding"] > 0:
                 shares_outstanding = fin["shares_outstanding"]
                 market_cap = latest_close * shares_outstanding
-            # Try shares from daily_prices
             elif shares_outstanding and shares_outstanding > 0:
                 market_cap = latest_close * shares_outstanding
+
+    # PIT enforcement: if the caller has determined this ticker's market cap
+    # is not point-in-time safe, treat market_cap as missing for all factor
+    # calculations. This cascades cleanly to all market-cap-dependent factors.
+    if not mcap_pit_safe:
+        market_cap = None
 
     factors = {}
     missing_reasons = {}
@@ -260,6 +322,15 @@ def compute_all_factors(conn, ticker, as_of):
     implemented = get_implemented_factors()
 
     for factor_id, factor_meta in implemented.items():
+        # Hard-skip market-cap-dependent factors when PIT-unsafe so they
+        # carry the explicit reason 'non_pit_market_cap' instead of a
+        # generic 'no_data'. The downstream UI / diagnostics show this
+        # reason verbatim.
+        if not mcap_pit_safe and factor_id in MARKET_CAP_DEPENDENT_FACTORS:
+            factors[factor_id] = None
+            missing_reasons[factor_id] = "non_pit_market_cap"
+            continue
+
         compute_fn_name = factor_meta.get("compute_function")
         if not compute_fn_name:
             factors[factor_id] = None
@@ -450,6 +521,32 @@ def compute_industry_factors(all_raw_factors, ticker_industry_map, tickers):
 # Upsert
 # ---------------------------------------------------------------------------
 
+def clear_existing_snapshots(conn, universe_name, as_of, tickers):
+    """Delete factor_snapshots for the given universe + date + ticker scope.
+
+    This runs at the start of every recalculation pass. Without it, factor
+    rows from a PREVIOUS calculation can outlive the new run when a factor
+    becomes missing (e.g. PIT enforcement suppresses a market-cap-dependent
+    factor) -- the upsert wouldn't touch those stale rows because no new
+    INSERT row exists for the same (universe, ticker, factor, date) key.
+
+    Returns the number of rows deleted.
+    """
+    if not tickers:
+        return 0
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM factor_snapshots
+        WHERE universe_name = %s
+          AND date = %s
+          AND ticker = ANY(%s)
+    """, (universe_name, as_of, list(tickers)))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    return deleted
+
+
 def upsert_factor_snapshots(conn, rows):
     """Write factor snapshot rows, scoped by universe_name.
 
@@ -568,6 +665,24 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, help="Max tickers to process")
     parser.add_argument("--exclude-financials", action="store_true",
                         help="Exclude financial-sector stocks (banks, insurance, securities)")
+
+    # Point-in-time market cap enforcement.
+    # Default behavior: PIT-strict for historical as-of dates, off for current.
+    pit_group = parser.add_mutually_exclusive_group()
+    pit_group.add_argument(
+        "--require-pit-market-cap", dest="pit_mode",
+        action="store_const", const="require",
+        help=("Enforce PIT market cap. Stocks whose effective market_cap "
+              "source is not 'marcap_historical' get all market-cap-dependent "
+              "factors marked missing with reason 'non_pit_market_cap'. "
+              "Default for historical as-of dates."))
+    pit_group.add_argument(
+        "--allow-snapshot-market-cap", dest="pit_mode",
+        action="store_const", const="allow",
+        help=("Allow snapshot market cap. Use only for current-day "
+              "validation; produces biased value factors for historical dates."))
+    parser.set_defaults(pit_mode=None)  # auto
+
     args = parser.parse_args()
 
     as_of = args.as_of_date
@@ -626,6 +741,61 @@ if __name__ == "__main__":
     print("  Scoring method: percentile_rank (0-100, ties get average rank)")
     print("  Universe scope: {0}".format(universe_name_for_scope))
 
+    # Resolve PIT mode: explicit flag overrides; otherwise auto from date.
+    _today_iso = datetime.now().strftime("%Y-%m-%d")
+    _is_historical = as_of < _today_iso
+    if args.pit_mode == "require":
+        require_pit = True
+    elif args.pit_mode == "allow":
+        require_pit = False
+    else:
+        require_pit = _is_historical  # auto: strict for historical dates
+
+    print("  PIT mode:       {0} ({1})".format(
+        "require_pit_market_cap" if require_pit else "allow_snapshot_market_cap",
+        "historical date" if _is_historical else "current date"))
+
+    # Build per-ticker PIT-safety map for the universe.
+    mcap_sources = get_pit_marcap_status(conn, tickers, as_of)
+    pit_safe_set = set()
+    non_pit_set = set()
+    no_mcap_set = set()
+    for t in tickers:
+        src = mcap_sources.get(t)
+        if src is None:
+            no_mcap_set.add(t)
+        elif src == "marcap_historical":
+            pit_safe_set.add(t)
+        else:
+            non_pit_set.add(t)
+    print("  Market cap PIT: {0} PIT-safe, {1} snapshot-only, {2} no marcap row".format(
+        len(pit_safe_set), len(non_pit_set), len(no_mcap_set)))
+    if require_pit and non_pit_set:
+        print("  -> {0} stocks will get non_pit_market_cap on all "
+              "market-cap-dependent factors.".format(len(non_pit_set)))
+
+    # Tell the operator what's about to happen with non-PIT market cap.
+    # The wording differs based on whether we're enforcing PIT (suppressing
+    # the dependent factors) or allowing snapshot (computing biased values).
+    if _is_historical and non_pit_set:
+        if require_pit:
+            print("  ! Note: {0}/{1} stocks have non-PIT market cap on {2}. "
+                  "Market-cap-dependent factors will be SUPPRESSED for these "
+                  "stocks (reason='non_pit_market_cap').".format(
+                      len(non_pit_set), len(tickers), as_of))
+            print("  ! To backfill PIT data: python ingest_marcap.py --source "
+                  "historical --as-of-date {0} --universe {1}".format(
+                      as_of, universe_name_for_scope))
+        else:
+            print("  ! WARNING: --allow-snapshot-market-cap is in effect and "
+                  "{0}/{1} stocks use snapshot market_cap on {2} (historical). "
+                  "Value factors WILL BE BIASED for these stocks.".format(
+                      len(non_pit_set), len(tickers), as_of))
+            print("  ! For PIT-safe ranking, re-run with --require-pit-market-cap "
+                  "or backfill: python ingest_marcap.py --source historical "
+                  "--as-of-date {0} --universe {1}".format(
+                      as_of, universe_name_for_scope))
+
     try:
         # Step 1: Load stock metadata for industry/sector grouping
         ticker_metadata = {}
@@ -635,11 +805,19 @@ if __name__ == "__main__":
             ticker_metadata[ticker] = meta
             ticker_industry_map[ticker] = meta.get("industry") or meta.get("sector") or ticker
 
-        # Step 2: Compute raw values for all tickers
+        # Step 2: Compute raw values for all tickers.
+        # Each ticker's mcap_pit_safe flag depends on (a) the policy
+        # (require_pit) and (b) the source of its effective market_cap row.
         all_raw = {}  # ticker -> {factorId: rawValue}
         all_missing = {}  # ticker -> {factorId: missingReason}
         for i, ticker in enumerate(tickers):
-            factors, missing = compute_all_factors(conn, ticker, as_of)
+            if require_pit:
+                pit_safe = ticker in pit_safe_set
+            else:
+                pit_safe = True  # treat all as safe; biased factors allowed
+            factors, missing = compute_all_factors(
+                conn, ticker, as_of, mcap_pit_safe=pit_safe,
+            )
             all_raw[ticker] = factors
             all_missing[ticker] = missing
             n_factors = sum(1 for v in factors.values() if v is not None)
@@ -676,7 +854,18 @@ if __name__ == "__main__":
                     raw, pct_rank, "calculated",
                 ))
 
-        # Step 6: Upsert
+        # Step 6a: Clear stale snapshots for this universe+date+ticker scope.
+        # Without this, factors that become missing in the new run (e.g.
+        # market-cap-dependent factors suppressed by PIT enforcement) would
+        # leave their old percentile_rank rows in place. The downstream
+        # ranking would then read those stale rows and produce wrong scores.
+        deleted = clear_existing_snapshots(
+            conn, universe_name_for_scope, as_of, tickers)
+        print("  Cleared {0} existing factor snapshots for "
+              "universe={1} date={2}".format(
+                  deleted, universe_name_for_scope, as_of))
+
+        # Step 6b: Upsert the freshly computed rows.
         n = upsert_factor_snapshots(conn, snapshot_rows)
         print("  Upserted {0} factor snapshot rows".format(n))
 
