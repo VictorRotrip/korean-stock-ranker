@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 
 from factor_definitions import FACTORS, get_implemented_factors
 from factor_calculators import technical, fundamental, industry, sentiment
+from factor_calculators import fundamental_ttm
 
 load_dotenv()
 
@@ -240,6 +241,123 @@ def get_prior_financials(conn, ticker, as_of, latest_period_end):
     return None
 
 
+def _ebitda_from_ttm(income_ttm):
+    """Best-effort TTM EBITDA = operating_income_ttm + depreciation_ttm.
+
+    Falls back to None if either component is missing.
+    """
+    oi = income_ttm.get("operating_income")
+    da = income_ttm.get("depreciation_amortization")
+    if oi is None:
+        return None
+    return oi + (da or 0)
+
+
+def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
+    """Build the (fin_dict, prior_dict, fundamental_meta) tuple used by the
+    fundamental factor calculators.
+
+    Strategy
+    --------
+    1. Try TTM from fundamental_snapshots (PIT-safe, quarterly-aware).
+    2. If TTM is unavailable, fall back to the legacy annual-only `fin`
+       passed in (which is what the original code path used).
+
+    The prior dict for YoY growth uses fundamental_snapshots' same-window
+    one-year-earlier view when TTM was available; otherwise it falls back
+    to legacy prior-annual at the call site (handled in compute_all_factors).
+
+    Returns
+    -------
+    fin_dict : dict   keys compatible with factor_calculators.fundamental
+                      (revenue, net_income, total_equity, etc.)
+    prior_dict : dict|None
+    fundamental_meta : dict
+        {
+          "income_source":   "ttm_quarterly" | "latest_annual"
+                            | "annual_fallback"
+                            | "insufficient_quarterly_history"
+                            | "annual_only"            # used legacy fin
+                            | "unavailable",
+          "balance_source":  "latest_quarterly" | "latest_annual"
+                            | "unavailable",
+          "ttm_period_end":  date or None,
+          "annual_period_end": date or None,
+          "available_quarters": int,
+        }
+    """
+    snap = fundamental_ttm.get_pit_fundamentals(conn, ticker, as_of)
+    src = snap["meta"]["income_source"]
+
+    if src in ("ttm_quarterly", "annual_fallback", "latest_annual"):
+        income = snap["income_ttm"]
+        balance = snap["balance"]
+        # The fundamental factor functions expect a single dict with the
+        # union of income + balance fields. Build that union here, mapping
+        # field names where they differ between fundamental_snapshots and
+        # the fundamental.py calculator's expectations.
+        fin_dict = {
+            # income statement
+            "revenue":            income.get("revenue"),
+            "gross_profit":       income.get("gross_profit"),
+            "operating_income":   income.get("operating_income"),
+            "net_income":         income.get("net_income"),
+            "eps":                income.get("eps"),
+            "operating_cash_flow": income.get("operating_cash_flow"),
+            "capital_expenditure": income.get("capex"),
+            "free_cash_flow":     income.get("free_cash_flow"),
+            "interest_expense":   income.get("interest_expense"),
+            "depreciation":       income.get("depreciation_amortization"),
+            "ebitda":             _ebitda_from_ttm(income),
+            # balance sheet
+            "total_assets":       balance.get("total_assets"),
+            "total_equity":       balance.get("total_equity"),
+            "total_liabilities":  balance.get("total_liabilities"),
+            "total_debt":         balance.get("total_debt"),
+            "cash":               balance.get("cash_and_equivalents"),
+            "shares_outstanding": balance.get("shares_outstanding"),
+            # legacy compatibility — none of these are sourced from TTM
+            "cost_of_revenue":    None,
+            "current_assets":     None,
+            "current_liabilities": None,
+            "dividends_paid":     None,
+        }
+        # Build the prior-year window for YoY growth.
+        prior = fundamental_ttm.get_pit_fundamentals_prior_year(
+            conn, ticker, as_of, snap["meta"].get("ttm_period_end")
+            or snap["meta"].get("annual_period_end"))
+        prior_dict = None
+        if prior is not None:
+            p_inc = prior["income_ttm"]
+            prior_dict = {
+                "revenue":            p_inc.get("revenue"),
+                "gross_profit":       p_inc.get("gross_profit"),
+                "operating_income":   p_inc.get("operating_income"),
+                "net_income":         p_inc.get("net_income"),
+                "eps":                p_inc.get("eps"),
+                "operating_cash_flow": p_inc.get("operating_cash_flow"),
+                "free_cash_flow":     p_inc.get("free_cash_flow"),
+            }
+        return fin_dict, prior_dict, snap["meta"]
+
+    # TTM completely unavailable: fall back to legacy annual-only `fin`.
+    if fallback_fin is not None:
+        return fallback_fin, None, {
+            "income_source": "annual_only",
+            "balance_source": "annual_only",
+            "ttm_period_end": None,
+            "annual_period_end": fallback_fin.get("period_end"),
+            "available_quarters": 0,
+        }
+    return None, None, {
+        "income_source": "unavailable",
+        "balance_source": "unavailable",
+        "ttm_period_end": None,
+        "annual_period_end": None,
+        "available_quarters": 0,
+    }
+
+
 def get_short_selling(conn, ticker, as_of):
     """Get latest short selling data."""
     cur = conn.cursor()
@@ -278,10 +396,20 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
         dict: {factorId: missingReason or None, ...}
     """
     prices = get_price_history(conn, ticker, as_of)
-    fin = get_latest_financials(conn, ticker, as_of)
-    prior = None
-    if fin:
-        prior = get_prior_financials(conn, ticker, as_of, fin["period_end"])
+    # Legacy annual-only PIT fundamentals — kept as a fallback for tickers
+    # that don't have rows in fundamental_snapshots yet.
+    fin_legacy = get_latest_financials(conn, ticker, as_of)
+    prior_legacy = None
+    if fin_legacy:
+        prior_legacy = get_prior_financials(conn, ticker, as_of, fin_legacy["period_end"])
+    # New: build TTM-aware `fin` from fundamental_snapshots.
+    # `fin_meta` records whether income data came from TTM, annual fallback,
+    # or was unavailable; downstream factor source labels use this.
+    fin, prior_ttm, fin_meta = build_fundamental_inputs(
+        conn, ticker, as_of, fallback_fin=fin_legacy)
+    # Use the TTM same-period prior when available; otherwise fall back to
+    # the legacy prior-annual we already loaded.
+    prior = prior_ttm if prior_ttm is not None else prior_legacy
     short = get_short_selling(conn, ticker, as_of)
 
     # Determine latest market cap and shares outstanding
@@ -318,10 +446,12 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
 
     factors = {}
     missing_reasons = {}
+    source_methods = {}
 
     implemented = get_implemented_factors()
 
     for factor_id, factor_meta in implemented.items():
+        data_source = factor_meta.get("data_source")
         # Hard-skip market-cap-dependent factors when PIT-unsafe so they
         # carry the explicit reason 'non_pit_market_cap' instead of a
         # generic 'no_data'. The downstream UI / diagnostics show this
@@ -329,12 +459,14 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
         if not mcap_pit_safe and factor_id in MARKET_CAP_DEPENDENT_FACTORS:
             factors[factor_id] = None
             missing_reasons[factor_id] = "non_pit_market_cap"
+            source_methods[factor_id] = "non_pit_market_cap"
             continue
 
         compute_fn_name = factor_meta.get("compute_function")
         if not compute_fn_name:
             factors[factor_id] = None
             missing_reasons[factor_id] = "unavailable"
+            source_methods[factor_id] = "unavailable"
             continue
 
         try:
@@ -349,11 +481,42 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
                 )
             factors[factor_id] = raw_value
 
+            # Record source-method per factor. For DART-derived factors,
+            # use the TTM/annual provenance recorded in fin_meta. Other
+            # factor types get their own source labels.
+            if data_source == "dart":
+                if raw_value is None:
+                    # If the factor failed for fundamentals reasons, surface
+                    # the same fin_meta source so the operator can see
+                    # whether quarterly data was the limiting factor.
+                    source_methods[factor_id] = fin_meta.get(
+                        "income_source", "unavailable")
+                else:
+                    source_methods[factor_id] = fin_meta.get(
+                        "income_source", "calculated")
+            elif data_source == "price":
+                source_methods[factor_id] = (
+                    "calculated" if raw_value is not None else "no_price_data"
+                )
+            elif data_source == "short_interest":
+                source_methods[factor_id] = (
+                    "calculated" if raw_value is not None else "no_short_data"
+                )
+            elif data_source == "estimates":
+                source_methods[factor_id] = "data_unavailable"
+            elif data_source == "derived":
+                source_methods[factor_id] = "post_processed"
+            else:
+                source_methods[factor_id] = (
+                    "calculated" if raw_value is not None else "unknown"
+                )
+
         except Exception as e:
             factors[factor_id] = None
             missing_reasons[factor_id] = "computation_error: {0}".format(str(e))
+            source_methods[factor_id] = "computation_error"
 
-    return factors, missing_reasons
+    return factors, missing_reasons, source_methods
 
 
 def _compute_single_factor(factor_id, factor_meta, compute_fn_name,
@@ -810,19 +973,41 @@ if __name__ == "__main__":
         # (require_pit) and (b) the source of its effective market_cap row.
         all_raw = {}  # ticker -> {factorId: rawValue}
         all_missing = {}  # ticker -> {factorId: missingReason}
+        all_methods = {}  # ticker -> {factorId: source_method}
+        ttm_status_counts = defaultdict(int)
         for i, ticker in enumerate(tickers):
             if require_pit:
                 pit_safe = ticker in pit_safe_set
             else:
                 pit_safe = True  # treat all as safe; biased factors allowed
-            factors, missing = compute_all_factors(
+            factors, missing, methods = compute_all_factors(
                 conn, ticker, as_of, mcap_pit_safe=pit_safe,
             )
             all_raw[ticker] = factors
             all_missing[ticker] = missing
+            all_methods[ticker] = methods
+            # Record this ticker's TTM status (the source method on a single
+            # representative DART factor). 'earnings_yield' is consumed by
+            # the value scoring pass and is sourced from TTM income, so we
+            # treat its method as a proxy for the ticker's fundamental
+            # source. Falls back to scanning any DART factor.
+            ts = methods.get("earnings_yield")
+            if ts is None:
+                for fid, m in methods.items():
+                    fmeta = FACTORS.get(fid, {})
+                    if fmeta.get("data_source") == "dart":
+                        ts = m
+                        break
+            ttm_status_counts[ts or "unknown"] += 1
             n_factors = sum(1 for v in factors.values() if v is not None)
             if (i + 1) % 50 == 0 or i == len(tickers) - 1:
                 print("  [{0}/{1}] {2}: {3} factors computed".format(i + 1, len(tickers), ticker, n_factors))
+
+        # TTM coverage summary across the universe.
+        print("")
+        print("  TTM / fundamental source breakdown:")
+        for label in sorted(ttm_status_counts.keys()):
+            print("    {0:<35} {1}/{2}".format(label, ttm_status_counts[label], len(tickers)))
 
         # Diagnostic: market_cap source summary
         mcap_count = sum(1 for t in tickers if all_raw.get(t, {}).get("market_cap") is not None)
@@ -830,6 +1015,15 @@ if __name__ == "__main__":
 
         # Step 3: Compute industry momentum
         compute_industry_factors(all_raw, ticker_industry_map, tickers)
+
+        # Industry factors are computed in post-processing; record their
+        # source method so the snapshot row doesn't end up with the default.
+        for ticker in tickers:
+            for fid in ("industry_momentum_26w", "industry_momentum_52w"):
+                if all_raw.get(ticker, {}).get(fid) is not None:
+                    all_methods.setdefault(ticker, {})[fid] = "post_processed"
+                else:
+                    all_methods.setdefault(ticker, {})[fid] = "no_industry_data"
 
         # Step 4: Collect all factor IDs
         all_factor_ids = set()
@@ -849,9 +1043,19 @@ if __name__ == "__main__":
 
             for ticker, pct_rank in ranks.items():
                 raw = raw_by_ticker[ticker]
+                # Per-factor source method records the fundamental provenance
+                # ('ttm_quarterly', 'annual_fallback', 'non_pit_market_cap',
+                # etc). Truncated to 50 chars to fit the migrated VARCHAR(50)
+                # column on factor_snapshots.source.
+                src_method = (
+                    all_methods.get(ticker, {}).get(factor_id)
+                    or "calculated"
+                )
+                if len(src_method) > 50:
+                    src_method = src_method[:50]
                 snapshot_rows.append((
                     universe_name_for_scope, ticker, factor_id, as_of,
-                    raw, pct_rank, "calculated",
+                    raw, pct_rank, src_method,
                 ))
 
         # Step 6a: Clear stale snapshots for this universe+date+ticker scope.

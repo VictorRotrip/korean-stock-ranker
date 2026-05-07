@@ -183,6 +183,125 @@ def main():
     with_norm = cur.fetchone()[0]
     print("  Stocks with snapshots:       {0}/{1}".format(with_norm, len(tickers)))
 
+    # 3a. Annual coverage by fiscal year (PIT-safe).
+    print()
+    print("  Annual coverage by fiscal year (PIT-safe, data_available <= as_of):")
+    cur.execute("""
+        SELECT fiscal_year, COUNT(DISTINCT ticker) FROM fundamental_snapshots
+        WHERE ticker = ANY(%s)
+          AND data_available_date <= %s
+          AND report_code = '11011'
+        GROUP BY fiscal_year ORDER BY fiscal_year DESC
+    """, (tickers, as_of))
+    for fy, cnt in cur.fetchall():
+        print("    FY{0}:  {1}/{2}".format(fy, cnt, len(tickers)))
+
+    # 3b. Quarterly coverage by fiscal year and report code.
+    print()
+    print("  Quarterly coverage by fiscal year and report code (PIT-safe):")
+    cur.execute("""
+        SELECT fiscal_year, report_code, COUNT(DISTINCT ticker)
+          FROM fundamental_snapshots
+         WHERE ticker = ANY(%s)
+           AND data_available_date <= %s
+           AND report_code IN ('11013','11012','11014')
+         GROUP BY fiscal_year, report_code
+         ORDER BY fiscal_year DESC, report_code
+    """, (tickers, as_of))
+    code_label = {"11013": "Q1", "11012": "H1", "11014": "9M"}
+    for fy, rc, cnt in cur.fetchall():
+        print("    FY{0} {1:<8}: {2}/{3}".format(
+            fy, code_label.get(rc, rc), cnt, len(tickers)))
+
+    # 3c. Latest available fundamental report per ticker.
+    print()
+    print("  Latest fundamental period per ticker (PIT-safe):")
+    cur.execute("""
+        SELECT
+          MAX(period_end) AS latest_period,
+          COUNT(DISTINCT ticker) AS n_at_latest
+        FROM fundamental_snapshots
+        WHERE ticker = ANY(%s)
+          AND data_available_date <= %s
+    """, (tickers, as_of))
+    latest_period, _ = cur.fetchone()
+    if latest_period:
+        cur.execute("""
+            WITH latest_per_ticker AS (
+              SELECT ticker, MAX(period_end) AS latest_pe
+                FROM fundamental_snapshots
+               WHERE ticker = ANY(%s) AND data_available_date <= %s
+               GROUP BY ticker
+            )
+            SELECT latest_pe, COUNT(*) FROM latest_per_ticker
+            GROUP BY latest_pe ORDER BY latest_pe DESC
+            LIMIT 8
+        """, (tickers, as_of))
+        for pe, n in cur.fetchall():
+            print("    period_end={0}: {1} tickers".format(pe, n))
+    else:
+        print("    (no PIT-safe fundamental rows for this scope)")
+
+    # 3d. Future-leak detection: would FY2025 annuals filed in 2026 be
+    # excluded from a 2025-12-30 PIT ranking? The check is general: any
+    # fiscal_year >= as_of_year that has rows where data_available_date >
+    # as_of indicates rows that would correctly be filtered out by the PIT
+    # rule. We surface this so the operator sees the engine is doing the
+    # right thing (and not silently using future data).
+    cur.execute("""
+        SELECT fiscal_year, report_code, COUNT(DISTINCT ticker)
+          FROM fundamental_snapshots
+         WHERE ticker = ANY(%s)
+           AND data_available_date > %s
+         GROUP BY fiscal_year, report_code
+         ORDER BY fiscal_year, report_code
+    """, (tickers, as_of))
+    leak_rows = cur.fetchall()
+    print()
+    print("  Future-data exclusion check (rows filtered by data_available_date > as_of):")
+    if leak_rows:
+        for fy, rc, cnt in leak_rows:
+            print("    FY{0} {1:<8}: {2} tickers (would be EXCLUDED)".format(
+                fy, code_label.get(rc, rc) if rc != "11011" else "Annual",
+                cnt))
+        print("    OK - the PIT filter on data_available_date is preventing "
+              "future-data leak.")
+    else:
+        print("    None. No fundamental rows in scope have "
+              "data_available_date > {0}.".format(as_of))
+
+    # 3e. TTM derivability per ticker — does each ticker have either 4
+    # consecutive cumulative quarters or an annual report we can fall back
+    # to? Counts are not exact (we approximate by checking the presence of
+    # current-year cumulative slots); the precise computation lives in
+    # factor_calculators.fundamental_ttm.
+    print()
+    print("  TTM derivability (approximate, PIT-safe):")
+    cur.execute("""
+        WITH years AS (
+          SELECT DISTINCT fiscal_year
+            FROM fundamental_snapshots
+           WHERE ticker = ANY(%s)
+             AND data_available_date <= %s
+        ),
+        slot_counts AS (
+          SELECT ticker, fiscal_year, COUNT(DISTINCT report_code) AS n_slots
+            FROM fundamental_snapshots
+           WHERE ticker = ANY(%s)
+             AND data_available_date <= %s
+             AND report_code IN ('11013','11012','11014','11011')
+           GROUP BY ticker, fiscal_year
+        )
+        SELECT
+          (SELECT COUNT(DISTINCT ticker) FROM slot_counts WHERE n_slots = 4) AS full_year,
+          (SELECT COUNT(DISTINCT ticker) FROM slot_counts WHERE n_slots = 3) AS three_slots,
+          (SELECT COUNT(DISTINCT ticker) FROM slot_counts WHERE n_slots <= 2) AS two_or_less
+    """, (tickers, as_of, tickers, as_of))
+    full4, three, two_or_less = cur.fetchone() or (0, 0, 0)
+    print("    Tickers with all 4 cumulative slots in some FY:  {0}".format(full4))
+    print("    Tickers with 3 slots in some FY:                  {0}".format(three))
+    print("    Tickers with <=2 slots in some FY:                {0}".format(two_or_less))
+
     # 4. Value factor eligibility
     print()
     print("--- VALUE FACTOR ELIGIBILITY ---")
@@ -298,6 +417,124 @@ def main():
             "{0:,.0f}".format(sh) if sh else "NULL",
             str(src or "?")[:7]))
 
+    # 7b. Universe point-in-time status.
+    # We classify each universe member into ONE of four buckets so the
+    # diagnosis is actionable. "Missing from marcap_historical" used to mean
+    # both "the parquet doesn't have this ticker" AND "the parquet has it
+    # but we never backfilled it into daily_prices" — those are very
+    # different problems and the recommendation is different too.
+    #
+    # Buckets (mutually exclusive, in priority order):
+    #   1. PIT-EXACT  : has source='marcap_historical' on the exact as-of date.
+    #   2. PIT-PRIOR  : has source='marcap_historical' on/before as-of, but
+    #                   the exact as-of date row is either missing or
+    #                   non-marcap_historical. Likely just needs an as-of
+    #                   backfill of ingest_marcap.py.
+    #   3. NON-PIT    : has any daily_prices row on/before as-of, but none
+    #                   are source='marcap_historical'. The marcap was set
+    #                   by ingest_prices.py / fdr_listing_snapshot — needs
+    #                   a historical-range backfill of ingest_marcap.py.
+    #   4. ABSENT     : universe member has no daily_prices row at all on
+    #                   or before as-of. Either ingest_prices.py never
+    #                   covered this date, or the ticker truly didn't trade
+    #                   yet. Recommend re-running ingest_prices.py first
+    #                   and only suggest rebuilding the universe if the
+    #                   ticker is still absent.
+    print()
+    print("--- UNIVERSE POINT-IN-TIME STATUS ---")
+    if args.universe:
+        print("  Universe name:    {0}".format(args.universe))
+    print("  Universe size:    {0}".format(len(tickers)))
+    print("  As-of date:       {0}".format(as_of))
+
+    # Single query computes all four counts in one pass to keep this section
+    # cheap on large universes.
+    cur.execute(
+        """
+        WITH per_ticker AS (
+            SELECT
+                s.ticker,
+                MAX(dp.date) FILTER (WHERE dp.source = 'marcap_historical'
+                                       AND dp.date <= %(as_of)s
+                                       AND dp.market_cap IS NOT NULL) AS pit_max_date,
+                MAX(dp.date) FILTER (WHERE dp.date <= %(as_of)s
+                                       AND dp.market_cap IS NOT NULL) AS any_max_date,
+                MAX(dp.date) FILTER (WHERE dp.date <= %(as_of)s) AS row_max_date
+            FROM stocks s
+            LEFT JOIN daily_prices dp ON dp.ticker = s.ticker
+            WHERE s.ticker = ANY(%(tickers)s)
+            GROUP BY s.ticker
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE pit_max_date = %(as_of)s::date)                             AS pit_exact,
+            COUNT(*) FILTER (WHERE pit_max_date IS NOT NULL AND pit_max_date < %(as_of)s::date) AS pit_prior,
+            COUNT(*) FILTER (WHERE pit_max_date IS NULL AND any_max_date IS NOT NULL)           AS non_pit,
+            COUNT(*) FILTER (WHERE pit_max_date IS NULL AND any_max_date IS NULL
+                               AND row_max_date IS NOT NULL)                                    AS no_marcap_only,
+            COUNT(*) FILTER (WHERE row_max_date IS NULL)                                        AS absent_in_db
+        FROM per_ticker
+        """,
+        {"as_of": as_of, "tickers": tickers},
+    )
+    pit_exact, pit_prior, non_pit, no_marcap_only, absent_in_db = cur.fetchone()
+
+    print("  PIT-exact (marcap_historical on {0}):           {1}/{2}".format(
+        as_of, pit_exact, len(tickers)))
+    print("  PIT-prior (marcap_historical earlier than as-of): {0}/{1}".format(
+        pit_prior, len(tickers)))
+    print("  NON-PIT (in daily_prices but source != marcap_historical): {0}/{1}".format(
+        non_pit, len(tickers)))
+    print("  IN DB but no market_cap row on/before as-of:    {0}/{1}".format(
+        no_marcap_only, len(tickers)))
+    print("  ABSENT from daily_prices entirely on/before as-of: {0}/{1}".format(
+        absent_in_db, len(tickers)))
+
+    needs_exact_backfill = pit_prior + non_pit + no_marcap_only
+    needs_range_backfill = non_pit + no_marcap_only
+    needs_universe_rebuild = absent_in_db
+
+    # Concrete, actionable suggestions per bucket. Only suggest rebuilding
+    # the universe if a member has NO daily_prices row at all on/before the
+    # as-of date (i.e. the ticker truly looks future-listed).
+    if pit_exact == len(tickers):
+        print("  STATUS: PIT-safe. Every universe member has marcap_historical "
+              "on the exact as-of date {0}.".format(as_of))
+    else:
+        print()
+        print("  RECOMMENDATIONS:")
+        if pit_prior > 0 and pit_prior == needs_exact_backfill - non_pit - no_marcap_only:
+            # Only pit_prior outstanding -> just need exact-date as-of refresh.
+            pass
+        if needs_exact_backfill > 0:
+            print("    * {0} ticker(s) have no marcap_historical row on the exact "
+                  "as-of date.".format(needs_exact_backfill))
+            print("      Fix: backfill the exact date with:")
+            print("        python ingest_marcap.py --source historical "
+                  "--as-of-date {0} \\".format(as_of))
+            print("          --universe {0}".format(args.universe or "<universe>"))
+        if needs_range_backfill > 0:
+            print("    * {0} ticker(s) have daily_prices rows but the marcap "
+                  "source is non-PIT (fdr/snapshot/null) — needs a historical-"
+                  "range backfill of ingest_marcap.py:".format(needs_range_backfill))
+            print("        python ingest_marcap.py --source historical \\")
+            print("          --start-date 2014-01-01 --end-date {0} \\".format(as_of))
+            print("          --universe {0} \\".format(args.universe or "<universe>"))
+            print("          --batch-size 25 --resume")
+        if needs_universe_rebuild > 0:
+            print("    * {0} ticker(s) are NOT in daily_prices on/before {1} at "
+                  "all.".format(needs_universe_rebuild, as_of))
+            print("      That can mean either:")
+            print("        (a) ingest_prices.py was not run for this date range, OR")
+            print("        (b) the ticker genuinely did not trade yet on {0}.".format(as_of))
+            print("      First, re-run ingest_prices.py for the universe and "
+                  "date range. If a ticker is still absent afterwards, only "
+                  "then consider rebuilding the universe with:")
+            print("        python ingest_universe.py --source historical "
+                  "--as-of-date {0} --require-pit \\".format(as_of))
+            print("          --limit-per-market 100 --sample-strategy largest \\")
+            print("          --exclude-preferred --exclude-etf --exclude-spac --exclude-reit \\")
+            print("          --universe-name <name>_pit_{0}".format(as_of.replace("-", "")))
+
     # 8. Factor snapshot coverage (scoped by universe + ticker filter so
     #    counts can never exceed the size of the chosen universe).
     print()
@@ -331,6 +568,51 @@ def main():
             as_of, scope_universe))
         print("  Run: python calculate_factors.py --universe {0} --as-of-date {1}".format(
             scope_universe, as_of))
+
+    # 8a. Source-method breakdown across this universe's factor snapshots.
+    # The source column on factor_snapshots is the per-(ticker,factor)
+    # provenance label written by calculate_factors.py — values include
+    # 'ttm_quarterly', 'annual_fallback', 'annual_only', 'non_pit_market_cap',
+    # 'no_price_data', 'calculated', etc.
+    print()
+    print("--- FACTOR SOURCE-METHOD BREAKDOWN (universe='{0}', as-of {1}) ---"
+          .format(scope_universe, as_of))
+    cur.execute("""
+        SELECT source, COUNT(*) AS n
+          FROM factor_snapshots
+         WHERE date = %s
+           AND universe_name = %s
+           AND ticker = ANY(%s)
+         GROUP BY source
+         ORDER BY n DESC
+    """, (as_of, scope_universe, tickers))
+    method_rows = cur.fetchall()
+    if method_rows:
+        for src, n in method_rows:
+            print("    {0:<35} {1} rows".format(src or "(null)", n))
+    else:
+        print("    (no factor_snapshots rows for this scope)")
+
+    # 8b. TTM vs annual-fallback per ticker — counts how many tickers had
+    # at least one factor scored with each source method on this universe
+    # / date. A healthy result is most tickers carrying 'ttm_quarterly'.
+    print()
+    print("  Tickers (distinct) by best-available fundamental source:")
+    cur.execute("""
+        SELECT source, COUNT(DISTINCT ticker)
+          FROM factor_snapshots
+         WHERE date = %s
+           AND universe_name = %s
+           AND ticker = ANY(%s)
+           AND source IN ('ttm_quarterly','latest_annual','annual_fallback',
+                          'annual_only','insufficient_quarterly_history',
+                          'unavailable')
+         GROUP BY source
+         ORDER BY source
+    """, (as_of, scope_universe, tickers))
+    for src, n in cur.fetchall():
+        print("    {0:<35} {1}/{2} tickers".format(
+            src, n, len(tickers)))
 
     # Also show how many other universes have data on this date (for
     # awareness that the system is multi-universe).

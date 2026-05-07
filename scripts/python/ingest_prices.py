@@ -1,12 +1,24 @@
 """
-Ingest daily OHLCV and market cap data into Supabase Postgres.
+Ingest daily OHLCV (and optionally market-cap supplementation) into Supabase
+Postgres.
+
+Defaults
+--------
+By default this script writes OHLCV ONLY. Historical market-cap, shares-
+outstanding, and trading-value are now owned by ingest_marcap.py (PIT-safe
+marcap_historical source). To avoid clobbering those PIT-safe rows:
+
+  * market_cap / shares_outstanding / trading_value are NEVER written by
+    default — even if FinanceDataReader returns them.
+  * The ON CONFLICT clause preserves existing rows whose source is
+    'marcap_historical' (we never downgrade PIT-correct rows to FDR/pykrx).
+  * pykrx market-cap supplementation is OFF by default and only runs when
+    --supplement-marcap-pykrx is passed AND KRX_ID/KRX_PW are present in env.
 
 Data sources (in order):
-1. FinanceDataReader: fdr.DataReader(ticker, start, end) — provides OHLCV + Marcap in single call
-2. pykrx per-ticker: stock.get_market_ohlcv(start, end, ticker) — fallback only
-
-Note: FinanceDataReader is preferred as it provides market cap (marcap) + OHLCV
-in a single call, making it more reliable than pykrx for bulk data.
+1. FinanceDataReader: fdr.DataReader(ticker, start, end) — OHLCV (and marcap,
+   ignored unless --supplement-marcap-pykrx).
+2. pykrx per-ticker: stock.get_market_ohlcv(start, end, ticker) — fallback OHLCV.
 
 Usage:
     python ingest_prices.py --tickers 005930,000660 --start-date 2024-01-01 --end-date 2024-12-31
@@ -16,6 +28,7 @@ Usage:
     python ingest_prices.py --dry-run --limit 5
     python ingest_prices.py --resume --start-date 2024-06-01
     python ingest_prices.py --market KOSPI,KOSDAQ --start-date 2024-06-01
+    python ingest_prices.py --universe test_200_large_pit_20251230 --start-date 2024-06-01 --supplement-marcap-pykrx
 """
 
 import os
@@ -40,6 +53,12 @@ SCRIPT_NAME = "ingest_prices"
 
 # Module-level flag to track if we've logged FDR columns yet
 _fdr_columns_logged = False
+
+# NOTE: ingest_prices.py treats every existing daily_prices.source value as
+# immutable. It only fills in source when the existing row was NULL. The
+# only place that overwrites source is ingest_marcap.py (which always sets
+# 'marcap_historical' for historical-range upserts). So there's no
+# allowlist/denylist needed here — see upsert_prices() docstring.
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +184,18 @@ def fetch_market_cap_from_pykrx(ticker, start_yyyymmdd, end_yyyymmdd, timeout=10
 # Data fetching — FinanceDataReader (primary)
 # ---------------------------------------------------------------------------
 
-def fetch_from_fdr(ticker, start, end, debug_columns=False):
-    """Fetch OHLCV + Marcap from FinanceDataReader.
+def fetch_from_fdr(ticker, start, end, debug_columns=False, supplement_marcap=False):
+    """Fetch OHLCV (and optionally Marcap) from FinanceDataReader.
 
     Args:
         ticker: stock ticker
         start: YYYY-MM-DD format
         end: YYYY-MM-DD format
         debug_columns: if True, always print columns; otherwise print only on first call
+        supplement_marcap: if True, attempt to fill missing market_cap from pykrx.
+                           Default False — historical marcap is owned by
+                           ingest_marcap.py and we don't want to clobber
+                           PIT-safe rows with FDR-only data.
 
     Returns:
         tuple: (df, source) where source is "fdr" or None if failed
@@ -237,26 +260,27 @@ def fetch_from_fdr(ticker, start, end, debug_columns=False):
                 axis=1
             )
 
-        # Check if market_cap is actually populated
-        has_marcap = "market_cap" in df.columns and df["market_cap"].notna().any()
-        if not has_marcap:
-            # Try to supplement from pykrx
-            try:
-                mcap_df = fetch_market_cap_from_pykrx(ticker, to_yyyymmdd(start), to_yyyymmdd(end))
-                if mcap_df is not None and not mcap_df.empty:
-                    # Merge on date
-                    df = df.merge(
-                        mcap_df[["date", "market_cap", "shares_outstanding", "trading_value"]].drop_duplicates("date"),
-                        on="date", how="left", suffixes=("", "_pykrx")
-                    )
-                    # Use pykrx values where FDR is missing
-                    for col in ["market_cap", "shares_outstanding", "trading_value"]:
-                        pykrx_col = col + "_pykrx"
-                        if pykrx_col in df.columns:
-                            df[col] = df[col].fillna(df[pykrx_col])
-                            df.drop(columns=[pykrx_col], inplace=True)
-            except Exception:
-                pass
+        # Optionally supplement missing market_cap from pykrx. Off by default
+        # — historical marcap belongs to ingest_marcap.py.
+        if supplement_marcap:
+            has_marcap = "market_cap" in df.columns and df["market_cap"].notna().any()
+            if not has_marcap:
+                try:
+                    mcap_df = fetch_market_cap_from_pykrx(ticker, to_yyyymmdd(start), to_yyyymmdd(end))
+                    if mcap_df is not None and not mcap_df.empty:
+                        # Merge on date
+                        df = df.merge(
+                            mcap_df[["date", "market_cap", "shares_outstanding", "trading_value"]].drop_duplicates("date"),
+                            on="date", how="left", suffixes=("", "_pykrx")
+                        )
+                        # Use pykrx values where FDR is missing
+                        for col in ["market_cap", "shares_outstanding", "trading_value"]:
+                            pykrx_col = col + "_pykrx"
+                            if pykrx_col in df.columns:
+                                df[col] = df[col].fillna(df[pykrx_col])
+                                df.drop(columns=[pykrx_col], inplace=True)
+                except Exception:
+                    pass
 
         # Ensure these columns exist
         if "shares_outstanding" not in df.columns:
@@ -274,13 +298,15 @@ def fetch_from_fdr(ticker, start, end, debug_columns=False):
 # Data fetching — pykrx (fallback)
 # ---------------------------------------------------------------------------
 
-def fetch_from_pykrx(ticker, start, end):
-    """Fetch OHLCV from pykrx (fallback only), and supplement with market cap data.
+def fetch_from_pykrx(ticker, start, end, supplement_marcap=False):
+    """Fetch OHLCV from pykrx (fallback only). Optionally supplement marcap.
 
     Args:
         ticker: stock ticker
         start: YYYYMMDD format
         end: YYYYMMDD format
+        supplement_marcap: if True, also fetch market_cap/shares/trading_value
+                           from pykrx market-cap endpoint. Default False.
 
     Returns:
         tuple: (df, source) where source is "pykrx" or None if failed
@@ -321,24 +347,30 @@ def fetch_from_pykrx(ticker, start, end):
 
     df["ticker"] = ticker
 
-    # Try to supplement with market cap data from pykrx
-    try:
-        mcap_df = fetch_market_cap_from_pykrx(ticker, start, end)
-        if mcap_df is not None and not mcap_df.empty:
-            df = df.merge(
-                mcap_df[["date", "market_cap", "shares_outstanding", "trading_value"]].drop_duplicates("date"),
-                on="date", how="left", suffixes=("", "_mcap")
-            )
-            # Remove any duplicate columns
-            for col in ["market_cap", "shares_outstanding", "trading_value"]:
-                mcap_col = col + "_mcap"
-                if mcap_col in df.columns:
-                    df.drop(columns=[mcap_col], inplace=True)
-        else:
+    # Optionally supplement with market cap data from pykrx
+    if supplement_marcap:
+        try:
+            mcap_df = fetch_market_cap_from_pykrx(ticker, start, end)
+            if mcap_df is not None and not mcap_df.empty:
+                df = df.merge(
+                    mcap_df[["date", "market_cap", "shares_outstanding", "trading_value"]].drop_duplicates("date"),
+                    on="date", how="left", suffixes=("", "_mcap")
+                )
+                for col in ["market_cap", "shares_outstanding", "trading_value"]:
+                    mcap_col = col + "_mcap"
+                    if mcap_col in df.columns:
+                        df.drop(columns=[mcap_col], inplace=True)
+            else:
+                df["market_cap"] = None
+                df["shares_outstanding"] = None
+                df["trading_value"] = None
+        except Exception:
             df["market_cap"] = None
             df["shares_outstanding"] = None
             df["trading_value"] = None
-    except Exception:
+    else:
+        # OHLCV-only mode: leave marcap fields blank so the upsert's COALESCE
+        # preserves any existing PIT-safe (marcap_historical) values.
         df["market_cap"] = None
         df["shares_outstanding"] = None
         df["trading_value"] = None
@@ -350,8 +382,30 @@ def fetch_from_pykrx(ticker, start, end):
 # Upsert
 # ---------------------------------------------------------------------------
 
-def upsert_prices(conn, df, dry_run=False):
-    """Upsert price data, filtering valid rows."""
+def upsert_prices(conn, df, dry_run=False, supplement_marcap=False):
+    """Upsert price data, filtering valid rows.
+
+    Contract for marcap source state (designed so ingest_marcap.py is the
+    sole authority for market_cap / shares_outstanding / trading_value /
+    source provenance):
+
+      * In OHLCV-only mode, market_cap / shares_outstanding / trading_value
+        are forced to NULL on the EXCLUDED side, so they are NEVER pushed
+        into daily_prices by this script.
+      * Existing non-null market_cap / shares_outstanding / trading_value
+        are NEVER overwritten by ingest_prices.py — even in supplement mode
+        we only fill in when the existing column is NULL. ingest_marcap.py
+        is the only caller that overwrites these fields.
+      * Existing source is NEVER changed by ingest_prices.py. We only fill
+        in `source` when the existing row had NULL — so a fresh row inserted
+        on a date we haven't seen before lands as 'fdr' / 'pykrx', but a row
+        whose source is already 'marcap_historical', 'fdr_listing_snapshot',
+        'fdr+marcap', etc. is left alone. ingest_marcap.py later upgrades
+        source to 'marcap_historical' on its own.
+
+    These rules mean it is safe to run `ingest_prices.py` and
+    `ingest_marcap.py` in any order, any number of times.
+    """
     if df.empty:
         return 0
 
@@ -364,31 +418,51 @@ def upsert_prices(conn, df, dry_run=False):
         close = row.get("close")
         if close is None or (isinstance(close, float) and pd.isna(close)) or close <= 0:
             continue
+
+        if supplement_marcap:
+            mcap = row.get("market_cap")
+            shares = row.get("shares_outstanding")
+            tval = row.get("trading_value")
+        else:
+            # OHLCV-only mode: never push marcap fields, even if FDR returned them.
+            mcap = None
+            shares = None
+            tval = None
+
         values.append((
             row["ticker"], row["date"],
             row.get("open"), row.get("high"), row.get("low"), close,
             row.get("volume"),
-            row.get("trading_value"),
-            row.get("market_cap"),
-            row.get("shares_outstanding"),
+            tval,
+            mcap,
+            shares,
             row.get("source", "unknown"),
         ))
 
     if not values:
         return 0
 
+    # ON CONFLICT semantics:
+    #   OHLCV (open/high/low/close/volume): always overwritten with EXCLUDED
+    #     (FDR is the authority for OHLCV).
+    #   trading_value / market_cap / shares_outstanding: fill-only — we keep
+    #     whatever was there, and only insert into a NULL slot.
+    #   source: fill-only — we never change an existing source.
     query = """
     INSERT INTO daily_prices (
         ticker, date, open, high, low, close,
         volume, trading_value, market_cap, shares_outstanding, source
     ) VALUES %s
     ON CONFLICT (ticker, date) DO UPDATE SET
-        open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
-        close = EXCLUDED.close, volume = EXCLUDED.volume,
-        trading_value = COALESCE(EXCLUDED.trading_value, daily_prices.trading_value),
-        market_cap = COALESCE(EXCLUDED.market_cap, daily_prices.market_cap),
-        shares_outstanding = COALESCE(EXCLUDED.shares_outstanding, daily_prices.shares_outstanding),
-        source = EXCLUDED.source
+        open   = EXCLUDED.open,
+        high   = EXCLUDED.high,
+        low    = EXCLUDED.low,
+        close  = EXCLUDED.close,
+        volume = EXCLUDED.volume,
+        trading_value      = COALESCE(daily_prices.trading_value,      EXCLUDED.trading_value),
+        market_cap         = COALESCE(daily_prices.market_cap,         EXCLUDED.market_cap),
+        shares_outstanding = COALESCE(daily_prices.shares_outstanding, EXCLUDED.shares_outstanding),
+        source             = COALESCE(daily_prices.source,             EXCLUDED.source)
     """
     execute_values(cur, query, values)
     conn.commit()
@@ -413,7 +487,34 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Skip tickers with full date range coverage")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be inserted but don't write")
     parser.add_argument("--debug-columns", action="store_true", help="Print FDR columns for every ticker")
+    parser.add_argument(
+        "--supplement-marcap-pykrx",
+        action="store_true",
+        help="If set, supplement missing market_cap from pykrx. Off by default — "
+             "historical marcap is owned by ingest_marcap.py. Requires KRX_ID/KRX_PW "
+             "in env; if those are missing the flag is auto-disabled at startup.",
+    )
     args = parser.parse_args()
+
+    # Resolve supplement-marcap mode once, up front. Avoids per-ticker pykrx
+    # auth failures spamming the log.
+    supplement_marcap = bool(args.supplement_marcap_pykrx)
+    if supplement_marcap:
+        krx_id = os.getenv("KRX_ID")
+        krx_pw = os.getenv("KRX_PW")
+        if not (krx_id and krx_pw):
+            print(
+                "WARN: --supplement-marcap-pykrx requested but KRX_ID/KRX_PW "
+                "are not set in env. Disabling pykrx market-cap supplementation "
+                "for this run (OHLCV-only).",
+                flush=True,
+            )
+            supplement_marcap = False
+        else:
+            print("  pykrx market-cap supplementation: ENABLED", flush=True)
+    else:
+        print("  Mode: OHLCV-only (historical marcap handled by ingest_marcap.py)",
+              flush=True)
 
     conn = psycopg2.connect(DATABASE_URL)
 
@@ -455,6 +556,7 @@ if __name__ == "__main__":
         "resume": args.resume,
         "dry_run": args.dry_run,
         "debug_columns": args.debug_columns,
+        "supplement_marcap_pykrx": supplement_marcap,
     })
 
     total_rows = 0
@@ -474,13 +576,20 @@ if __name__ == "__main__":
                     continue
 
             # 1. Try FDR first (primary source)
-            df, source = fetch_from_fdr(ticker, start, end, debug_columns=args.debug_columns)
+            df, source = fetch_from_fdr(
+                ticker, start, end,
+                debug_columns=args.debug_columns,
+                supplement_marcap=supplement_marcap,
+            )
 
             # 2. Fallback to pykrx if FDR failed or empty
             if df is None or df.empty:
                 yyyymmdd_start = to_yyyymmdd(start)
                 yyyymmdd_end = to_yyyymmdd(end)
-                df, source = fetch_from_pykrx(ticker, yyyymmdd_start, yyyymmdd_end)
+                df, source = fetch_from_pykrx(
+                    ticker, yyyymmdd_start, yyyymmdd_end,
+                    supplement_marcap=supplement_marcap,
+                )
 
             if df is None or df.empty:
                 print("no data")
@@ -493,7 +602,10 @@ if __name__ == "__main__":
             rows = len(df)
 
             if not args.dry_run:
-                n = upsert_prices(conn, df, dry_run=False)
+                n = upsert_prices(
+                    conn, df, dry_run=False,
+                    supplement_marcap=supplement_marcap,
+                )
                 total_rows += n
                 print("{}: {} rows -> {} upserted".format(source, rows, n))
                 batch_data.append((ticker, n))

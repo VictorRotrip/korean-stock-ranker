@@ -639,29 +639,45 @@ def get_resume_dates(conn, ticker_set, requested_dates, source_label):
     A date is considered 'done' if every ticker in ticker_set has a
     daily_prices row on that date with source = source_label and a non-null
     market_cap. Anything less and we re-run that date.
+
+    Note on types: `requested_dates` may be ISO strings (e.g. "2014-01-02")
+    coming straight from the marcap parquet, numpy datetimes, or python
+    date/datetime objects. We coerce to ISO strings and cast the array
+    parameter to date[] explicitly, otherwise psycopg2 sends text[] which
+    Postgres won't compare against a date column ("operator does not exist:
+    date = text").
     """
     if not ticker_set or not requested_dates:
         return list(requested_dates)
 
+    # Normalize every input to ISO YYYY-MM-DD string and de-duplicate while
+    # preserving order (so the returned todo list has stable ordering).
+    iso_seen = set()
+    iso_dates = []
+    for d in requested_dates:
+        if hasattr(d, "isoformat"):
+            d_iso = d.isoformat()[:10]
+        else:
+            d_iso = str(d)[:10]
+        if d_iso not in iso_seen:
+            iso_seen.add(d_iso)
+            iso_dates.append(d_iso)
+
     cur = conn.cursor()
     cur.execute("""
-        SELECT date, COUNT(DISTINCT ticker) AS done
+        SELECT date::text, COUNT(DISTINCT ticker) AS done
         FROM daily_prices
-        WHERE ticker = ANY(%s)
-          AND date = ANY(%s)
+        WHERE ticker = ANY(%s::text[])
+          AND date   = ANY(%s::date[])
           AND source = %s
           AND market_cap IS NOT NULL
         GROUP BY date
-    """, (list(ticker_set), list(requested_dates), source_label))
-    done_counts = {row[0].isoformat(): row[1] for row in cur.fetchall()}
+    """, (list(ticker_set), iso_dates, source_label))
+    done_counts = {row[0]: row[1] for row in cur.fetchall()}
     cur.close()
 
     target_size = len(ticker_set)
-    todo = []
-    for d in requested_dates:
-        d_iso = d if isinstance(d, str) else d.isoformat()
-        if done_counts.get(d_iso, 0) < target_size:
-            todo.append(d_iso)
+    todo = [d for d in iso_dates if done_counts.get(d, 0) < target_size]
     return todo
 
 
@@ -1110,7 +1126,18 @@ if __name__ == "__main__":
                            rows_updated=upd)
 
     except Exception as e:
-        log_finish(conn, log_id, "error", error_message=str(e))
+        # If the failure left the connection in a poisoned transaction
+        # (InFailedSqlTransaction), log_finish would itself raise. Roll back
+        # first so we always get a clean error row in ingestion_log.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            log_finish(conn, log_id, "error", error_message=str(e))
+        except Exception as log_err:
+            print("WARN: failed to write ingestion_log error row: {0}".format(log_err),
+                  flush=True)
         print("ERROR: {}".format(e), flush=True)
         import traceback
         traceback.print_exc()

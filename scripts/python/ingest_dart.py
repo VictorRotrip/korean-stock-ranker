@@ -235,13 +235,31 @@ def resolve_corp_code(ticker, corp_code_map):
 
 
 def find_filing(ticker, corp_code, year, report_code, timeout, retry_count=2):
-    """Find a filing and return (filing_date, receipt_no) or (None, None)."""
+    """Find a filing and return (filing_date, receipt_no) or (None, None).
+
+    Matching is done in three passes so we don't miss Q1/Q3 filings whose
+    report_nm uses a period marker like '(2024.03)' instead of an explicit
+    '1분기'/'3분기' label:
+
+      PASS 1  exact label match (1분기 / 3분기 / 반기 / 사업보고서)
+      PASS 2  period-marker fallback for Q1 / Q3 ('분기보고서' + '(YYYY.03)'
+              or '(YYYY.09)' in any of the common separator variants)
+      PASS 3  rcept_dt month fallback for Q1 / Q3:
+                * Q1 reports usually filed in months 04-06 of `year`
+                * Q3 reports usually filed in months 10-12 of `year`
+              We pick the earliest matching '분기보고서' filing in that window.
+      PASS 4  loosest fallback for annual ('사업보고서' even if 분기/반기 also
+              appears in the name).
+    """
     params = {
         "corp_code": corp_code,
         "bgn_de": "{}0101".format(year),
         "end_de": "{}0630".format(year + 1),
         "pblntf_ty": "A",
-        "page_count": "10",
+        # bumped from 10 -> 100. Some companies file >10 misc. reports in a
+        # year (auditor changes, corrections), which would push the actual
+        # quarterly off the first page and produce a false 'no report'.
+        "page_count": "100",
     }
 
     data = dart_api_call("list", params, timeout, retry_count)
@@ -249,7 +267,9 @@ def find_filing(ticker, corp_code, year, report_code, timeout, retry_count=2):
     if not data or data.get("status") != "000":
         return None, None
 
-    filings_list = data.get("list", [])
+    filings_list = data.get("list", []) or []
+
+    # PASS 1 — strict label match.
     matching = None
     for f in filings_list:
         report_nm = f.get("report_nm", "")
@@ -266,10 +286,55 @@ def find_filing(ticker, corp_code, year, report_code, timeout, retry_count=2):
             matching = f
             break
 
-    if not matching and filings_list:
+    # PASS 2 — period-marker fallback for Q1 / Q3.
+    if not matching and report_code in ("11013", "11014"):
+        period_token_year = year
+        if report_code == "11013":
+            markers = (
+                "({0}.03)".format(period_token_year),
+                "({0}.3)".format(period_token_year),
+                "({0}-03)".format(period_token_year),
+                "({0}/03)".format(period_token_year),
+            )
+        else:  # 11014
+            markers = (
+                "({0}.09)".format(period_token_year),
+                "({0}.9)".format(period_token_year),
+                "({0}-09)".format(period_token_year),
+                "({0}/09)".format(period_token_year),
+            )
         for f in filings_list:
             report_nm = f.get("report_nm", "")
-            if report_code == "11011" and "사업보고서" in report_nm:
+            if "분기보고서" in report_nm and any(m in report_nm for m in markers):
+                matching = f
+                break
+
+    # PASS 3 — rcept_dt month-window fallback for Q1 / Q3.
+    if not matching and report_code in ("11013", "11014"):
+        if report_code == "11013":
+            target_months = ("04", "05", "06")
+        else:
+            target_months = ("10", "11", "12")
+        candidates = [
+            f for f in filings_list
+            if "분기보고서" in (f.get("report_nm") or "")
+        ]
+        # Sort ascending by rcept_dt so we pick the earliest in-window filing
+        # (a later filing is usually a correction of the original).
+        candidates.sort(key=lambda x: str(x.get("rcept_dt") or ""))
+        for f in candidates:
+            rd = str(f.get("rcept_dt") or "")
+            if (len(rd) >= 6
+                    and rd[:4] == str(year)
+                    and rd[4:6] in target_months):
+                matching = f
+                break
+
+    # PASS 4 — loosest fallback for annual.
+    if not matching and report_code == "11011":
+        for f in filings_list:
+            report_nm = f.get("report_nm", "")
+            if "사업보고서" in report_nm:
                 matching = f
                 break
 
@@ -298,6 +363,236 @@ def fetch_finstate(corp_code, year, report_code, fs_div, timeout, retry_count=2)
     if not data or data.get("status") != "000":
         return None
     return data.get("list", [])
+
+
+def fetch_finstate_raw(corp_code, year, report_code, fs_div, timeout, retry_count=2):
+    """Same as fetch_finstate but returns the WHOLE response dict (status,
+    message, list) instead of just `list`. Used by --debug-dart-report so we
+    can show the operator the exact OpenDART status code and message."""
+    params = {
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": report_code,
+        "fs_div": fs_div,
+    }
+    data = dart_api_call("fnlttSinglAcntAll", params, timeout, retry_count)
+    return params, data
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers (--debug-dart-report)
+# ---------------------------------------------------------------------------
+
+def _filing_match_reason(report_code, report_nm, year):
+    """Return a short human reason if the filing should match the report code,
+    otherwise None. Mirrors the logic in find_filing() PASS 1 + PASS 2 so the
+    debug output explains why a filing was/wasn't picked."""
+    if not report_nm:
+        return None
+    if report_code == "11011":
+        if ("사업보고서" in report_nm
+                and "분기" not in report_nm
+                and "반기" not in report_nm):
+            return "primary: '사업보고서' (annual)"
+        if "사업보고서" in report_nm:
+            return "fallback: '사업보고서' (annual)"
+    elif report_code == "11012":
+        if "반기" in report_nm:
+            return "primary: '반기' (H1)"
+    elif report_code == "11013":
+        if "1분기" in report_nm:
+            return "primary: '1분기'"
+        if "분기보고서" in report_nm and any(
+            m in report_nm for m in (
+                "({0}.03)".format(year), "({0}.3)".format(year),
+                "({0}-03)".format(year), "({0}/03)".format(year))):
+            return "fallback: '분기보고서' + Q1 period marker"
+    elif report_code == "11014":
+        if "3분기" in report_nm:
+            return "primary: '3분기'"
+        if "분기보고서" in report_nm and any(
+            m in report_nm for m in (
+                "({0}.09)".format(year), "({0}.9)".format(year),
+                "({0}-09)".format(year), "({0}/09)".format(year))):
+            return "fallback: '분기보고서' + Q3 period marker"
+    return None
+
+
+def debug_one_report(ticker, corp_code, year, report_code, timeout, retry_count=2):
+    """Print a deep-dive trace for one (ticker, year, report_code) covering:
+        1. Identifiers + how the report code maps to fiscal_quarter / period_end.
+        2. Method A: list -> find_filing -> fnlttSinglAcntAll (current path).
+        3. Method B: direct fnlttSinglAcntAll, bypassing find_filing.
+       For each path, print:
+           - exact endpoint and raw params
+           - HTTP-level errors / OpenDART status code + message
+           - rows-returned count
+           - first 5 raw rows incl. account_nm, sj_div, fs_div,
+             thstrm_amount, thstrm_add_amount
+           - whether thstrm_amount and thstrm_add_amount are populated at all
+           - final classification reason (ok / no_report / no_data)."""
+    rt = REPORT_TYPES.get(report_code)
+    label = rt["label"] if rt else "?"
+    statement_type = rt["statement_type"] if rt else "?"
+    fiscal_quarter = rt["fiscal_quarter"] if rt else None
+    period_end = determine_period_end(year, report_code)
+
+    print()
+    print("=" * 78)
+    print("DEBUG  ticker={0}  corp_code={1}  year={2}  report_code={3} ({4})"
+          .format(ticker, corp_code, year, report_code, label))
+    print("       Maps to: statement_type={0}  fiscal_quarter={1}  period_end={2}"
+          .format(statement_type, fiscal_quarter, period_end))
+    print("=" * 78)
+
+    # ---------------- Method A: current pipeline path ----------------
+    print()
+    print("[Method A] Current path: 'list' -> match report_nm -> 'fnlttSinglAcntAll'")
+    print("-" * 78)
+    list_params = {
+        "corp_code": corp_code,
+        "bgn_de": "{}0101".format(year),
+        "end_de": "{}0630".format(year + 1),
+        "pblntf_ty": "A",
+        "page_count": "100",
+    }
+    print("  endpoint: GET {0}/list.json".format(DART_API_BASE))
+    print("  params:   {0}".format(json.dumps(list_params, ensure_ascii=False)))
+    list_data = dart_api_call("list", list_params, timeout, retry_count)
+    if not list_data:
+        print("  status:   NETWORK ERROR (no JSON returned)")
+        print("  classification: skip: list endpoint failed")
+        return
+    print("  status:   {0}  message: {1}".format(
+        list_data.get("status"), list_data.get("message")))
+    filings = list_data.get("list", []) or []
+    print("  rows:     {0}".format(len(filings)))
+    print("  First 5 filings:")
+    for f in filings[:5]:
+        print("    rcept_dt={0}  rcept_no={1}  report_nm={2}".format(
+            f.get("rcept_dt"), f.get("rcept_no"),
+            (f.get("report_nm") or "")[:55]))
+
+    matched = None
+    matched_reason = None
+    for f in filings:
+        reason = _filing_match_reason(
+            report_code, f.get("report_nm", ""), year)
+        if reason:
+            matched = f
+            matched_reason = reason
+            break
+    if matched:
+        print("  matched filing:")
+        print("    rcept_dt={0}  rcept_no={1}".format(
+            matched.get("rcept_dt"), matched.get("rcept_no")))
+        print("    report_nm={0}".format(
+            (matched.get("report_nm") or "")[:55]))
+        print("    reason: {0}".format(matched_reason))
+    else:
+        print("  matched filing: NONE")
+        print("  classification: skip: no report (find_filing returned None)")
+
+    # Always proceed to the fnlttSinglAcntAll call so the operator can see
+    # whether the financials *would* be available even if find_filing
+    # mismatched on names. This is the smoking gun if Method A fails but
+    # Method B succeeds.
+    for fs_div in ("CFS", "OFS"):
+        print()
+        print("  fnlttSinglAcntAll  fs_div={0}".format(fs_div))
+        params, data = fetch_finstate_raw(
+            corp_code, year, report_code, fs_div, timeout, retry_count)
+        print("    endpoint: GET {0}/fnlttSinglAcntAll.json".format(DART_API_BASE))
+        print("    params:   {0}".format(json.dumps(params, ensure_ascii=False)))
+        if not data:
+            print("    status:   NETWORK ERROR")
+            continue
+        print("    status:   {0}  message: {1}".format(
+            data.get("status"), data.get("message")))
+        rows = data.get("list", []) or []
+        print("    rows:     {0}".format(len(rows)))
+        if rows:
+            print("    First 5 rows:")
+            for r in rows[:5]:
+                print("      sj_div={0:<5} fs_div={1:<5} account_nm={2:<28} "
+                      "thstrm_amount={3:<15} thstrm_add_amount={4}".format(
+                          (r.get("sj_div") or "")[:5],
+                          (r.get("fs_div") or "")[:5],
+                          (r.get("account_nm") or "")[:28],
+                          str(r.get("thstrm_amount") or "-")[:15],
+                          str(r.get("thstrm_add_amount") or "-")))
+            has_thstrm = any(r.get("thstrm_amount") not in (None, "", "-")
+                             for r in rows)
+            has_add = any(r.get("thstrm_add_amount") not in (None, "", "-")
+                          for r in rows)
+            cfs_present = any(str(r.get("fs_div") or "").upper() == "CFS"
+                              for r in rows)
+            ofs_present = any(str(r.get("fs_div") or "").upper() == "OFS"
+                              for r in rows)
+            print("    has thstrm_amount values:      {0}".format(has_thstrm))
+            print("    has thstrm_add_amount values:  {0}  "
+                  "(needed for cumulative YTD on Q1/H1/Q3)".format(has_add))
+            print("    CFS rows present: {0}   OFS rows present: {1}"
+                  .format(cfs_present, ofs_present))
+            break
+        else:
+            print("    no rows -> falling through to next fs_div")
+
+    # ---------------- Method B: direct fnlttSinglAcntAll ----------------
+    print()
+    print("[Method B] Direct fnlttSinglAcntAll (bypasses find_filing)")
+    print("-" * 78)
+    succeeded_div = None
+    for fs_div in ("CFS", "OFS"):
+        params, data = fetch_finstate_raw(
+            corp_code, year, report_code, fs_div, timeout, retry_count)
+        print("  endpoint: GET {0}/fnlttSinglAcntAll.json  fs_div={1}".format(
+            DART_API_BASE, fs_div))
+        print("  params:   {0}".format(json.dumps(params, ensure_ascii=False)))
+        if not data:
+            print("  status:   NETWORK ERROR")
+            continue
+        print("  status:   {0}  message: {1}".format(
+            data.get("status"), data.get("message")))
+        rows = data.get("list", []) or []
+        print("  rows:     {0}".format(len(rows)))
+        if rows:
+            if succeeded_div is None:
+                succeeded_div = fs_div
+            print("  First 5 rows:")
+            for r in rows[:5]:
+                print("    sj_div={0:<5} fs_div={1:<5} account_nm={2:<28} "
+                      "thstrm_amount={3:<15} thstrm_add_amount={4}".format(
+                          (r.get("sj_div") or "")[:5],
+                          (r.get("fs_div") or "")[:5],
+                          (r.get("account_nm") or "")[:28],
+                          str(r.get("thstrm_amount") or "-")[:15],
+                          str(r.get("thstrm_add_amount") or "-")))
+            break
+        else:
+            print("  no rows for fs_div={0}".format(fs_div))
+
+    # ---------------- Verdict ----------------
+    print()
+    print("[Verdict] for ticker={0} year={1} report_code={2} ({3})".format(
+        ticker, year, report_code, label))
+    if succeeded_div:
+        print("  Method B (direct endpoint) WORKS via fs_div={0}.".format(
+            succeeded_div))
+        if matched:
+            print("  Method A (find_filing) ALSO matched a filing -> production "
+                  "should already work for this case.")
+        else:
+            print("  Method A FAILED (no filing matched). Production sees "
+                  "'skip: no report'. The fix is to relax find_filing's "
+                  "report_nm matching for {0}.".format(label))
+    else:
+        print("  Method B (direct endpoint) returned NO ROWS for both CFS and "
+              "OFS. The data does not exist in OpenDART for this "
+              "ticker/year/report_code. No code fix will recover it; the "
+              "company simply does not have a {0} filing for FY{1}.".format(
+                  label, year))
+    print("=" * 78)
 
 
 # ---------------------------------------------------------------------------
@@ -481,13 +776,37 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
         "receipt_no": receipt_no,
     }
 
+    # For interim filings (Q1 / H1 / Q3) the TTM derivation in
+    # fundamental_ttm.py expects income statement and cash flow values to be
+    # CUMULATIVE YTD so it can compute single-quarter values by subtracting
+    # the prior cumulative window. DART exposes the cumulative-since-start-
+    # of-fiscal-year amount as `thstrm_add_amount`; `thstrm_amount` on
+    # interim filings is just the current-period amount and is not what we
+    # want for income/CF. Balance sheet rows are point-in-time, so we always
+    # use `thstrm_amount` for them.
+    is_interim = report_code in ("11012", "11013", "11014")
+    BS_DIVS = ("BS", "BSE")  # DART balance-sheet sj_div values
+
     for item in accounts:
         account_name = str(item.get("account_nm", "")).strip()
-        if account_name in ACCOUNT_MAP:
-            field = ACCOUNT_MAP[account_name]
+        if account_name not in ACCOUNT_MAP:
+            continue
+        field = ACCOUNT_MAP[account_name]
+
+        sj_div = str(item.get("sj_div") or "").upper()
+        is_balance_sheet = sj_div in BS_DIVS
+
+        if is_interim and not is_balance_sheet:
+            # Income / Comprehensive Income / CF on Q1/H1/Q3: prefer cumulative.
+            val = parse_amount(item.get("thstrm_add_amount"))
+            if val is None:
+                val = parse_amount(item.get("thstrm_amount"))
+        else:
+            # Annual report or balance-sheet rows on any report: thstrm_amount.
             val = parse_amount(item.get("thstrm_amount"))
-            if val is not None:
-                result[field] = val
+
+        if val is not None:
+            result[field] = val
 
     # Derived fields
     if "revenue" in result and "cost_of_revenue" in result:
@@ -688,6 +1007,15 @@ if __name__ == "__main__":
                         help="Number of retries per failed request (default: 2)")
     parser.add_argument("--refresh-corp-codes", action="store_true",
                         help="Force re-download of corpCode.xml (ignoring cache)")
+    parser.add_argument(
+        "--debug-dart-report", action="store_true",
+        help="Diagnostic mode: for each (ticker, year, report_code) print the "
+             "exact OpenDART list / fnlttSinglAcntAll calls, response status, "
+             "raw rows, presence of thstrm_amount / thstrm_add_amount, and "
+             "compare the current 'find_filing -> fetch_finstate' path against "
+             "a direct fnlttSinglAcntAll call. Does not write to the DB. "
+             "Use --ticker / --tickers, --year, --reports.",
+    )
     args = parser.parse_args()
 
     if not DATABASE_URL:
@@ -804,6 +1132,29 @@ if __name__ == "__main__":
         report_codes = ["11011"]
         if args.quarterly:
             report_codes += ["11013", "11012", "11014"]
+
+    # ---------------- DEBUG MODE: per-report deep-dive ----------------
+    # Runs the diagnostic helper for every (ticker, year, report_code)
+    # combination. Does NOT write to the database. Exits before any normal
+    # ingestion logic so the operator can read the verdict cleanly.
+    if args.debug_dart_report:
+        print()
+        print("=" * 78)
+        print("DART DEBUG MODE  (no writes to financial_statements)")
+        print("  Tickers: {0}".format(", ".join(ticker_corp.keys())))
+        print("  Years:   {0}".format(years))
+        print("  Reports: {0}".format(report_codes))
+        print("=" * 78)
+        for t in ticker_corp:
+            for y in years:
+                for rc in report_codes:
+                    debug_one_report(
+                        t, ticker_corp[t], y, rc,
+                        args.timeout, args.retry,
+                    )
+                    time.sleep(args.rate_limit)
+        conn.close()
+        sys.exit(0)
 
     timeout_secs = args.timeout
     rate_limit = args.rate_limit

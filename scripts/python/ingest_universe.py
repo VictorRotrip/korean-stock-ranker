@@ -1,21 +1,39 @@
 """
 Ingest KOSPI and KOSDAQ stock universe into Supabase Postgres.
 
-Data source: FinanceDataReader.StockListing("KRX")
-Columns used: Code, Name, Market, Dept, Marcap, Stocks, Amount, Close
+Two sources:
+
+  snapshot    Uses fdr.StockListing("KRX") -- a CURRENT snapshot of all
+              KRX listings. Convenient for current-day work but NOT
+              point-in-time: a 2024-12-30 universe built this way includes
+              stocks that listed AFTER 2024-12-30, biasing any historical
+              ranking.
+
+  historical  Uses the FinanceData/marcap GitHub dataset for the requested
+              as-of date (or nearest prior trading day). Point-in-time
+              correct: only stocks that were actually listed/tradable on
+              that date appear. Required for backtests.
+
+  auto        Picks historical when --as-of-date is in the past, snapshot
+              otherwise.
 
 Sampling strategies:
   largest    - sort by market cap descending
-  liquid     - sort by average trading value descending
+  liquid     - sort by trading value descending
   random     - random sample
   stratified - proportional to each market total count
 
 Usage:
-    python ingest_universe.py --limit 200
-    python ingest_universe.py --limit-per-market 100 --exclude-preferred --exclude-etf --exclude-spac
-    python ingest_universe.py --market KOSPI --limit 50 --sample-strategy liquid
-    python ingest_universe.py --tickers 005930,000660
-    python ingest_universe.py --dry-run --limit 20
+    # Current/snapshot (legacy):
+    python ingest_universe.py --limit-per-market 100 --sample-strategy largest \
+        --exclude-preferred --exclude-etf --exclude-spac --exclude-reit \
+        --universe-name test_200_large
+
+    # Point-in-time historical:
+    python ingest_universe.py --source historical --as-of-date 2024-12-30 --require-pit \
+        --limit-per-market 100 --sample-strategy largest \
+        --exclude-preferred --exclude-etf --exclude-spac --exclude-reit \
+        --universe-name test_200_large_pit_20241230
 """
 
 import os
@@ -156,8 +174,39 @@ def enrich_sector(df):
     return df
 
 
+def load_from_historical_marcap(as_of_date, markets=None):
+    """Load KRX universe from the FinanceData/marcap historical dataset.
+
+    Returns (DataFrame, actual_trading_date) or (None, None) on failure.
+    Output schema is compatible with downstream tag_stocks / apply_exclusions
+    / sample_stocks: ticker, name, market, market_cap, shares_outstanding,
+    trading_value, close, dept.
+    """
+    try:
+        from data_sources import marcap_historical
+    except ImportError as e:
+        print("  ERROR: data_sources.marcap_historical not importable: {}".format(e))
+        return None, None
+
+    df, actual_date = marcap_historical.fetch_marcap_date(as_of_date)
+    if df is None or len(df) == 0:
+        print("  ERROR: historical marcap returned no data for {}".format(as_of_date))
+        return None, None
+
+    print("  Historical marcap: {} rows on trading date {} (requested {})".format(
+        len(df), actual_date, as_of_date))
+
+    if markets and "market" in df.columns:
+        before = len(df)
+        df = df[df["market"].isin(markets)].copy()
+        print("  Filtered to markets {}: {} -> {} stocks".format(
+            ",".join(markets), before, len(df)))
+
+    return df, actual_date
+
+
 def load_from_fdr(markets=None):
-    """Load full KRX universe from FinanceDataReader."""
+    """Load full KRX universe from FinanceDataReader (CURRENT snapshot)."""
     import FinanceDataReader as fdr
 
     if markets is None:
@@ -370,7 +419,7 @@ def sample_stocks(df, args):
     return df
 
 
-def upsert_to_db(conn, df, dry_run=False):
+def upsert_to_db(conn, df, dry_run=False, source_label="fdr"):
     if df.empty:
         return 0, 0
 
@@ -413,7 +462,7 @@ def upsert_to_db(conn, df, dry_run=False):
             bool(row.get("is_reit", False)),
             bool(row.get("is_financial", False)),
             bool(row.get("is_holding", False)),
-            "fdr",
+            source_label,
         ))
 
     query = """
@@ -527,6 +576,20 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true",
         help="Skip tickers already in DB")
 
+    # Point-in-time options
+    parser.add_argument("--as-of-date",
+        help="Reference date YYYY-MM-DD. Required for --source historical; "
+             "in --source auto, triggers historical mode for past dates.")
+    parser.add_argument("--source", default="snapshot",
+        choices=["snapshot", "historical", "auto"],
+        help=("Universe source. snapshot=current FDR listing (NOT PIT); "
+              "historical=FinanceData/marcap on as-of date (PIT-correct); "
+              "auto=historical for past --as-of-date, snapshot otherwise. "
+              "Default: snapshot."))
+    parser.add_argument("--require-pit", action="store_true",
+        help=("Refuse to fall back to snapshot if historical source is "
+              "unavailable or --as-of-date is current. Use for backtests."))
+
     args = parser.parse_args()
 
     markets = [m.strip() for m in args.market.split(",")]
@@ -584,15 +647,65 @@ if __name__ == "__main__":
         print("=" * 60)
         print()
 
-        if tickers_filter:
-            print("Loading specific tickers: {}".format(
-                ", ".join(sorted(tickers_filter))))
+        # ---- Resolve source (snapshot / historical / auto) ----
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        is_historical_date = bool(args.as_of_date) and args.as_of_date < today_iso
+
+        if args.source == "auto":
+            effective_source = "historical" if is_historical_date else "snapshot"
+        else:
+            effective_source = args.source
+
+        if effective_source == "historical" and not args.as_of_date:
+            print("ERROR: --source historical requires --as-of-date")
+            log_finish(conn, log_id, "error",
+                       error_message="historical without as-of-date")
+            conn.close()
+            sys.exit(1)
+
+        if args.require_pit and not is_historical_date:
+            print("ERROR: --require-pit requires --as-of-date in the past")
+            log_finish(conn, log_id, "error",
+                       error_message="require-pit without past as-of-date")
+            conn.close()
+            sys.exit(1)
+
+        actual_trading_date = None
+        if effective_source == "historical":
+            print("Loading historical marcap universe for {}...".format(args.as_of_date))
+            df, actual_trading_date = load_from_historical_marcap(
+                args.as_of_date, markets)
+            if df is None or len(df) == 0:
+                if args.require_pit:
+                    print("ERROR: --require-pit but historical source unavailable. "
+                          "Refusing to fall back to snapshot.")
+                    log_finish(conn, log_id, "error",
+                               error_message="require-pit historical unavailable")
+                    conn.close()
+                    sys.exit(1)
+                print("WARNING: historical source unavailable, falling back to snapshot.")
+                print("         Universe will NOT be point-in-time safe.")
+                effective_source = "snapshot_fallback"
+                df = load_from_fdr(markets)
+        else:
+            if args.source == "snapshot" and is_historical_date:
+                print("WARNING: --source snapshot used with historical "
+                      "as-of-date {}. Universe is NOT point-in-time safe.".format(
+                          args.as_of_date))
+                if args.require_pit:
+                    print("ERROR: --require-pit forbids snapshot for historical date.")
+                    log_finish(conn, log_id, "error",
+                               error_message="require-pit forbids snapshot for historical")
+                    conn.close()
+                    sys.exit(1)
+            print("Loading KRX universe (snapshot)...")
             df = load_from_fdr(markets)
+
+        if tickers_filter:
+            print("Filtering to specific tickers: {}".format(
+                ", ".join(sorted(tickers_filter))))
             df = df[df["ticker"].isin(tickers_filter)]
             print("  Matched: {}/{}".format(len(df), len(tickers_filter)))
-        else:
-            print("Loading KRX universe...")
-            df = load_from_fdr(markets)
 
         if df.empty:
             print("ERROR: No stocks found. Cannot proceed.")
@@ -643,20 +756,28 @@ if __name__ == "__main__":
 
         print_summary(df)
 
-        n, _ = upsert_to_db(conn, df, dry_run=args.dry_run)
+        # Stock-source label: 'marcap_historical' if we used the PIT source,
+        # 'fdr' for snapshot. Recorded on stocks.source so future audits
+        # can tell which path created the row.
+        stocks_source_label = (
+            "marcap_historical" if effective_source == "historical" else "fdr"
+        )
+
+        n, _ = upsert_to_db(conn, df, dry_run=args.dry_run,
+                            source_label=stocks_source_label)
         if not args.dry_run:
             print("  Upserted {} stocks to database".format(n))
 
         # Save universe membership
+        is_pit_safe = (effective_source == "historical")
+
         if args.universe_name and not args.dry_run:
             uname = args.universe_name
             cur = conn.cursor()
-            # Replace: delete old membership for this universe name
             cur.execute(
                 "DELETE FROM universe_memberships WHERE universe_name = %s",
                 (uname,))
             deleted = cur.rowcount
-            # Insert new membership
             mem_values = [(uname, row["ticker"]) for _, row in df.iterrows()]
             execute_values(cur,
                 "INSERT INTO universe_memberships (universe_name, ticker) "
@@ -669,6 +790,41 @@ if __name__ == "__main__":
         elif args.universe_name and args.dry_run:
             print("  [DRY RUN] Would save universe '{}' with {} members".format(
                 args.universe_name, len(df)))
+
+        # ---- Universe metadata block (always print) ----
+        # universe_memberships currently has no metadata columns; we print
+        # this for the operator. TODO: persist in a universe_metadata table
+        # so the UI / diagnose script can read it back without grepping logs.
+        excl = []
+        if args.exclude_preferred: excl.append("preferred")
+        if args.exclude_etf:       excl.append("etf")
+        if args.exclude_spac:      excl.append("spac")
+        if args.exclude_reit:      excl.append("reit")
+        if args.exclude_financials: excl.append("financials")
+
+        market_counts = df["market"].value_counts().to_dict() if "market" in df.columns else {}
+
+        print()
+        print("  === UNIVERSE METADATA ===")
+        print("  Universe name:       {0}".format(args.universe_name or "(unnamed)"))
+        print("  Source:              {0}".format(effective_source))
+        if args.as_of_date:
+            print("  Requested as-of:     {0}".format(args.as_of_date))
+        if actual_trading_date:
+            print("  Trading date used:   {0}".format(actual_trading_date))
+        print("  Selection strategy:  {0}".format(args.sample_strategy))
+        if market_counts:
+            print("  Market counts:       {0}".format(
+                ", ".join("{}={}".format(m, c)
+                         for m, c in sorted(market_counts.items()))))
+        print("  Total selected:      {0}".format(len(df)))
+        print("  Exclusions applied:  {0}".format(
+            ", ".join(excl) if excl else "(none)"))
+        print("  Point-in-time safe:  {0}".format("yes" if is_pit_safe else "no"))
+        if not is_pit_safe and args.as_of_date and is_historical_date:
+            print("  ! WARNING: --as-of-date {0} is historical but universe is "
+                  "snapshot-derived. NOT suitable for backtests.".format(
+                      args.as_of_date))
 
         log_finish(conn, log_id, "success",
                    rows_processed=len(df), rows_inserted=n)

@@ -154,7 +154,10 @@ def normalize_financial(fs_row):
 
     Returns: dict with canonical field names or None if invalid.
     """
-    # Determine report code from statement_type
+    # Determine report code from statement_type. fiscal_quarter is the
+    # secondary signal (1/2/3) used when statement_type is missing or
+    # uses some legacy label. We never want to leave report_code NULL,
+    # because the unique index on fundamental_snapshots keys on it.
     type_to_code = {
         "annual": "11011",
         "Q1": "11013",
@@ -162,6 +165,16 @@ def normalize_financial(fs_row):
         "Q3": "11014",
     }
     report_code = type_to_code.get(fs_row.get("statement_type"), None)
+    if report_code is None:
+        fq = fs_row.get("fiscal_quarter")
+        if fq == 1:
+            report_code = "11013"
+        elif fq == 2:
+            report_code = "11012"
+        elif fq == 3:
+            report_code = "11014"
+        elif fq in (None, 4):
+            report_code = "11011"
 
     # Build result with all available fields
     result = {
@@ -251,6 +264,11 @@ def upsert_fundamental_snapshots(conn, records):
             r.get("source", "dart"), r.get("updated_at"),
         ))
 
+    # Conflict target = the unique index created by migration 006:
+    #   (ticker, fiscal_year, report_code, consolidated_or_separate)
+    # NULLS NOT DISTINCT (Postgres 15+). The previous index keyed on
+    # period_end + fiscal_quarter, which let NULL-fiscal_quarter annual
+    # rows duplicate on every rerun.
     query = """
     INSERT INTO fundamental_snapshots (
         ticker, period_end, data_available_date,
@@ -267,8 +285,10 @@ def upsert_fundamental_snapshots(conn, records):
         shares_outstanding, dividends_paid,
         source, updated_at
     ) VALUES %s
-    ON CONFLICT (ticker, period_end, fiscal_quarter, consolidated_or_separate)
+    ON CONFLICT (ticker, fiscal_year, report_code, consolidated_or_separate)
     DO UPDATE SET
+        period_end = EXCLUDED.period_end,
+        fiscal_quarter = EXCLUDED.fiscal_quarter,
         data_available_date = EXCLUDED.data_available_date,
         revenue = COALESCE(EXCLUDED.revenue, fundamental_snapshots.revenue),
         gross_profit = COALESCE(EXCLUDED.gross_profit, fundamental_snapshots.gross_profit),
@@ -342,6 +362,131 @@ def compute_coverage_stats(conn, tickers=None):
     return coverage
 
 
+def compute_report_code_coverage(conn, tickers=None):
+    """Distinct-ticker counts per report_code and fiscal_year.
+
+    Powers the diagnostics block printed at the end of the normalization run
+    so the operator can see whether quarterly DART data was actually picked up.
+    Rows in fundamental_snapshots have report_code in {11011, 11013, 11012,
+    11014} corresponding to {annual, Q1, half-year, 9M-cumulative}.
+    """
+    conditions = []
+    params = []
+    if tickers:
+        placeholders = ",".join(["%s"] * len(tickers))
+        conditions.append("ticker IN ({})".format(placeholders))
+        params = list(tickers)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT fiscal_year, report_code, COUNT(DISTINCT ticker), COUNT(*)
+             FROM fundamental_snapshots
+           {wc}
+           GROUP BY fiscal_year, report_code
+           ORDER BY fiscal_year DESC, report_code""".format(wc=where_clause),
+        params,
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def compute_duplicate_logical_keys(conn, tickers=None):
+    """Return (total_rows, distinct_logical_keys, duplicate_groups, surplus_rows).
+
+    A duplicate group is a (ticker, fiscal_year, report_code,
+    consolidated_or_separate) value with more than one row in
+    fundamental_snapshots. After migration 006 this should always be 0.
+    If it is non-zero, the script prints a WARNING telling the operator
+    to run migration 006.
+    """
+    conditions = []
+    params = []
+    if tickers:
+        placeholders = ",".join(["%s"] * len(tickers))
+        conditions.append("ticker IN ({})".format(placeholders))
+        params = list(tickers)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM fundamental_snapshots " + where_clause,
+                params)
+    total_rows = cur.fetchone()[0]
+
+    cur.execute(
+        """SELECT COUNT(*) FROM (
+               SELECT 1
+                 FROM fundamental_snapshots
+               {wc}
+               GROUP BY ticker,
+                        fiscal_year,
+                        COALESCE(report_code, 'unknown'),
+                        COALESCE(consolidated_or_separate, 'consolidated')
+           ) t""".format(wc=where_clause),
+        params,
+    )
+    distinct_logical = cur.fetchone()[0]
+
+    cur.execute(
+        """SELECT COUNT(*) FROM (
+               SELECT 1
+                 FROM fundamental_snapshots
+               {wc}
+               GROUP BY ticker,
+                        fiscal_year,
+                        COALESCE(report_code, 'unknown'),
+                        COALESCE(consolidated_or_separate, 'consolidated')
+               HAVING COUNT(*) > 1
+           ) t""".format(wc=where_clause),
+        params,
+    )
+    duplicate_groups = cur.fetchone()[0]
+    cur.close()
+
+    surplus = total_rows - distinct_logical
+    return total_rows, distinct_logical, duplicate_groups, surplus
+
+
+def compute_raw_statement_type_coverage(conn, tickers=None):
+    """Distinct-ticker counts per statement_type / fiscal_year in the RAW
+    financial_statements table.
+
+    This is the input side of the pipeline. If Q1 / Q3 don't show up here,
+    they're not in DART yet — re-run ingest_dart.py with --quarterly. If
+    they DO show up here but not in fundamental_snapshots, that's a
+    normalizer bug.
+
+    statement_type values written by ingest_dart.py: 'annual', 'Q1', 'Q2',
+    'Q3'. We translate each to its DART report code so the diagnostic
+    columns match the rest of the pipeline.
+    """
+    conditions = []
+    params = []
+    if tickers:
+        placeholders = ",".join(["%s"] * len(tickers))
+        conditions.append("ticker IN ({})".format(placeholders))
+        params = list(tickers)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT fiscal_year, statement_type,
+                  COUNT(DISTINCT ticker), COUNT(*)
+             FROM financial_statements
+           {wc}
+           GROUP BY fiscal_year, statement_type
+           ORDER BY fiscal_year DESC, statement_type""".format(wc=where_clause),
+        params,
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -395,13 +540,70 @@ if __name__ == "__main__":
         print("DART Financial Normalization")
         print("=" * 50)
         if tickers:
-            print("  Tickers: {}".format(", ".join(tickers)))
+            print("  Tickers: {}".format(", ".join(tickers[:5]) +
+                                         (" ... +{0} more".format(len(tickers) - 5)
+                                          if len(tickers) > 5 else "")))
         if years:
             print("  Years:   {}".format(years))
         if limit:
             print("  Limit:   {}".format(limit))
         if dry_run:
             print("  DRY RUN: no writes will be made")
+        print("=" * 50)
+        print()
+
+        # Pre-flight: idempotency check. If migration 006 hasn't been applied
+        # there will already be duplicate logical keys in fundamental_snapshots
+        # — abort with a loud warning rather than silently doubling them.
+        total_rows, distinct_logical, dup_groups, surplus = (
+            compute_duplicate_logical_keys(conn, tickers)
+        )
+        if dup_groups > 0:
+            print()
+            print("!" * 70)
+            print("WARNING: fundamental_snapshots has {0} duplicate logical "
+                  "key group(s)".format(dup_groups))
+            print("         total_rows={0}  distinct_logical_keys={1}  "
+                  "surplus_rows={2}".format(
+                      total_rows, distinct_logical, surplus))
+            print("         The unique index keyed on (ticker, period_end, "
+                  "fiscal_quarter, consolidated_or_separate) treats NULL "
+                  "fiscal_quarter (= annual) as distinct, so re-runs of this")
+            print("         normalizer have been inserting duplicate annual "
+                  "rows on every pass.")
+            print("         Fix: run scripts/sql/006_fundamental_snapshots_"
+                  "dedupe.sql in Supabase SQL Editor, then rerun this "
+                  "script.")
+            print("         Aborting to avoid making the duplicates worse.")
+            print("!" * 70)
+            sys.exit(2)
+
+        # Pre-flight: print RAW financial_statements coverage so the operator
+        # can immediately see whether Q1/Q2/Q3 are present BEFORE normalizing.
+        # If a code is missing here, no amount of normalizing will produce it
+        # in fundamental_snapshots; the fix is to re-run ingest_dart.py with
+        # --quarterly for the missing years.
+        print("RAW financial_statements coverage (input)")
+        print("=" * 50)
+        type_to_code = {
+            "annual": "11011",
+            "Q1": "11013",
+            "Q2": "11012",
+            "Q3": "11014",
+        }
+        raw_rows = compute_raw_statement_type_coverage(conn, tickers)
+        if not raw_rows:
+            print("  (no rows in financial_statements for this scope)")
+            print("  Hint: run ingest_dart.py --universe <name> --full --quarterly")
+        else:
+            print("  {0:<6} {1:<18} {2:>14} {3:>10}".format(
+                "FY", "Code (Type)", "DistinctTickers", "Rows"))
+            for fy, st, n_t, n_rows in raw_rows:
+                rc = type_to_code.get(st, "?")
+                print("  {0:<6} {1:<18} {2:>14} {3:>10}".format(
+                    fy or "?",
+                    "{0} ({1})".format(rc, st or "?"),
+                    n_t, n_rows))
         print("=" * 50)
         print()
 
@@ -442,6 +644,52 @@ if __name__ == "__main__":
         coverage = compute_coverage_stats(conn, tickers)
         for field, stat in sorted(coverage.items()):
             print("  {}: {}".format(field, stat))
+        print("=" * 50)
+
+        # Report-code coverage breakdown (annual vs quarterly)
+        print()
+        print("Report-Code Coverage (rows in fundamental_snapshots)")
+        print("=" * 50)
+        # Map DART report codes to human labels matching how the rest of the
+        # pipeline talks about them.
+        code_label = {
+            "11011": "Annual",
+            "11013": "Q1",
+            "11012": "H1 (Q2)",
+            "11014": "9M (Q3)",
+        }
+        rc_rows = compute_report_code_coverage(conn, tickers)
+        if not rc_rows:
+            print("  (no rows in fundamental_snapshots for this scope)")
+        else:
+            print("  {0:<6} {1:<10} {2:>14} {3:>10}".format(
+                "FY", "Code", "DistinctTickers", "Rows"))
+            for fy, rc, n_t, n_rows in rc_rows:
+                print("  {0:<6} {1:<10} {2:>14} {3:>10}".format(
+                    fy or "?",
+                    "{0} ({1})".format(rc or "?", code_label.get(rc, "?")),
+                    n_t, n_rows))
+        print("=" * 50)
+
+        # Post-run idempotency check. After a successful normalize the row
+        # count and the distinct-logical-key count should match exactly. If
+        # they don't, the unique index isn't doing its job (e.g. the
+        # migration was rolled back) — surface that loudly.
+        total_rows, distinct_logical, dup_groups, surplus = (
+            compute_duplicate_logical_keys(conn, tickers)
+        )
+        print()
+        print("Idempotency Check (fundamental_snapshots)")
+        print("=" * 50)
+        print("  total_rows:            {0}".format(total_rows))
+        print("  distinct_logical_keys: {0}".format(distinct_logical))
+        print("  duplicate_groups:      {0}".format(dup_groups))
+        print("  surplus_rows:          {0}".format(surplus))
+        if dup_groups == 0 and surplus == 0:
+            print("  STATUS: clean. Re-running this normalizer will not grow "
+                  "the table.")
+        else:
+            print("  STATUS: DUPLICATES PRESENT. Run migration 006 to fix.")
         print("=" * 50)
 
         log_finish(conn, log_id, "success",
