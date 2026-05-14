@@ -82,6 +82,8 @@ export interface FinancialStatement {
   // Cash Flow Statement
   operatingCashFlow: number | null;
   capitalExpenditure: number | null;
+  /** Alias for capitalExpenditure used in factors.ts for brevity. */
+  capex?: number | null;
   freeCashFlow: number | null;
   dividendsPaid: number | null;
   // Derived (can be computed but stored for convenience)
@@ -175,7 +177,7 @@ export type FactorDataStatus = "real" | "proxy" | "mock" | "unavailable";
 
 export interface FactorCoverage {
   /** Which data source is actually providing this factor's data */
-  preferredSource: "dart" | "pykrx" | "marcap" | null;
+  preferredSource: "dart" | "pykrx" | "marcap" | "price" | "estimates" | null;
   /** Fallback source if preferred is unavailable */
   fallbackSource: "dart" | "pykrx" | "marcap" | null;
   /** Current status label */

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getStocks, getLatestPrices } from "@/lib/mock-data";
+import { fetchStocks, fetchLatestPrices } from "@/lib/data-service.server";
 
 export const runtime = "nodejs";
 
@@ -8,8 +8,10 @@ export const runtime = "nodejs";
  * Returns the full stock universe with latest prices.
  */
 export async function GET() {
-  const stocks = getStocks();
-  const prices = getLatestPrices();
+  const [stocks, prices] = await Promise.all([
+    fetchStocks(),
+    fetchLatestPrices(),
+  ]);
 
   const enriched = stocks.map(s => ({
     ...s,

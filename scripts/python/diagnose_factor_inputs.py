@@ -703,9 +703,91 @@ def main():
         print("    other / unknown source:          {0}/{1} stocks".format(
             other_count, len(tickers)))
 
-    # Decide whether the as-of-date market cap is point-in-time safe overall
+    # Decide whether the as-of-date market cap is point-in-time safe overall.
+    # 'is_historical_date' = ranking is intended to reflect the past (PIT
+    # required). 'is_current_date' = ranking is current; snapshot fallback
+    # is acceptable. The diagnostic block immediately below is keyed on this.
     today_iso = datetime_now_iso()
     is_historical_date = as_of < today_iso
+    is_current_date = not is_historical_date
+
+    # ---- 9a. CURRENT SNAPSHOT MARKET CAP COVERAGE ----
+    # Same data, different lens. For a current ranking with
+    # --allow-snapshot-market-cap, the only thing that matters is whether
+    # every universe member has SOME row on the EXACT as-of date — historical
+    # or snapshot. Stale/prior-only rows are NOT acceptable here even if
+    # they're marcap_historical.
+    cur.execute(
+        """
+        SELECT
+            COUNT(DISTINCT ticker) FILTER (
+                WHERE date = %s AND market_cap IS NOT NULL
+                  AND source = 'marcap_historical')                          AS exact_pit,
+            COUNT(DISTINCT ticker) FILTER (
+                WHERE date = %s AND market_cap IS NOT NULL
+                  AND source = 'fdr_listing_snapshot')                       AS exact_snapshot,
+            COUNT(DISTINCT ticker) FILTER (
+                WHERE date = %s AND market_cap IS NOT NULL
+                  AND source IS DISTINCT FROM 'marcap_historical'
+                  AND source IS DISTINCT FROM 'fdr_listing_snapshot')        AS exact_other,
+            COUNT(DISTINCT ticker) FILTER (
+                WHERE date <= %s AND market_cap IS NOT NULL)                 AS any_on_or_before
+          FROM daily_prices
+         WHERE ticker = ANY(%s)
+        """,
+        (as_of, as_of, as_of, as_of, tickers),
+    )
+    cur_row = cur.fetchone() or (0, 0, 0, 0)
+    cur_exact_pit, cur_exact_snap, cur_exact_other, cur_any_on_or_before = cur_row
+    cur_exact_total = (cur_exact_pit or 0) + (cur_exact_snap or 0) + (cur_exact_other or 0)
+    cur_stale_only = (cur_any_on_or_before or 0) - cur_exact_total
+    cur_missing = len(tickers) - (cur_any_on_or_before or 0)
+
+    print()
+    print("--- CURRENT SNAPSHOT MARKET CAP COVERAGE ---")
+    print("  Mode:                                       {0}".format(
+        "current (snapshot allowed)" if is_current_date
+        else "historical / backtest (PIT required)"))
+    print("  Exact-asof rows total:                      {0}/{1}".format(
+        cur_exact_total, len(tickers)))
+    print("    of which marcap_historical (PIT):         {0}".format(
+        cur_exact_pit or 0))
+    print("    of which fdr_listing_snapshot:            {0}".format(
+        cur_exact_snap or 0))
+    if cur_exact_other:
+        print("    of which other source:                    {0}".format(
+            cur_exact_other))
+    print("  Stale / prior-only rows (<as-of, no exact): {0}".format(
+        cur_stale_only))
+    print("  Missing entirely (no rows on/before as-of): {0}".format(
+        cur_missing))
+
+    if is_current_date:
+        if cur_exact_total >= len(tickers):
+            print("  STATUS: OK. Every universe member has an exact-as-of "
+                  "market_cap row (snapshot allowed for current ranking).")
+        else:
+            print("  STATUS: NOT OK for current ranking.")
+            if cur_stale_only > 0:
+                print("    {0} ticker(s) only have a PRIOR-date market_cap row. "
+                      "Re-run:".format(cur_stale_only))
+                print("      python ingest_marcap.py --source auto "
+                      "--as-of-date {0} --universe {1}".format(
+                          as_of, args.universe or "<universe>"))
+            if cur_missing > 0:
+                print("    {0} ticker(s) have NO market_cap row on/before "
+                      "{1}. Likely missing from FDR snapshot too.".format(
+                          cur_missing, as_of))
+    else:
+        # Historical / backtest mode — exact-asof should ideally be all PIT.
+        if cur_exact_pit >= len(tickers):
+            print("  STATUS: PIT-safe.")
+        elif cur_exact_pit > 0:
+            print("  STATUS: PARTIAL PIT. {0} non-PIT or stale tickers will "
+                  "be excluded from a strict historical ranking.".format(
+                      len(tickers) - cur_exact_pit))
+        else:
+            print("  STATUS: NO PIT rows for historical date.")
 
     if pit_count == len(tickers):
         print()
@@ -715,17 +797,21 @@ def main():
         print()
         print("  STATUS: MIXED. Some stocks are PIT-safe, some are snapshot-only.")
         if is_historical_date:
-            print("    WARNING: as-of-date {0} is historical but {1} stocks "
-                  "use snapshot.".format(as_of, snap_count))
+            print("    WARNING (backtest): as-of-date {0} is historical but "
+                  "{1} stocks use snapshot. Backtests at this date will be "
+                  "biased.".format(as_of, snap_count))
             print("    Run: python ingest_marcap.py --source historical "
                   "--as-of-date {0} --universe <name>".format(as_of))
+        else:
+            print("    Note (current ranking): snapshot fallback is acceptable "
+                  "with --allow-snapshot-market-cap.")
     elif snap_count > 0 and pit_count == 0:
         print()
         print("  STATUS: SNAPSHOT-ONLY. Market cap is from current FDR listing,")
         print("    NOT point-in-time. OK for current-ranking validation.")
         if is_historical_date:
-            print("    WARNING: as-of-date {0} is historical. Backtests at this "
-                  "date will be biased.".format(as_of))
+            print("    WARNING (backtest): as-of-date {0} is historical. "
+                  "Backtests at this date will be biased.".format(as_of))
             print("    Run: python ingest_marcap.py --source historical "
                   "--as-of-date {0} --universe <name>".format(as_of))
 
@@ -751,12 +837,19 @@ def main():
     non_pit_rows = cur.fetchall()
 
     if non_pit_rows:
+        # Cap the dump at 50. For an all-stock universe (~2500 tickers) the
+        # untruncated dump can exceed 60,000 lines and drown out the rest of
+        # the diagnostic output.
+        DUMP_LIMIT = 50
         print()
-        print("--- NON-PIT TICKERS (snapshot-only, would be excluded from historical ranking) ---")
+        print("--- NON-PIT TICKERS (snapshot-only, would be excluded from "
+              "STRICT HISTORICAL ranking) ---")
+        print("  Showing up to {0} of {1}.".format(
+            DUMP_LIMIT, len(non_pit_rows)))
         print("  {0:<8} {1:<22} {2:<8} {3:<22} {4:>14} {5:>16}  Reason".format(
             "Ticker", "Name", "Market", "Source", "Close", "MarketCap"))
         print("  " + "-" * 110)
-        for t, nm, mkt, src, cl, mc in non_pit_rows:
+        for t, nm, mkt, src, cl, mc in non_pit_rows[:DUMP_LIMIT]:
             print("  {0:<8} {1:<22} {2:<8} {3:<22} {4:>14} {5:>16}  missing_from_marcap_historical_on_asof".format(
                 t,
                 (nm or "?")[:22],
@@ -765,9 +858,132 @@ def main():
                 "{0:,.0f}".format(cl) if cl else "NULL",
                 "{0:,.0f}".format(mc) if mc else "NULL",
             ))
-        print("  Tip: --require-pit-market-cap (default for historical dates) "
-              "will exclude these {0} stocks from the main ranking.".format(
-                  len(non_pit_rows)))
+        if len(non_pit_rows) > DUMP_LIMIT:
+            print("  ... and {0} more.".format(len(non_pit_rows) - DUMP_LIMIT))
+        if is_historical_date:
+            print("  Tip (backtest): --require-pit-market-cap (default for "
+                  "historical dates) will exclude these {0} stocks.".format(
+                      len(non_pit_rows)))
+        else:
+            print("  Note (current ranking): with --allow-snapshot-market-cap, "
+                  "these stocks ARE included.")
+
+    # ---- 10. Ranking snapshot coverage ----
+    # Look up the most-recent ranking_snapshots row for this (universe, date).
+    # If found, show the canonical four counts (universe_member_count,
+    # ranked_count, insufficient_coverage_count, non_pit_excluded_count) plus
+    # total_accounted_count so the operator can confirm the ranking accounted
+    # for every universe member. If no row exists, tell them what to run.
+    print()
+    print("--- RANKING SNAPSHOT COVERAGE ---")
+    if args.universe:
+        cur.execute(
+            """
+            SELECT id, universe_size, results->'_meta' AS meta, computed_at
+              FROM ranking_snapshots
+             WHERE universe_name = %s
+               AND date = %s
+             ORDER BY computed_at DESC
+             LIMIT 1
+            """,
+            (args.universe, as_of),
+        )
+        rs = cur.fetchone()
+        if rs:
+            rs_id, rs_size, meta, computed_at = rs
+            meta = meta or {}
+            print("  Snapshot id:               {0}".format(rs_id))
+            print("  Universe:                  {0}".format(args.universe))
+            print("  As-of date:                {0}".format(as_of))
+            print("  Computed at:               {0}".format(computed_at))
+            print("  Universe member count:     {0}".format(
+                meta.get("universe_member_count", rs_size)))
+            print("  Ranked (main):             {0}".format(
+                meta.get("ranked_count", "?")))
+            print("  Insufficient coverage:     {0}".format(
+                meta.get("insufficient_coverage_count", "?")))
+            print("  Non-PIT excluded:          {0}".format(
+                meta.get("non_pit_excluded_count", "?")))
+            print("  Total accounted:           {0}".format(
+                meta.get("total_accounted_count", "?")))
+            ranked = meta.get("ranked_count")
+            insuf = meta.get("insufficient_coverage_count")
+            nonpit = meta.get("non_pit_excluded_count")
+            total = meta.get("total_accounted_count")
+            members = meta.get("universe_member_count", rs_size)
+            if (isinstance(total, int) and isinstance(members, int)
+                    and total != members):
+                print("  ! WARNING: total_accounted ({0}) != universe_member_count ({1}). "
+                      "Some members slipped past the ranking — re-run "
+                      "run_ranking_snapshot.py.".format(total, members))
+            elif (isinstance(ranked, int) and isinstance(members, int)
+                  and ranked == 0):
+                print("  ! WARNING: 0 stocks made the main ranking. Loosen "
+                      "thresholds or check factor coverage above.")
+        else:
+            print("  No ranking snapshot found for universe={0}, date={1}.".format(
+                args.universe, as_of))
+            print("  Run: python run_ranking_snapshot.py --universe {0} "
+                  "--as-of-date {1}".format(args.universe, as_of))
+    else:
+        print("  (skipped — pass --universe to inspect a specific universe's "
+              "ranking snapshot)")
+
+    # ---- 11. Sparse-fundamentals warning ----
+    # Tickers in the universe with substantially fewer non-null factor values
+    # than the universe-median for the same as-of date. These will land in
+    # 'insufficient_coverage' under any reasonable threshold and merit a
+    # warning at the top level. Population (denominator) = the number of
+    # distinct factor_ids actually computed for the universe on this date.
+    if args.universe:
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT factor_id)
+              FROM factor_snapshots
+             WHERE date = %s
+               AND universe_name = %s
+               AND ticker = ANY(%s)
+            """,
+            (as_of, args.universe, tickers),
+        )
+        factor_pop = cur.fetchone()[0] or 0
+
+        if factor_pop > 0:
+            cur.execute(
+                """
+                SELECT s.ticker, s.name,
+                       COALESCE(p.k, 0) AS k
+                  FROM stocks s
+                  LEFT JOIN (
+                      SELECT ticker,
+                             COUNT(*) FILTER (WHERE raw_value IS NOT NULL) AS k
+                        FROM factor_snapshots
+                       WHERE date = %s
+                         AND universe_name = %s
+                         AND ticker = ANY(%s)
+                       GROUP BY ticker
+                  ) p ON p.ticker = s.ticker
+                 WHERE s.ticker = ANY(%s)
+                   AND COALESCE(p.k, 0) < %s
+                 ORDER BY COALESCE(p.k, 0) ASC, s.ticker
+                 LIMIT 20
+                """,
+                (as_of, args.universe, tickers, tickers, factor_pop // 2),
+            )
+            sparse_rows = cur.fetchall()
+            if sparse_rows:
+                print()
+                print("--- SPARSE-FUNDAMENTALS WARNINGS ---")
+                print("  {0} ticker(s) have <{1} factor values for {2}. "
+                      "First 20:".format(
+                          len(sparse_rows), factor_pop // 2, as_of))
+                print("  {0:<8} {1:<24} {2:>8} / {3}".format(
+                    "Ticker", "Name", "Filled", "Total"))
+                for t, n, k in sparse_rows:
+                    print("  {0:<8} {1:<24} {2:>8} / {3}".format(
+                        t, (n or "?")[:24], k, factor_pop))
+                print("  These will likely fall into 'insufficient_coverage' "
+                      "under current thresholds.")
 
     print()
     print("=" * 70)

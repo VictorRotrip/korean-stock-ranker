@@ -62,6 +62,105 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DART_API_KEY = os.getenv("DART_API_KEY")
 SCRIPT_NAME = "ingest_dart"
 
+
+# ---------------------------------------------------------------------------
+# DB connection resilience
+# ---------------------------------------------------------------------------
+#
+# The full-universe DART ingest can run for hours and skip thousands of
+# already-ingested filings between actual writes. The Supabase connection has
+# been observed timing out during long skip streaks, after which every
+# subsequent upsert / log call raises and the exception path itself crashes
+# because it re-uses the now-closed connection.
+#
+# These helpers make every DB-touching call site reconnect-resilient:
+#   connect_db()            : single connection factory with TCP keepalives
+#   ensure_connection(c)    : returns a live conn (reconnects if closed/dead)
+#   db_write_with_retry(c, fn, *a, **kw)
+#                           : runs fn(conn, ...). On psycopg2.{Operational,
+#                             Interface}Error, rolls back, reconnects, and
+#                             retries once. Returns (conn, result) so the
+#                             caller can keep using the (possibly new) conn.
+
+# Errors that mean "the connection is dead, throw it away and reconnect":
+_CONN_DEAD_ERRORS = (
+    psycopg2.OperationalError,
+    psycopg2.InterfaceError,
+)
+
+
+def connect_db():
+    """Open a fresh DB connection with TCP keepalives so idle connections
+    don't get silently reaped by the Supabase pooler / load balancer."""
+    return psycopg2.connect(
+        DATABASE_URL,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+
+
+def ensure_connection(conn, verify=False):
+    """Return a live DB connection.
+
+    Reconnects (with a "DB connection lost; reconnecting..." log line) when:
+      * conn is None,
+      * conn.closed is non-zero (psycopg2 sets this once close() runs or the
+        server drops the connection), or
+      * verify=True and a `SELECT 1` liveness probe raises a connection error.
+
+    Does NOT raise on its own: a brand-new connect_db() failure (rare but
+    possible) propagates, which is the right behaviour — we can't continue.
+    """
+    if conn is None or getattr(conn, "closed", 0):
+        print("  DB connection lost; reconnecting...", flush=True)
+        return connect_db()
+    if verify:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+        except _CONN_DEAD_ERRORS:
+            print("  DB connection stale; reconnecting...", flush=True)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return connect_db()
+    return conn
+
+
+def db_write_with_retry(conn, fn, *args, **kwargs):
+    """Run fn(conn, *args, **kwargs) with one reconnect-and-retry on
+    connection-loss errors.
+
+    Returns (conn, result). If fn raises a non-connection error, that
+    exception bubbles up untouched — only OperationalError / InterfaceError
+    trigger the reconnect dance. Callers must reassign their local `conn`
+    from the returned tuple so subsequent calls use the fresh connection.
+    """
+    conn = ensure_connection(conn)
+    try:
+        return conn, fn(conn, *args, **kwargs)
+    except _CONN_DEAD_ERRORS as e:
+        print(
+            "  DB error during write ({0}); reconnecting and retrying once...".format(
+                str(e).strip()[:80]),
+            flush=True,
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = connect_db()
+        return conn, fn(conn, *args, **kwargs)
+
 DART_API_BASE = "https://opendart.fss.or.kr/api"
 DEFAULT_TIMEOUT = 30
 
@@ -735,6 +834,113 @@ ACCOUNT_MAP = {
 }
 
 
+# Per-field priority lists for fields that have multiple Korean K-IFRS
+# concept names. When a filing reports more than one of these in the
+# same statement, the FIRST entry (= highest priority = most precise)
+# wins. Applied in fetch_financials AFTER the regular ACCOUNT_MAP loop,
+# so it can override the simpler mapping when a more precise concept
+# was also present.
+#
+# Specifically for interest_expense: Korean issuers commonly report
+# 금융비용 (finance costs — a broader bucket including FX losses) or
+# 금융원가 (synonym) instead of, or alongside, the precise 이자비용
+# line item. We accept 금융비용 as a fallback when 이자비용 is absent;
+# when both present, 이자비용 wins.
+ACCOUNT_PRIORITY = {
+    "interest_expense": [
+        # Most precise -> least precise
+        "이자비용",
+        "이자비용및유사비용",
+        "이자비용 및 유사비용",
+        "이자비용및유사한비용",
+        "차입금이자비용",
+        "사채이자비용",
+        "차입금이자",
+        "사채이자",
+        "금융비용",       # broader: interest + FX losses + fair value losses
+        "금융원가",       # synonym of 금융비용
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Statement-type filter (sj_div) — prevents cross-statement contamination
+# ---------------------------------------------------------------------------
+# DART filings group line items into named statements via the `sj_div` field:
+#   BS / BSE = 재무상태표 (Balance Sheet)
+#   IS / CIS = 손익계산서 / 포괄손익계산서 (Income / Comprehensive Income Statement)
+#   CF / CFS = 현금흐름표 (Cash Flow Statement)
+#   SCE      = 자본변동표 (Statement of Changes in Equity)
+#
+# The same Korean account name can legitimately appear in multiple statements.
+# Critically, 당기순이익 ("net income") appears both in IS/CIS (where the
+# value is the real number) AND in SCE (where it's often a header row with
+# thstrm_amount = "0" because the actual movement is broken out below it).
+# Without a sj_div filter the parser overwrites the real value with the SCE
+# zero, corrupting net_income for ~1500 stocks including Samsung Electronics,
+# Kia, SK Hynix, POSCO, SK Telecom, etc.
+#
+# Each field in ACCOUNT_MAP is tagged here with the sj_div values it is
+# allowed to come from. Fields whose data could appear in more than one
+# statement (e.g. depreciation can show up in both IS and CF) list both.
+
+IS_DIVS = ("IS", "CIS")        # income statement / comprehensive income
+BS_DIVS = ("BS", "BSE")        # balance sheet (also used inside fetch_financials)
+CF_DIVS = ("CF", "CFS")        # cash flow statement
+
+FIELD_TO_STATEMENT = {
+    # Income statement fields
+    "revenue":            IS_DIVS,
+    "interest_income":    IS_DIVS,
+    "cost_of_revenue":    IS_DIVS,
+    "gross_profit":       IS_DIVS,
+    "operating_income":   IS_DIVS,
+    "net_income":         IS_DIVS,
+    "eps":                IS_DIVS,
+    "interest_expense":   IS_DIVS,
+    # Depreciation/amortization is reported on both IS and the CF
+    # reconciliation; either source is fine.
+    "depreciation":       IS_DIVS + CF_DIVS,
+    "amortization":       IS_DIVS + CF_DIVS,
+    # Balance sheet fields
+    "total_assets":       BS_DIVS,
+    "total_liabilities":  BS_DIVS,
+    "total_equity":       BS_DIVS,
+    "current_assets":     BS_DIVS,
+    "current_liabilities": BS_DIVS,
+    "cash":               BS_DIVS,
+    "total_debt":         BS_DIVS,
+    "short_term_debt":    BS_DIVS,
+    "long_term_debt":     BS_DIVS,
+    "bonds_payable":      BS_DIVS,
+    "inventory":          BS_DIVS,
+    "retained_earnings":  BS_DIVS,
+    # Cash flow fields
+    "operating_cash_flow": CF_DIVS,
+    "investing_cash_flow": CF_DIVS,
+    "capex_tangible":     CF_DIVS,
+    "capex_intangible":   CF_DIVS,
+    "dividends_paid":     CF_DIVS,
+    # Shares outstanding can appear in BS or in a separate disclosure row;
+    # be permissive here — empty tuple means "no filter".
+    "shares_outstanding": (),
+}
+
+
+def _sj_div_ok(field, sj_div):
+    """Return True if a line item with this sj_div is allowed to write
+    to this field. Unknown fields are permissive (no filter). Empty
+    sj_div (rare, but possible for old filings) is also permissive so
+    we don't silently lose data — the SCE contamination we are guarding
+    against has a populated sj_div = 'SCE'."""
+    if not sj_div:
+        return True
+    allowed = FIELD_TO_STATEMENT.get(field)
+    if not allowed:   # empty tuple or missing -> no filter
+        return True
+    return sj_div in allowed
+
+
 def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=2):
     """Fetch a single financial statement from DART.
     Returns (result_dict, status_string)."""
@@ -785,28 +991,60 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
     # want for income/CF. Balance sheet rows are point-in-time, so we always
     # use `thstrm_amount` for them.
     is_interim = report_code in ("11012", "11013", "11014")
-    BS_DIVS = ("BS", "BSE")  # DART balance-sheet sj_div values
+
+    # Helper: extract the right amount column for a line item.
+    def _item_value(item):
+        sj_div = str(item.get("sj_div") or "").upper()
+        is_balance_sheet = sj_div in BS_DIVS
+        if is_interim and not is_balance_sheet:
+            v = parse_amount(item.get("thstrm_add_amount"))
+            if v is None:
+                v = parse_amount(item.get("thstrm_amount"))
+            return v
+        return parse_amount(item.get("thstrm_amount"))
 
     for item in accounts:
         account_name = str(item.get("account_nm", "")).strip()
         if account_name not in ACCOUNT_MAP:
             continue
         field = ACCOUNT_MAP[account_name]
-
+        # Statement-type filter: skip rows whose sj_div doesn't match the
+        # statement(s) this field is supposed to come from. Prevents the
+        # SCE 당기순이익 = 0 contamination that was zeroing net_income for
+        # ~1500 stocks including all major chaebols.
         sj_div = str(item.get("sj_div") or "").upper()
-        is_balance_sheet = sj_div in BS_DIVS
-
-        if is_interim and not is_balance_sheet:
-            # Income / Comprehensive Income / CF on Q1/H1/Q3: prefer cumulative.
-            val = parse_amount(item.get("thstrm_add_amount"))
-            if val is None:
-                val = parse_amount(item.get("thstrm_amount"))
-        else:
-            # Annual report or balance-sheet rows on any report: thstrm_amount.
-            val = parse_amount(item.get("thstrm_amount"))
-
+        if not _sj_div_ok(field, sj_div):
+            continue
+        val = _item_value(item)
         if val is not None:
             result[field] = val
+
+    # ----- Priority resolution -----
+    # For fields with ACCOUNT_PRIORITY lists, walk all items, collect
+    # any value tagged with a priority concept, then pick the highest-
+    # priority (lowest list-index) one. Overwrites whatever the simple
+    # ACCOUNT_MAP loop above wrote, so the more precise concept wins.
+    for target_field, priority_list in ACCOUNT_PRIORITY.items():
+        best_idx = None
+        best_val = None
+        for item in accounts:
+            name = str(item.get("account_nm", "")).strip()
+            if name not in priority_list:
+                continue
+            sj_div = str(item.get("sj_div") or "").upper()
+            if not _sj_div_ok(target_field, sj_div):
+                continue
+            idx = priority_list.index(name)
+            if best_idx is not None and idx >= best_idx:
+                # already have a more-or-equally-precise candidate
+                continue
+            v = _item_value(item)
+            if v is None:
+                continue
+            best_idx = idx
+            best_val = v
+        if best_val is not None:
+            result[target_field] = best_val
 
     # Derived fields
     if "revenue" in result and "cost_of_revenue" in result:
@@ -1027,7 +1265,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     run_start_time = time.time()
-    conn = psycopg2.connect(DATABASE_URL)
+    # All DB access in this script goes through connect_db() so TCP keepalives
+    # are set; long skip streaks would otherwise silently kill the connection.
+    conn = connect_db()
 
     # --- Resolve tickers ---
     ticker_names = {}
@@ -1236,6 +1476,12 @@ if __name__ == "__main__":
                         cnt_skipped_existing += 1
                         print("  {} {} {} / {} / {} -> skip: existing".format(
                             prefix, ticker, display_name, year, label), flush=True)
+                        # Long skip streaks can leave the connection idle long
+                        # enough for the load balancer to drop it. Verify
+                        # liveness every 500 skips so the next real upsert
+                        # doesn't crash.
+                        if cnt_skipped_existing % 500 == 0:
+                            conn = ensure_connection(conn, verify=True)
                         continue
 
                     cnt_processed += 1
@@ -1261,8 +1507,29 @@ if __name__ == "__main__":
                         if result:
                             cnt_ok += 1
                             records.append(result)
-                            upsert_dart_filing(conn, result)
-                            print("{} ({:.1f}s)".format(status_msg, elapsed), flush=True)
+                            try:
+                                conn, _ = db_write_with_retry(
+                                    conn, upsert_dart_filing, result)
+                            except _CONN_DEAD_ERRORS as db_err:
+                                # Reconnect + one retry already failed inside
+                                # db_write_with_retry. Log it (best-effort)
+                                # and keep going so other tickers still run.
+                                cnt_errors += 1
+                                print(" db error after retry: {0}".format(
+                                    str(db_err).strip()[:80]), flush=True)
+                                try:
+                                    conn, _ = db_write_with_retry(
+                                        conn, log_ingestion_error,
+                                        ticker, "db_write_error",
+                                        str(db_err)[:200],
+                                        {"year": year, "report_code": report_code})
+                                except Exception as log_err:
+                                    print("  WARN: log_ingestion_error failed: "
+                                          "{0}".format(str(log_err)[:80]),
+                                          flush=True)
+                            else:
+                                print("{} ({:.1f}s)".format(status_msg, elapsed),
+                                      flush=True)
                         else:
                             if "no report" in status_msg:
                                 cnt_no_report += 1
@@ -1274,58 +1541,90 @@ if __name__ == "__main__":
                         cnt_errors += 1
                         error_msg = str(e)[:80]
                         print("error: {}".format(error_msg), flush=True)
-                        log_ingestion_error(conn, ticker, "fetch_error",
-                                           error_msg,
-                                           {"year": year, "report_code": report_code})
+                        # Use the resilient wrapper so a connection-drop in
+                        # the middle of error logging doesn't cascade.
+                        try:
+                            conn, _ = db_write_with_retry(
+                                conn, log_ingestion_error,
+                                ticker, "fetch_error", error_msg,
+                                {"year": year, "report_code": report_code})
+                        except Exception as log_err:
+                            print("  WARN: log_ingestion_error failed: {0}".format(
+                                str(log_err)[:80]), flush=True)
 
                     time.sleep(rate_limit)
 
             # Batch upsert every 50 records
             if len(records) >= 50:
-                n = upsert_financials(conn, records)
+                conn, n = db_write_with_retry(
+                    conn, upsert_financials, records)
                 cnt_inserted += n
                 print("  -> Batch upsert: {} records".format(n), flush=True)
                 records = []
 
         # Final upsert
         if records and not dry_run:
-            n = upsert_financials(conn, records)
+            conn, n = db_write_with_retry(
+                conn, upsert_financials, records)
             cnt_inserted += n
             print("  -> Final upsert: {} records".format(n), flush=True)
 
         # Update factor_coverage with new P123 factor IDs
         if cnt_inserted > 0:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE factor_coverage
-                SET data_status = 'real', is_available = TRUE,
-                    uses_mock_data = FALSE, point_in_time_safe = TRUE,
-                    preferred_source = 'dart', last_updated = NOW()
-                WHERE factor_id IN (
-                    'pe_ttm_inv', 'price_book', 'price_sales_ttm_inv', 'fcf_mcap',
-                    'ebitda_ev', 'roe_ttm', 'roa_ttm', 'gross_profit_assets',
-                    'operating_margin_ttm', 'debt_to_equity', 'interest_coverage_ttm',
-                    'sales_growth_yoy', 'eps_growth_yoy', 'op_income_growth_yoy',
-                    'gross_margin_ttm', 'asset_turnover_ttm', 'ocf_mcap', 'ufcf_ev',
-                    'ev_sales_ttm_inv', 'gross_profit_ev', 'dividend_yield',
-                    'net_income_growth_yoy'
-                )
-            """)
-            conn.commit()
-            cur.close()
+            def _update_factor_coverage(c):
+                cur = c.cursor()
+                cur.execute("""
+                    UPDATE factor_coverage
+                    SET data_status = 'real', is_available = TRUE,
+                        uses_mock_data = FALSE, point_in_time_safe = TRUE,
+                        preferred_source = 'dart', last_updated = NOW()
+                    WHERE factor_id IN (
+                        'pe_ttm_inv', 'price_book', 'price_sales_ttm_inv', 'fcf_mcap',
+                        'ebitda_ev', 'roe_ttm', 'roa_ttm', 'gross_profit_assets',
+                        'operating_margin_ttm', 'debt_to_equity', 'interest_coverage_ttm',
+                        'sales_growth_yoy', 'eps_growth_yoy', 'op_income_growth_yoy',
+                        'gross_margin_ttm', 'asset_turnover_ttm', 'ocf_mcap', 'ufcf_ev',
+                        'ev_sales_ttm_inv', 'gross_profit_ev', 'dividend_yield',
+                        'net_income_growth_yoy'
+                    )
+                """)
+                c.commit()
+                cur.close()
+            conn, _ = db_write_with_retry(conn, _update_factor_coverage)
 
-        log_finish(conn, log_id, "success",
-                   rows_processed=cnt_processed, rows_inserted=cnt_inserted,
-                   rows_skipped=cnt_skipped_existing)
+        try:
+            conn, _ = db_write_with_retry(
+                conn, log_finish, log_id, "success",
+                rows_processed=cnt_processed,
+                rows_inserted=cnt_inserted,
+                rows_skipped=cnt_skipped_existing)
+        except Exception as log_err:
+            print("  WARN: failed to write ingestion_log success row: {0}".format(
+                str(log_err)[:80]), flush=True)
 
     except Exception as e:
-        log_finish(conn, log_id, "error", error_message=str(e),
-                   rows_processed=cnt_processed, rows_inserted=cnt_inserted,
-                   rows_skipped=cnt_skipped_existing)
+        # The fatal handler MUST never propagate a connection-loss error
+        # from the logging step itself — otherwise the operator sees the
+        # logging failure and not the original cause. Reconnect first, log
+        # best-effort, then re-raise the original.
+        try:
+            conn, _ = db_write_with_retry(
+                conn, log_finish, log_id, "error",
+                error_message=str(e),
+                rows_processed=cnt_processed,
+                rows_inserted=cnt_inserted,
+                rows_skipped=cnt_skipped_existing)
+        except Exception as log_err:
+            print("  WARN: failed to write ingestion_log error row: {0}".format(
+                str(log_err)[:80]), flush=True)
         print("FATAL ERROR: {}".format(e), flush=True)
         raise
     finally:
-        conn.close()
+        try:
+            if conn is not None and not getattr(conn, "closed", 0):
+                conn.close()
+        except Exception:
+            pass
 
     # ===================================================================
     # SUMMARY

@@ -349,3 +349,40 @@ export const ingestionErrors = pgTable("ingestion_errors", {
   parameters: jsonb("parameters"),
   createdAt: timestamp("created_at").defaultNow(),
 });
+
+// ---------------------------------------------------------------------------
+// Universe Memberships (named universes — written by ingest_universe.py)
+// ---------------------------------------------------------------------------
+// Tracks which tickers belong to a named universe (e.g. "krx_all_current",
+// "test_50"). Used by the Python pipeline to scope ranking runs, and by the
+// webapp to know which universe a snapshot was computed against.
+
+export const universeMemberships = pgTable("universe_memberships", {
+  universeName: text("universe_name").notNull(),
+  ticker: varchar("ticker", { length: 10 }).notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.universeName, table.ticker] }),
+  universeIdx: index("universe_memberships_universe_idx").on(table.universeName),
+}));
+
+// ---------------------------------------------------------------------------
+// Backtest Forward Returns (pre-computed by backtest_forward_returns.py)
+// ---------------------------------------------------------------------------
+// One row per (ticker, snapshot_date, horizon_days) with the forward total
+// return. Joined with factor_snapshots in the /backtest UI so we can
+// recompute composites with user-tweaked weights and bucket into deciles
+// without shipping all the price data to the client.
+
+export const backtestForwardReturns = pgTable("backtest_forward_returns", {
+  ticker: varchar("ticker", { length: 10 }).notNull(),
+  snapshotDate: date("snapshot_date").notNull(),
+  horizonDays: integer("horizon_days").notNull(),  // 21 (1m), 63 (3m), 126 (6m), 252 (12m)
+  forwardReturn: doublePrecision("forward_return"),  // (price_end / price_start) - 1
+  startClose: doublePrecision("start_close"),
+  endClose: doublePrecision("end_close"),
+  endDate: date("end_date"),
+  computedAt: timestamp("computed_at").defaultNow(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.ticker, table.snapshotDate, table.horizonDays] }),
+  dateHorizonIdx: index("bfr_date_horizon_idx").on(table.snapshotDate, table.horizonDays),
+}));

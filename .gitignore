@@ -45,3 +45,10 @@ scripts/python/.cache/
 scripts/python/.cache/marcap/
 scripts/python/.dart_corp_codes.json
 scripts/python/scripts/
+
+# Pipeline logs (re-generated on every run)
+scripts/python/*.log
+scripts/python/_tmp_*
+
+# leftover sandbox scratch
+_tmp_*.mjs

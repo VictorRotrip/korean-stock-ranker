@@ -77,16 +77,24 @@ BALANCE_FIELDS = (
 # Loaders
 # ---------------------------------------------------------------------------
 
-def _load_pit_snapshots(conn, ticker, as_of):
+def _load_pit_snapshots(conn, ticker, as_of, period_end_cap=None):
     """Return PIT-safe rows from fundamental_snapshots for one ticker.
 
-    Output is sorted by (period_end ASC, fiscal_quarter ASC NULLS LAST) so
-    annual rows come last within a fiscal year (annuals have NULL quarter,
-    treated as 'after' Q3).
+    The PIT availability filter `data_available_date <= as_of` always
+    holds — the caller's actual vantage point determines what's visible.
+
+    When `period_end_cap` is given (used by the prior-year lookup),
+    only rows with `period_end <= period_end_cap` are returned. This
+    lets us look at a trailing window ending one year before the current
+    TTM window while still using the actual `as_of` as the PIT cutoff
+    — so FY2024 annual filings (filed in early 2025) ARE visible to a
+    ranking computed at as_of=2026-05-06, which is the correct behavior
+    for YoY growth.
+
+    Output sorted by (period_end ASC, fiscal_quarter ASC NULLS LAST).
+    Annual rows have NULL fiscal_quarter and so come last within a year.
     """
-    cur = conn.cursor()
-    cur.execute(
-        """
+    sql = """
         SELECT period_end, data_available_date,
                fiscal_year, fiscal_quarter, report_code,
                consolidated_or_separate,
@@ -101,11 +109,15 @@ def _load_pit_snapshots(conn, ticker, as_of):
          WHERE ticker = %s
            AND data_available_date <= %s
            AND consolidated_or_separate = 'consolidated'
-         ORDER BY period_end ASC,
-                  COALESCE(fiscal_quarter, 99) ASC
-        """,
-        (ticker, as_of),
-    )
+    """
+    params = [ticker, as_of]
+    if period_end_cap is not None:
+        sql += " AND period_end <= %s"
+        params.append(period_end_cap)
+    sql += " ORDER BY period_end ASC, COALESCE(fiscal_quarter, 99) ASC"
+
+    cur = conn.cursor()
+    cur.execute(sql, params)
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     cur.close()
@@ -187,14 +199,20 @@ def _per_quarter_values(buckets, fy, slot):
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_pit_fundamentals(conn, ticker, as_of):
+def get_pit_fundamentals(conn, ticker, as_of, period_end_cap=None):
     """Return PIT-safe fundamentals for `ticker` viewed from `as_of`.
 
-    See module docstring for the output shape. Always returns a dict; if no
-    rows exist the dict is populated with Nones and meta source is
-    'unavailable'.
+    See module docstring for the output shape. Always returns a dict;
+    if no rows exist the dict is populated with Nones and meta source
+    is 'unavailable'.
+
+    `period_end_cap` (optional): restricts the row scan to period_end
+    on or before this date. Used by get_pit_fundamentals_prior_year to
+    look at a window one year earlier while keeping `as_of` as the
+    real PIT availability filter.
     """
-    rows = _load_pit_snapshots(conn, ticker, as_of)
+    rows = _load_pit_snapshots(conn, ticker, as_of,
+                                period_end_cap=period_end_cap)
 
     income_ttm = {f: None for f in INCOME_FIELDS + PERSHARE_FIELDS}
     balance = {f: None for f in BALANCE_FIELDS}
@@ -290,10 +308,28 @@ def get_pit_fundamentals(conn, ticker, as_of):
 def get_pit_fundamentals_prior_year(conn, ticker, as_of, ttm_period_end):
     """Return TTM fundamentals for the same trailing-window one year earlier.
 
-    Used to compute YoY same-period growth. Implemented by simply requesting
-    PIT fundamentals as_of (ttm_period_end - 1 year). If the resulting window
-    is also a 4-quarter TTM, growth is comparable; if it's an annual fallback
-    the caller can decide whether to compute growth at all.
+    Used to compute YoY same-period growth.
+
+    BUGFIX HISTORY
+    --------------
+    The previous implementation passed `prior_iso` (ttm_period_end - 1
+    year) as the `as_of` argument to get_pit_fundamentals, which made
+    the function filter by `data_available_date <= prior_iso`. That
+    over-restricted what counted as "available": a ranking computed at
+    as_of=2026-05-06 looking for prior-year TTM would only see rows
+    available on 2024-12-31, which excludes the FY2024 annual report
+    (filed in early 2025). The result was that EPS and net-income
+    growth coverage dropped to 33-35% even though sales/op-income
+    growth (which require less granular line items per filing) reached
+    66-69%.
+
+    The corrected behavior:
+      - PIT availability filter stays anchored at the real operator
+        as_of (so FY2024 annual filed Mar 2025 IS visible at as_of=
+        2026-05-06).
+      - We constrain the SCAN window to period_end <= prior_iso so
+        the trailing-4-quarter window we build ends one year earlier
+        than the current TTM window.
     """
     if ttm_period_end is None:
         return None
@@ -307,7 +343,8 @@ def get_pit_fundamentals_prior_year(conn, ticker, as_of, ttm_period_end):
         prior_iso = "{0:04d}-{1}-{2}".format(int(year) - 1, month, day)
     except Exception:
         return None
-    return get_pit_fundamentals(conn, ticker, prior_iso)
+    return get_pit_fundamentals(
+        conn, ticker, as_of, period_end_cap=prior_iso)
 
 
 def yoy_quarter_growth(current_q, prior_q):

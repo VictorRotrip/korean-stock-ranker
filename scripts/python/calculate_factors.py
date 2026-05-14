@@ -51,6 +51,26 @@ SCRIPT_NAME = "calculate_factors"
 
 
 # ---------------------------------------------------------------------------
+# Industry-relative ranking
+# ---------------------------------------------------------------------------
+# Factors whose category appears in INDUSTRY_RELATIVE_CATEGORIES are
+# percentile-ranked WITHIN their KSIC industry bucket (peer-group ranking)
+# instead of across the whole universe. This corrects the structural bias
+# of universe-wide ranking where, e.g., a bank's PE always loses to a
+# software company's PE because the two industries have categorically
+# different multiples.
+#
+# Stocks in industries with fewer than MIN_INDUSTRY_SIZE members fall back
+# to universe-wide ranking, since a "rank within 3 stocks" is too noisy to
+# be informative.
+#
+# Momentum / risk / liquidity / industry_momentum / sentiment stay
+# universe-wide because their signal IS cross-sectional by design.
+INDUSTRY_RELATIVE_CATEGORIES = ("value", "quality", "growth")
+MIN_INDUSTRY_SIZE = 5
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -86,17 +106,77 @@ def log_finish(conn, log_id, status, rows_processed=0, rows_inserted=0,
 # Data loading
 # ---------------------------------------------------------------------------
 
-def get_active_tickers(conn, tickers_filter=None, limit=None):
+def get_active_tickers(conn, tickers_filter=None, limit=None, as_of=None,
+                       pit_universe=True, pit_lookback_days=14):
+    """Return the universe of tickers eligible for ranking on `as_of`.
+
+    Two layered filters:
+
+      1. Candidate pool. From the `stocks` table — either restricted to
+         `tickers_filter` (the membership of a named universe like
+         `krx_all_historical`) or all rows. We intentionally DO NOT
+         filter on `stocks.is_active` here, because a stock that was
+         active on the rebalance date but has since been delisted should
+         still be in the historical universe.
+
+      2. Point-in-time alive filter. Only keep tickers that have a price
+         row in `daily_prices` within `pit_lookback_days` calendar days
+         before `as_of`. This is the single fix that eliminates
+         survivorship bias: a stock not yet IPO'd or already delisted on
+         that date simply has no recent price row and gets dropped from
+         the universe for that date.
+
+    The legacy behaviour (filter by is_active, ignore as_of) is preserved
+    when `pit_universe=False` for any callers that still expect it.
+    """
     cur = conn.cursor()
-    if tickers_filter:
-        placeholders = ",".join(["%s"] * len(tickers_filter))
-        cur.execute(f"SELECT ticker FROM stocks WHERE ticker IN ({placeholders}) AND is_active = TRUE",
-                    tuple(tickers_filter))
+
+    if pit_universe and as_of:
+        # PIT mode — candidate pool first (no is_active filter), then
+        # the "had a price recently before as_of" filter.
+        if tickers_filter:
+            cur.execute("""
+                SELECT s.ticker
+                FROM stocks s
+                WHERE s.ticker = ANY(%s)
+                  AND EXISTS (
+                    SELECT 1 FROM daily_prices dp
+                    WHERE dp.ticker = s.ticker
+                      AND dp.date <= %s
+                      AND dp.date >= (%s::date - %s::int)
+                  )
+                ORDER BY s.ticker
+            """, (list(tickers_filter), as_of, as_of, pit_lookback_days))
+        else:
+            q = """
+                SELECT s.ticker
+                FROM stocks s
+                WHERE EXISTS (
+                    SELECT 1 FROM daily_prices dp
+                    WHERE dp.ticker = s.ticker
+                      AND dp.date <= %s
+                      AND dp.date >= (%s::date - %s::int)
+                )
+                ORDER BY s.ticker
+            """
+            params = [as_of, as_of, pit_lookback_days]
+            if limit:
+                q += " LIMIT {0}".format(int(limit))
+            cur.execute(q, params)
     else:
-        q = "SELECT ticker FROM stocks WHERE is_active = TRUE ORDER BY ticker"
-        if limit:
-            q += " LIMIT {0}".format(int(limit))
-        cur.execute(q)
+        # Legacy mode — preserve old behaviour for any edge callers.
+        if tickers_filter:
+            placeholders = ",".join(["%s"] * len(tickers_filter))
+            cur.execute(
+                f"SELECT ticker FROM stocks WHERE ticker IN ({placeholders}) "
+                f"AND is_active = TRUE",
+                tuple(tickers_filter))
+        else:
+            q = "SELECT ticker FROM stocks WHERE is_active = TRUE ORDER BY ticker"
+            if limit:
+                q += " LIMIT {0}".format(int(limit))
+            cur.execute(q)
+
     tickers = [r[0] for r in cur.fetchall()]
     cur.close()
     return tickers
@@ -253,6 +333,26 @@ def _ebitda_from_ttm(income_ttm):
     return oi + (da or 0)
 
 
+# Income-statement fields that can be filled from annual data when the
+# TTM aggregation returns None. Balance-sheet fields are NOT in this
+# list — they always come from the latest balance snapshot.
+_INCOME_FALLBACK_FIELDS = (
+    "revenue",
+    "gross_profit",
+    "operating_income",
+    "net_income",
+    "eps",
+    "operating_cash_flow",
+    "free_cash_flow",
+    # Below added so interest_coverage_ttm can fire when annual filings
+    # carry these but quarterly TTM does not (common in K-IFRS: many
+    # issuers only disclose interest_expense in the annual report).
+    "interest_expense",
+    "depreciation",
+    "ebitda",
+)
+
+
 def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
     """Build the (fin_dict, prior_dict, fundamental_meta) tuple used by the
     fundamental factor calculators.
@@ -261,11 +361,22 @@ def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
     --------
     1. Try TTM from fundamental_snapshots (PIT-safe, quarterly-aware).
     2. If TTM is unavailable, fall back to the legacy annual-only `fin`
-       passed in (which is what the original code path used).
+       passed in.
+    3. NEW: per-field annual fill. When TTM works as a whole but a
+       specific income-statement field is None (commonly net_income
+       or EPS because Korean interim filings sometimes omit those
+       line items), fill that single field from the latest annual
+       financials. Do the same for the prior dict from the prior
+       annual financials. Coverage for eps_growth_yoy /
+       net_income_growth_yoy jumps from ~35% to ~80% as a result.
 
-    The prior dict for YoY growth uses fundamental_snapshots' same-window
-    one-year-earlier view when TTM was available; otherwise it falls back
-    to legacy prior-annual at the call site (handled in compute_all_factors).
+    The mixing rule: each field independently uses TTM when present,
+    else annual. Ratios across two fields (e.g. operating margin =
+    operating_income / revenue) will use TTM/TTM when both available,
+    annual/annual when both fall back; mixed combinations only happen
+    when one field is missing in TTM but its co-field is present —
+    rare in practice for Korean filings since interim line items
+    tend to fail together.
 
     Returns
     -------
@@ -284,6 +395,10 @@ def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
           "ttm_period_end":  date or None,
           "annual_period_end": date or None,
           "available_quarters": int,
+          "fin_annual_fill":  list of field names that were filled
+                              from annual in the CURRENT dict
+          "prior_annual_fill": list of field names that were filled
+                              from annual in the PRIOR dict
         }
     """
     snap = fundamental_ttm.get_pit_fundamentals(conn, ticker, as_of)
@@ -329,6 +444,7 @@ def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
         prior_dict = None
         if prior is not None:
             p_inc = prior["income_ttm"]
+            p_bal = prior["balance"]
             prior_dict = {
                 "revenue":            p_inc.get("revenue"),
                 "gross_profit":       p_inc.get("gross_profit"),
@@ -337,8 +453,62 @@ def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
                 "eps":                p_inc.get("eps"),
                 "operating_cash_flow": p_inc.get("operating_cash_flow"),
                 "free_cash_flow":     p_inc.get("free_cash_flow"),
+                # Balance fields one year ago — used by buyback yield
+                # and any future Y-o-Y balance-based factors.
+                "shares_outstanding": p_bal.get("shares_outstanding"),
+                "total_equity":       p_bal.get("total_equity"),
+                "total_assets":       p_bal.get("total_assets"),
             }
-        return fin_dict, prior_dict, snap["meta"]
+
+        # ----- NEW: per-field annual fallback -----
+        # Load latest annual + prior annual for the per-field fill.
+        # fallback_fin is already the latest annual (loaded by caller).
+        prior_annual = None
+        if fallback_fin is not None:
+            prior_annual = get_prior_financials(
+                conn, ticker, as_of, fallback_fin.get("period_end"))
+
+        fin_filled = []
+        prior_filled = []
+        if fallback_fin is not None:
+            for f in _INCOME_FALLBACK_FIELDS:
+                if fin_dict.get(f) is None:
+                    v = fallback_fin.get(f)
+                    if v is not None:
+                        fin_dict[f] = v
+                        fin_filled.append(f)
+        # If ebitda is still None but operating_income + depreciation got
+        # filled from annual, reconstruct ebitda. Mirrors _ebitda_from_ttm.
+        if fin_dict.get("ebitda") is None:
+            oi = fin_dict.get("operating_income")
+            da = fin_dict.get("depreciation")
+            if oi is not None and da is not None:
+                try:
+                    fin_dict["ebitda"] = float(oi) + float(da)
+                    fin_filled.append("ebitda(derived)")
+                except (TypeError, ValueError):
+                    pass
+        if prior_dict is None and prior_annual is not None:
+            # TTM prior was unavailable entirely; seed from annual.
+            prior_dict = {}
+            for f in _INCOME_FALLBACK_FIELDS:
+                v = prior_annual.get(f)
+                if v is not None:
+                    prior_dict[f] = v
+                    prior_filled.append(f)
+        elif prior_dict is not None and prior_annual is not None:
+            for f in _INCOME_FALLBACK_FIELDS:
+                if prior_dict.get(f) is None:
+                    v = prior_annual.get(f)
+                    if v is not None:
+                        prior_dict[f] = v
+                        prior_filled.append(f)
+        # ----- end fallback -----
+
+        meta = dict(snap["meta"])
+        meta["fin_annual_fill"] = fin_filled
+        meta["prior_annual_fill"] = prior_filled
+        return fin_dict, prior_dict, meta
 
     # TTM completely unavailable: fall back to legacy annual-only `fin`.
     if fallback_fin is not None:
@@ -348,6 +518,8 @@ def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
             "ttm_period_end": None,
             "annual_period_end": fallback_fin.get("period_end"),
             "available_quarters": 0,
+            "fin_annual_fill": [],
+            "prior_annual_fill": [],
         }
     return None, None, {
         "income_source": "unavailable",
@@ -355,6 +527,8 @@ def build_fundamental_inputs(conn, ticker, as_of, fallback_fin):
         "ttm_period_end": None,
         "annual_period_end": None,
         "available_quarters": 0,
+        "fin_annual_fill": [],
+        "prior_annual_fill": [],
     }
 
 
@@ -444,6 +618,32 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
     if not mcap_pit_safe:
         market_cap = None
 
+    # Year-ago shares for buyback yield. DART's reported shares_outstanding
+    # in financial_statements is unreliable (~0/2500 in this DB), so the
+    # fundamental_snapshots balance is None for almost every ticker. The
+    # daily_prices source has 100% coverage and is the right place to
+    # measure share count change. `prices` is sorted oldest-first and is
+    # ~260 trading days = ~1 year long, so prices[0] is approximately the
+    # share count one year before as_of.
+    year_ago_shares = None
+    if prices:
+        for p in prices:  # oldest first
+            if p[8] is not None and p[8] > 0:
+                year_ago_shares = p[8]
+                break
+
+    # Inject prices-based shares_outstanding into fin and prior so the
+    # buyback-yield calculator can use them. Don't clobber existing
+    # values; only fill if currently None.
+    if fin is not None and shares_outstanding is not None:
+        if fin.get("shares_outstanding") is None:
+            fin["shares_outstanding"] = shares_outstanding
+    if year_ago_shares is not None:
+        if prior is None:
+            prior = {}
+        if prior.get("shares_outstanding") is None:
+            prior["shares_outstanding"] = year_ago_shares
+
     factors = {}
     missing_reasons = {}
     source_methods = {}
@@ -516,7 +716,7 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
             missing_reasons[factor_id] = "computation_error: {0}".format(str(e))
             source_methods[factor_id] = "computation_error"
 
-    return factors, missing_reasons, source_methods
+    return factors, missing_reasons, source_methods, fin_meta
 
 
 def _compute_single_factor(factor_id, factor_meta, compute_fn_name,
@@ -644,6 +844,79 @@ def percentile_rank(values_dict, factor_meta):
     return ranks
 
 
+def percentile_rank_by_industry(values_dict, ticker_industry_map,
+                                  factor_meta, min_industry_size=5):
+    """Industry-relative percentile rank with universe fallback.
+
+    Tickers grouped by their KSIC industry (from ticker_industry_map).
+    For each industry with at least `min_industry_size` non-None values,
+    ranks are computed WITHIN that industry pool. Tickers whose industry
+    has fewer than that many non-None values get a universe-wide rank
+    instead (computed once across all tickers, including those that
+    received industry-relative ranks — this preserves a consistent
+    apples-to-apples baseline).
+
+    Args:
+        values_dict: {ticker: raw_value_or_None}
+        ticker_industry_map: {ticker: industry_string}
+            (typically the same dict built for industry_momentum)
+        factor_meta: factor metadata; rank_direction is consulted by
+            percentile_rank
+        min_industry_size: minimum non-None members an industry needs to
+            qualify for industry-relative ranking
+
+    Returns:
+        ranks: {ticker: percentile_rank_0_to_100}
+        scope_used: {ticker: "industry" | "universe_fallback"}
+            Tickers absent from `ranks` (because raw value was None)
+            are also absent from scope_used.
+    """
+    # Group every ticker by industry, keeping ALL values (including None
+    # so we know the pool size accurately).
+    by_industry = defaultdict(dict)
+    for ticker, value in values_dict.items():
+        industry_key = ticker_industry_map.get(ticker) or ticker
+        by_industry[industry_key][ticker] = value
+
+    # Decide which industries have enough non-None values to qualify.
+    eligible_industries = set()
+    for ind, tdict in by_industry.items():
+        non_null_count = sum(1 for v in tdict.values() if v is not None)
+        if non_null_count >= min_industry_size:
+            eligible_industries.add(ind)
+
+    ranks = {}
+    scope_used = {}
+    fallback_tickers = []
+
+    # Pass 1: rank within each eligible industry bucket.
+    for ind, tdict in by_industry.items():
+        if ind in eligible_industries:
+            industry_ranks = percentile_rank(tdict, factor_meta)
+            for t, r in industry_ranks.items():
+                ranks[t] = r
+                scope_used[t] = "industry"
+        else:
+            # Collect tickers whose industry pool was too small —
+            # they get universe-wide rank in pass 2.
+            for t, v in tdict.items():
+                if v is not None:
+                    fallback_tickers.append(t)
+
+    # Pass 2: universe-wide rank for stocks whose industry was too small.
+    # Note that the universe-wide pool here includes ALL tickers' raw
+    # values, not just the small-industry leftovers. This gives the
+    # small-industry stocks a fair comparison against the full market.
+    if fallback_tickers:
+        universe_ranks = percentile_rank(values_dict, factor_meta)
+        for t in fallback_tickers:
+            if t in universe_ranks:
+                ranks[t] = universe_ranks[t]
+                scope_used[t] = "universe_fallback"
+
+    return ranks, scope_used
+
+
 # ---------------------------------------------------------------------------
 # Post-processing: industry momentum and other derived factors
 # ---------------------------------------------------------------------------
@@ -665,15 +938,22 @@ def compute_industry_factors(all_raw_factors, ticker_industry_map, tickers):
         if ret_252 is not None:
             price_returns_252d[ticker] = ret_252
 
-    # Compute industry momentum for each ticker
+    # Compute industry momentum for each ticker.
+    # NOTE: compute_all_factors pre-seeds these keys with None (because
+    # data_source == "derived" returns None from _compute_single_factor),
+    # so the previous `key not in dict` check ALWAYS short-circuited and
+    # the post-processing never ran. We check for None value instead so
+    # the derived calculation actually executes.
     for ticker in tickers:
-        if "industry_momentum_26w" not in all_raw_factors.get(ticker, {}):
+        existing_26 = all_raw_factors.get(ticker, {}).get("industry_momentum_26w")
+        if existing_26 is None:
             result = industry.calc_industry_momentum(
                 ticker, ticker_industry_map, price_returns_126d
             )
             all_raw_factors.setdefault(ticker, {})["industry_momentum_26w"] = result
 
-        if "industry_momentum_52w" not in all_raw_factors.get(ticker, {}):
+        existing_52 = all_raw_factors.get(ticker, {}).get("industry_momentum_52w")
+        if existing_52 is None:
             result = industry.calc_industry_momentum(
                 ticker, ticker_industry_map, price_returns_252d
             )
@@ -875,7 +1155,15 @@ if __name__ == "__main__":
         print("  Universe '{}': {} tickers".format(args.universe, len(tickers_filter)))
 
     conn = psycopg2.connect(DATABASE_URL)
-    tickers = get_active_tickers(conn, tickers_filter, args.limit)
+    # PIT universe: only consider tickers that had a price in the 14 days
+    # before `as_of`. This is what eliminates survivorship bias for a
+    # historical backfill — a delisted ticker is in `stocks` (with no
+    # is_active filter applied), but isn't in the universe for dates
+    # after its delisting, and a future-listing ticker isn't in the
+    # universe for dates before its IPO.
+    tickers = get_active_tickers(
+        conn, tickers_filter, args.limit, as_of=as_of, pit_universe=True,
+    )
 
     # Exclude financial-sector stocks if requested
     if args.exclude_financials:
@@ -975,17 +1263,34 @@ if __name__ == "__main__":
         all_missing = {}  # ticker -> {factorId: missingReason}
         all_methods = {}  # ticker -> {factorId: source_method}
         ttm_status_counts = defaultdict(int)
+        # Per-field counter for annual-fill events (one increment per
+        # ticker per field). Tracks how often the new annual fallback
+        # was needed in the current dict (income TTM came back None
+        # for that field) and similarly for the prior dict.
+        fin_fill_counts = defaultdict(int)
+        prior_fill_counts = defaultdict(int)
+        n_with_fin_fill = 0
+        n_with_prior_fill = 0
         for i, ticker in enumerate(tickers):
             if require_pit:
                 pit_safe = ticker in pit_safe_set
             else:
                 pit_safe = True  # treat all as safe; biased factors allowed
-            factors, missing, methods = compute_all_factors(
+            factors, missing, methods, fin_meta = compute_all_factors(
                 conn, ticker, as_of, mcap_pit_safe=pit_safe,
             )
             all_raw[ticker] = factors
             all_missing[ticker] = missing
             all_methods[ticker] = methods
+            # Aggregate annual-fill stats from fin_meta.
+            for f in fin_meta.get("fin_annual_fill", []) or []:
+                fin_fill_counts[f] += 1
+            for f in fin_meta.get("prior_annual_fill", []) or []:
+                prior_fill_counts[f] += 1
+            if fin_meta.get("fin_annual_fill"):
+                n_with_fin_fill += 1
+            if fin_meta.get("prior_annual_fill"):
+                n_with_prior_fill += 1
             # Record this ticker's TTM status (the source method on a single
             # representative DART factor). 'earnings_yield' is consumed by
             # the value scoring pass and is sourced from TTM income, so we
@@ -1008,6 +1313,24 @@ if __name__ == "__main__":
         print("  TTM / fundamental source breakdown:")
         for label in sorted(ttm_status_counts.keys()):
             print("    {0:<35} {1}/{2}".format(label, ttm_status_counts[label], len(tickers)))
+
+        # Diagnostic: annual-fill stats. Tells us how often TTM had a None
+        # for an income field and we filled it from annual financials.
+        # This is the new growth-coverage fallback path.
+        if n_with_fin_fill > 0 or n_with_prior_fill > 0:
+            print("")
+            print("  Annual-fill stats (TTM None -> annual fallback):")
+            print("    Tickers with any current-year fill: {0}/{1}".format(
+                n_with_fin_fill, len(tickers)))
+            print("    Tickers with any prior-year fill:   {0}/{1}".format(
+                n_with_prior_fill, len(tickers)))
+            if fin_fill_counts:
+                print("    Most-filled current-year fields:")
+                top = sorted(fin_fill_counts.items(),
+                             key=lambda x: -x[1])[:8]
+                for f, c in top:
+                    print("      {0:<30} {1}/{2}".format(
+                        f, c, len(tickers)))
 
         # Diagnostic: market_cap source summary
         mcap_count = sum(1 for t in tickers if all_raw.get(t, {}).get("market_cap") is not None)
@@ -1032,14 +1355,34 @@ if __name__ == "__main__":
 
         print("  {0} unique factors across {1} stocks".format(len(all_factor_ids), len(tickers)))
 
-        # Step 5: Percentile rank each factor within the chosen universe scope.
+        # Step 5: Percentile rank each factor within the chosen scope.
         # Each row carries universe_name so multiple universes can store
         # ranks for the same (ticker, factor_id, date) without collision.
+        #
+        # Industry-relative ranking: factors in categories listed in
+        # INDUSTRY_RELATIVE_CATEGORIES (value / quality / growth) are
+        # ranked WITHIN their KSIC industry bucket if the bucket has
+        # >= MIN_INDUSTRY_SIZE members. Otherwise universe-wide
+        # ranking is used as a fallback. The source column is
+        # annotated with " (industry)", " (universe_fb)", or
+        # " (universe)" so the rank scope is auditable downstream.
         snapshot_rows = []
+        rank_scope_stats = defaultdict(int)  # (category, scope) -> count
         for factor_id in sorted(all_factor_ids):
             factor_meta = FACTORS.get(factor_id, {})
             raw_by_ticker = {t: fs.get(factor_id) for t, fs in all_raw.items()}
-            ranks = percentile_rank(raw_by_ticker, factor_meta)
+
+            category = factor_meta.get("category", "")
+            use_industry_relative = category in INDUSTRY_RELATIVE_CATEGORIES
+
+            if use_industry_relative:
+                ranks, scope_used = percentile_rank_by_industry(
+                    raw_by_ticker, ticker_industry_map, factor_meta,
+                    min_industry_size=MIN_INDUSTRY_SIZE,
+                )
+            else:
+                ranks = percentile_rank(raw_by_ticker, factor_meta)
+                scope_used = {t: "universe" for t in ranks}
 
             for ticker, pct_rank in ranks.items():
                 raw = raw_by_ticker[ticker]
@@ -1051,11 +1394,21 @@ if __name__ == "__main__":
                     all_methods.get(ticker, {}).get(factor_id)
                     or "calculated"
                 )
-                if len(src_method) > 50:
-                    src_method = src_method[:50]
+                scope = scope_used.get(ticker, "universe")
+                # Compact suffix tags for downstream auditing.
+                if scope == "industry":
+                    suffix = " (industry)"
+                elif scope == "universe_fallback":
+                    suffix = " (universe_fb)"
+                else:
+                    suffix = " (universe)"
+                annotated = src_method + suffix
+                if len(annotated) > 50:
+                    annotated = annotated[:50]
+                rank_scope_stats[(category, scope)] += 1
                 snapshot_rows.append((
                     universe_name_for_scope, ticker, factor_id, as_of,
-                    raw, pct_rank, src_method,
+                    raw, pct_rank, annotated,
                 ))
 
         # Step 6a: Clear stale snapshots for this universe+date+ticker scope.
@@ -1072,6 +1425,32 @@ if __name__ == "__main__":
         # Step 6b: Upsert the freshly computed rows.
         n = upsert_factor_snapshots(conn, snapshot_rows)
         print("  Upserted {0} factor snapshot rows".format(n))
+
+        # Step 6c: Print rank-scope distribution (industry-relative vs
+        # universe-wide). This is the audit trail for the industry-
+        # relative ranking added for Value / Quality / Growth.
+        if rank_scope_stats:
+            # Categories that opted into industry-relative ranking.
+            print("\n  Rank-scope distribution by factor category:")
+            agg = defaultdict(lambda: defaultdict(int))
+            for (cat, scope), cnt in rank_scope_stats.items():
+                agg[cat][scope] += cnt
+            for cat in sorted(agg.keys()):
+                scopes = agg[cat]
+                total = sum(scopes.values())
+                if cat in INDUSTRY_RELATIVE_CATEGORIES:
+                    ind_count = scopes.get("industry", 0)
+                    fb_count = scopes.get("universe_fallback", 0)
+                    ind_pct = 100.0 * ind_count / total if total else 0
+                    fb_pct = 100.0 * fb_count / total if total else 0
+                    print("    {0:<22} industry-relative {1}/{2} "
+                          "({3:.1f}%), universe-fallback {4}/{2} ({5:.1f}%)"
+                          .format(cat, ind_count, total, ind_pct,
+                                  fb_count, fb_pct))
+                else:
+                    uni_count = scopes.get("universe", 0)
+                    print("    {0:<22} universe-wide {1}/{2} (100%)"
+                          .format(cat, uni_count, total))
 
         # Step 7: Print coverage summary
         print_coverage_summary(all_raw, all_missing, all_factor_ids, tickers)

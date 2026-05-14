@@ -37,6 +37,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import argparse
 from datetime import datetime
@@ -269,19 +270,68 @@ def tag_stocks(df):
     """Add boolean classification columns."""
     if df.empty or "name" not in df.columns:
         for col in ["is_preferred", "is_spac", "is_financial",
-                     "is_holding", "is_etf", "is_reit"]:
+                     "is_holding", "is_etf", "is_reit",
+                     "_pref_reason"]:
             if col not in df.columns:
-                df[col] = False
+                df[col] = False if col != "_pref_reason" else None
         return df
 
-    pref_keywords = ["우", "우B", "2우B", "우선", "Pfd"]
-    df["is_preferred"] = df.apply(
-        lambda r: (
-            str(r.get("ticker", ""))[-1] in ("5", "7", "8", "9")
-            and any(kw in str(r.get("name", "")) for kw in pref_keywords)
-        ),
+    # KRX preferred-share name suffix patterns. Anchored at end of name so we
+    # don't accidentally flag ordinary names that contain '우' inside a word
+    # (e.g. '우진플라임'). Examples we want to catch:
+    #   삼성전자우         → "우" alone at end
+    #   삼성물산우B        → "우B"
+    #   한화3우B          → "3우B"
+    #   대덕전자1우        → "1우"
+    #   두산퓨얼셀2우B     → "2우B"
+    #   아모레퍼시픽홀딩스3우C → "3우C"
+    #   CJ4우(전환)       → "4우(전환)"
+    _PREF_SUFFIX_RE = re.compile(
+        r"\d?우[A-Z]?(?:\(전환\))?$"
+    )
+    # Explicit Korean wording for "preferred share". Rare, but unambiguous.
+    _PREF_LITERAL_RE = re.compile(r"우선주$")
+
+    def _classify_preferred(ticker, name):
+        """Return ('flag', 'reason') for a stock. reason is one of:
+            None              → not preferred
+            'name_suffix'     → matched the Korean preferred-name regex
+            'name_literal'    → name ends with '우선주'
+            'alpha_ticker_corroborated'
+                              → 6-char ticker ending in a letter, AND '우'
+                                appears in the trailing 4 characters of the
+                                name (corroborating evidence)
+            'numeric_suffix_corroborated'
+                              → ticker ends in 5/7/9, AND name ends with '우'
+                                or matches the suffix regex
+        Conservative: prefers a false negative to a false positive, so an
+        ordinary common-stock name is never flagged.
+        """
+        nm = (name or "").strip()
+        tk = (ticker or "").strip().upper()
+
+        if _PREF_SUFFIX_RE.search(nm):
+            return True, "name_suffix"
+        if _PREF_LITERAL_RE.search(nm):
+            return True, "name_literal"
+        if len(tk) == 6 and tk[-1].isalpha() and not tk[-1].isdigit():
+            # Tickers like 00088K, 33626L, 35320K. KRX uses alphanumeric
+            # 6-char tickers exclusively for alternate share classes
+            # (preferred / convertible / etc.). Require '우' near the end
+            # of the name as corroborating evidence per the milestone spec.
+            if "우" in nm[-4:]:
+                return True, "alpha_ticker_corroborated"
+        if tk and tk[-1] in ("5", "7", "9"):
+            if nm.endswith("우") or _PREF_SUFFIX_RE.search(nm):
+                return True, "numeric_suffix_corroborated"
+        return False, None
+
+    classified = df.apply(
+        lambda r: _classify_preferred(r.get("ticker"), r.get("name")),
         axis=1,
     )
+    df["is_preferred"] = classified.apply(lambda x: x[0])
+    df["_pref_reason"] = classified.apply(lambda x: x[1])
 
     df["is_spac"] = df["name"].apply(
         lambda n: "스팩" in str(n) or "SPAC" in str(n).upper())
@@ -395,10 +445,28 @@ def _stratified_sample(df, limit):
 
 
 def sample_stocks(df, args):
-    """Apply sampling strategy to select stocks."""
+    """Apply sampling strategy to select stocks.
+
+    Strategy 'all' is a special no-op that returns every eligible stock
+    after exclusions, ignoring --limit and --limit-per-market. Used for the
+    full-universe ranking pipeline (krx_all_current).
+    """
     strategy = args.sample_strategy or "largest"
     limit = args.limit
     limit_per_market = args.limit_per_market
+
+    if strategy == "all":
+        # Full universe — no limit applies. If the operator passed a limit
+        # flag alongside, warn loudly so it isn't silently ignored.
+        if limit or limit_per_market:
+            print("  WARNING: --sample-strategy all ignores --limit / "
+                  "--limit-per-market (would have selected at most {0}).".format(
+                      limit_per_market or limit))
+        market_counts = df["market"].value_counts().to_dict() \
+            if "market" in df.columns else {}
+        for m in sorted(market_counts):
+            print("  all {}: {} selected".format(m, market_counts[m]))
+        return df
 
     if limit_per_market:
         parts = []
@@ -545,9 +613,12 @@ if __name__ == "__main__":
         help="Max stocks per market (overrides --limit)")
 
     parser.add_argument("--sample-strategy",
-        choices=["largest", "liquid", "random", "stratified"],
+        choices=["largest", "liquid", "random", "stratified", "all"],
         default="largest",
-        help="How to pick stocks when limit applies (default: largest)")
+        help="How to pick stocks when limit applies (default: largest). "
+             "'all' takes every eligible stock after exclusions and ignores "
+             "--limit / --limit-per-market — use for the full-universe "
+             "current ranking (krx_all_current).")
 
     parser.add_argument("--exclude-preferred", action="store_true",
         help="Exclude preferred shares")
@@ -717,13 +788,68 @@ if __name__ == "__main__":
         df = tag_stocks(df)
         df = enrich_sector(df)
 
+        source_total = len(df)
+
+        # Capture preferred-share audit BEFORE we apply_exclusions (which
+        # drops the rows). Show per-reason counts and first 20 examples so
+        # the operator can spot-check the detector in real conditions.
+        pref_audit = None
+        if args.exclude_preferred and "is_preferred" in df.columns:
+            pref_df = df[df["is_preferred"]].copy()
+            if "_pref_reason" not in pref_df.columns:
+                pref_df["_pref_reason"] = "unknown"
+            reason_counts = (
+                pref_df["_pref_reason"].fillna("unknown").value_counts().to_dict()
+            )
+            sample = pref_df[["ticker", "name", "_pref_reason"]].head(20)\
+                .values.tolist()
+            pref_audit = {
+                "total": int(len(pref_df)),
+                "by_reason": reason_counts,
+                "sample": sample,
+            }
+
         df, excl_counts = apply_exclusions(df, args)
-        if excl_counts.get("total_excluded", 0) > 0:
-            print("  Exclusions applied:")
-            for k, v in excl_counts.items():
-                if k != "total_excluded" and v > 0:
-                    print("    {}: {} removed".format(k, v))
-            print("    Remaining: {}".format(len(df)))
+        # Always print the per-category breakdown so the operator sees zeros
+        # too. Useful for the all-stock universe to confirm the exclusion
+        # filters actually fired (REIT / SPAC counts in particular).
+        print("  Exclusion breakdown:")
+        print("    Source rows total:           {0}".format(source_total))
+        print("    Excluded preferred:          {0}".format(
+            excl_counts.get("preferred", 0)))
+        print("    Excluded ETF/ETN:            {0}".format(
+            excl_counts.get("etf", 0)))
+        print("    Excluded SPAC:               {0}".format(
+            excl_counts.get("spac", 0)))
+        print("    Excluded REIT:               {0}".format(
+            excl_counts.get("reit", 0)))
+        if args.exclude_financials:
+            print("    Excluded financials:         {0}".format(
+                excl_counts.get("financial", 0)))
+        if args.min_market_cap:
+            print("    Below min-market-cap:        {0}".format(
+                excl_counts.get("below_min_mcap", 0)))
+        if args.min_trading_value:
+            print("    Below min-trading-value:     {0}".format(
+                excl_counts.get("below_min_tv", 0)))
+        print("    Total excluded:              {0}".format(
+            excl_counts.get("total_excluded", 0)))
+        print("    Remaining after exclusions:  {0}".format(len(df)))
+
+        if pref_audit and pref_audit["total"] > 0:
+            print()
+            print("  Preferred-share exclusion audit:")
+            print("    By detection reason:")
+            for reason, n in sorted(
+                pref_audit["by_reason"].items(),
+                key=lambda kv: (-kv[1], kv[0]),
+            ):
+                print("      {0:<33} {1:>6}".format(reason, n))
+            print("    First {0} excluded preferred examples:".format(
+                len(pref_audit["sample"])))
+            for tk, nm, reason in pref_audit["sample"]:
+                print("      {0:<8} {1:<28} ({2})".format(
+                    tk or "?", (nm or "?")[:28], reason or "?"))
 
         if df.empty:
             print("ERROR: All stocks excluded. Loosen filters.")

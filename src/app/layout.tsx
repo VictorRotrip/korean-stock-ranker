@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { BarChart3, Layers, List, Database } from "lucide-react";
+import { BarChart3, Layers, List, Database, Trophy, LineChart } from "lucide-react";
+import { getDataSource } from "@/lib/data-service.server";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -10,11 +11,14 @@ export const metadata: Metadata = {
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: BarChart3 },
+  { href: "/ranking", label: "Today's Ranking", icon: Trophy },
+  { href: "/backtest", label: "Backtest", icon: LineChart },
   { href: "/ranking-systems", label: "Ranking Systems", icon: Layers },
   { href: "/universe", label: "Universe", icon: List },
 ];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const dataSource = getDataSource();
   return (
     <html lang="ko" suppressHydrationWarning>
       <body className="min-h-screen bg-background font-sans antialiased">
@@ -42,7 +46,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <div className="border-t p-3">
               <div className="flex items-center gap-2 rounded-md bg-muted px-3 py-2">
                 <Database className="h-3 w-3 text-muted-foreground" />
-                <span className="text-xs text-muted-foreground">Mock Data Mode</span>
+                <span className="text-xs text-muted-foreground">
+                  {dataSource === "db" ? "Live (Supabase)" : "Mock Data Mode"}
+                </span>
               </div>
             </div>
           </aside>

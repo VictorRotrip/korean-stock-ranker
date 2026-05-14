@@ -532,26 +532,52 @@ def upsert_historical_marcap_bulk(conn, df, dry_run=False):
 def upsert_snapshot_marcap_as_of(conn, df, as_of_date,
                                  ticker_filter=None,
                                  dry_run=False):
-    """Apply a CURRENT FDR listing snapshot to daily_prices for the as-of date.
+    """Apply a CURRENT FDR listing snapshot to daily_prices on the EXACT
+    as_of_date. NOT point-in-time. Source = 'fdr_listing_snapshot'.
 
-    NOT point-in-time. Sets source = 'fdr_listing_snapshot' on inserts.
-    Existing rows have their marcap fields updated, but source is NOT changed
-    if it was already 'marcap_historical' (we don't downgrade PIT-correct rows).
+    Strict contract (post-fix):
+      * Always upserts on (ticker, as_of_date). Never touches a prior-date
+        row. The earlier behaviour of "update the latest prior row" was a
+        bug — it silently overwrote PIT-safe 2025-12-30 marcap_historical
+        rows with current 2026-05-06 snapshot values.
+      * Existing marcap_historical rows on the as-of date are left alone:
+        marcap fields and source are preserved verbatim. (We never downgrade
+        a PIT row.)
+      * Existing fdr_listing_snapshot / unknown-source rows on the as-of
+        date are refreshed: their marcap fields are filled in (COALESCE
+        favouring the new value, falling back to existing) and source is
+        set to fdr_listing_snapshot.
+      * Rows that don't exist at all on the as-of date are inserted with
+        source = fdr_listing_snapshot.
+
+    Returns (updated, inserted, missing_tickers): the tickers in
+    ticker_filter that the FDR snapshot did not contain.
     """
+    matched_tickers = set()
     if df is None or len(df) == 0:
-        return 0, 0
+        if ticker_filter:
+            return 0, 0, list(ticker_filter)
+        return 0, 0, []
 
-    if ticker_filter:
-        df = df[df["ticker"].isin(set(ticker_filter))]
+    requested = set(ticker_filter) if ticker_filter else None
+    if requested:
+        df = df[df["ticker"].isin(requested)]
+    matched_tickers = set(df["ticker"].astype(str).unique())
+
     if len(df) == 0:
-        return 0, 0
+        return 0, 0, sorted(requested - matched_tickers) if requested else []
     if dry_run:
-        return len(df), 0
+        missing = sorted(requested - matched_tickers) if requested else []
+        return 0, len(df), missing
 
     cur = conn.cursor()
     updated = 0
     inserted = 0
 
+    # Single bulk upsert keyed on (ticker, as_of_date). The CASE expressions
+    # implement the protect-marcap_historical rule directly in SQL so we
+    # don't need a per-ticker SELECT + UPDATE round-trip.
+    rows = []
     for _, row in df.iterrows():
         ticker = row.get("ticker")
         if not ticker:
@@ -559,73 +585,59 @@ def upsert_snapshot_marcap_as_of(conn, df, as_of_date,
         mc = safe_int(row.get("market_cap"))
         sh = safe_int(row.get("shares_outstanding"))
         tv = safe_int(row.get("trading_value"))
+        close = safe_float(row.get("close"))
+        vol = safe_int(row.get("volume"))
         if mc is None and sh is None and tv is None:
             continue
+        rows.append((ticker, as_of_date, close, vol, tv, mc, sh,
+                     SOURCE_SNAPSHOT))
 
-        cur.execute(
-            "SELECT 1 FROM daily_prices WHERE ticker = %s AND date = %s",
-            (ticker, as_of_date))
-        exact = cur.fetchone()
+    if not rows:
+        cur.close()
+        missing = sorted(requested - matched_tickers) if requested else []
+        return 0, 0, missing
 
-        if exact:
-            cur.execute("""
-                UPDATE daily_prices
-                SET market_cap         = COALESCE(%s, market_cap),
-                    shares_outstanding = COALESCE(%s, shares_outstanding),
-                    trading_value      = COALESCE(%s, trading_value),
-                    source             = CASE
-                        WHEN source = %s THEN source
-                        ELSE %s
-                    END
-                WHERE ticker = %s AND date = %s
-            """, (mc, sh, tv,
-                  SOURCE_HISTORICAL, SOURCE_SNAPSHOT,
-                  ticker, as_of_date))
-            updated += 1
-        else:
-            cur.execute(
-                "SELECT date FROM daily_prices "
-                "WHERE ticker = %s AND date <= %s "
-                "ORDER BY date DESC LIMIT 1",
-                (ticker, as_of_date))
-            latest = cur.fetchone()
-
-            if latest:
-                actual_date = latest[0]
-                cur.execute("""
-                    UPDATE daily_prices
-                    SET market_cap         = COALESCE(%s, market_cap),
-                        shares_outstanding = COALESCE(%s, shares_outstanding),
-                        trading_value      = COALESCE(%s, trading_value),
-                        source             = CASE
-                            WHEN source = %s THEN source
-                            ELSE %s
-                        END
-                    WHERE ticker = %s AND date = %s
-                """, (mc, sh, tv,
-                      SOURCE_HISTORICAL, SOURCE_SNAPSHOT,
-                      ticker, actual_date))
-                updated += 1
-            else:
-                close = safe_float(row.get("close"))
-                vol = safe_int(row.get("volume"))
-                cur.execute("""
-                    INSERT INTO daily_prices
-                        (ticker, date, close, volume,
-                         trading_value, market_cap,
-                         shares_outstanding, source)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (ticker, date) DO UPDATE SET
-                        market_cap         = COALESCE(EXCLUDED.market_cap, daily_prices.market_cap),
-                        shares_outstanding = COALESCE(EXCLUDED.shares_outstanding, daily_prices.shares_outstanding),
-                        trading_value      = COALESCE(EXCLUDED.trading_value, daily_prices.trading_value)
-                """, (ticker, as_of_date, close, vol,
-                      tv, mc, sh, SOURCE_SNAPSHOT))
-                inserted += 1
+    # RETURNING (xmax = 0) AS inserted lets us split inserts vs updates in
+    # one round-trip. xmax = 0 on a row means it was a fresh insert.
+    query = """
+    INSERT INTO daily_prices
+        (ticker, date, close, volume,
+         trading_value, market_cap, shares_outstanding, source)
+    VALUES %s
+    ON CONFLICT (ticker, date) DO UPDATE SET
+        close              = COALESCE(daily_prices.close, EXCLUDED.close),
+        volume             = COALESCE(daily_prices.volume, EXCLUDED.volume),
+        trading_value = CASE
+            WHEN daily_prices.source = '""" + SOURCE_HISTORICAL + """'
+                THEN daily_prices.trading_value
+            ELSE COALESCE(EXCLUDED.trading_value, daily_prices.trading_value)
+        END,
+        market_cap = CASE
+            WHEN daily_prices.source = '""" + SOURCE_HISTORICAL + """'
+                THEN daily_prices.market_cap
+            ELSE COALESCE(EXCLUDED.market_cap, daily_prices.market_cap)
+        END,
+        shares_outstanding = CASE
+            WHEN daily_prices.source = '""" + SOURCE_HISTORICAL + """'
+                THEN daily_prices.shares_outstanding
+            ELSE COALESCE(EXCLUDED.shares_outstanding, daily_prices.shares_outstanding)
+        END,
+        source = CASE
+            WHEN daily_prices.source = '""" + SOURCE_HISTORICAL + """'
+                THEN daily_prices.source
+            ELSE EXCLUDED.source
+        END
+    RETURNING (xmax = 0) AS inserted
+    """
+    result = execute_values(cur, query, rows, fetch=True)
+    inserted = sum(1 for r in result if r[0])
+    updated = len(result) - inserted
 
     conn.commit()
     cur.close()
-    return updated, inserted
+
+    missing = sorted(requested - matched_tickers) if requested else []
+    return updated, inserted, missing
 
 
 # ---------------------------------------------------------------------------
@@ -1101,19 +1113,54 @@ if __name__ == "__main__":
                               s.get("shares_outstanding") or 0),
                           flush=True)
 
-                upd, ins = upsert_snapshot_marcap_as_of(
+                upd, ins, missing = upsert_snapshot_marcap_as_of(
                     conn, df, args.as_of_date,
                     ticker_filter, dry_run=args.dry_run)
+
+                # Compute exact-as-of coverage AFTER the upsert so the
+                # operator can confirm every requested ticker now has a
+                # daily_prices row on the as-of date.
+                coverage_count = None
+                if ticker_filter:
+                    cur_chk = conn.cursor()
+                    cur_chk.execute(
+                        "SELECT COUNT(DISTINCT ticker) FROM daily_prices "
+                        "WHERE ticker = ANY(%s::text[]) AND date = %s::date "
+                        "AND market_cap IS NOT NULL",
+                        (list(ticker_filter), args.as_of_date),
+                    )
+                    coverage_count = cur_chk.fetchone()[0]
+                    cur_chk.close()
 
                 elapsed = time.time() - t0
                 print("", flush=True)
                 print("SUMMARY (as-of, snapshot fallback)", flush=True)
                 print("=" * 55, flush=True)
-                print("  Source:    {0}".format(SOURCE_SNAPSHOT), flush=True)
-                print("  As-of:     {0}".format(args.as_of_date), flush=True)
-                print("  Updated:   {0}".format(upd), flush=True)
-                print("  Inserted:  {0}".format(ins), flush=True)
-                print("  Elapsed:   {0:.1f}s".format(elapsed), flush=True)
+                print("  Source:                {0}".format(SOURCE_SNAPSHOT), flush=True)
+                print("  As-of date:            {0}".format(args.as_of_date), flush=True)
+                if ticker_filter is not None:
+                    print("  Requested tickers:     {0}".format(len(ticker_filter)),
+                          flush=True)
+                    print("  Matched in snapshot:   {0}".format(
+                        len(ticker_filter) - len(missing)), flush=True)
+                    print("  Missing from snapshot: {0}".format(len(missing)),
+                          flush=True)
+                    if missing:
+                        preview = ", ".join(missing[:10])
+                        if len(missing) > 10:
+                            preview += " ... +{0} more".format(len(missing) - 10)
+                        print("    Missing tickers:     {0}".format(preview),
+                              flush=True)
+                print("  Inserted exact-asof:   {0}".format(ins), flush=True)
+                print("  Updated exact-asof:    {0}".format(upd), flush=True)
+                if coverage_count is not None:
+                    print("  Exact-asof coverage:   {0}/{1} tickers have a "
+                          "market_cap row on {2}".format(
+                              coverage_count, len(ticker_filter),
+                              args.as_of_date),
+                          flush=True)
+                print("  Elapsed:               {0:.1f}s".format(elapsed),
+                      flush=True)
                 print("  WARNING: NOT POINT-IN-TIME. Marcap is from a "
                       "current FDR snapshot.", flush=True)
                 print("           Do not rely on this for backtests.",

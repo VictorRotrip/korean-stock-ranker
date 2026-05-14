@@ -192,6 +192,26 @@ FACTORS = {
         "p123_aliases": [],
     },
 
+    # --- Buyback Yield (shareholder return) ---
+    "buyback_yield_yoy": {
+        "name": "Buyback Yield YoY",
+        "category": "value",
+        "subcategory": "asset_based",
+        "description": ("(prior_shares - current_shares) / current_shares. "
+                        "Positive = net share count reduction (buyback / "
+                        "treasury retirement)."),
+        "rank_direction": "higher",
+        "scope": "universe",
+        "data_source": "dart",
+        "implementation_status": "real",
+        "point_in_time_safe": True,
+        "required_fields": ["shares_outstanding"],
+        "lookback_days": 0,
+        "compute_function": "calc_buyback_yield_yoy",
+        "missing_value_policy": "exclude",
+        "p123_aliases": [],
+    },
+
     # =========================================================================
     # QUALITY (30% default weight)
     # =========================================================================
@@ -404,6 +424,42 @@ FACTORS = {
         "required_fields": ["net_income"],
         "lookback_days": 0,
         "compute_function": "calc_net_income_growth_yoy",
+        "missing_value_policy": "exclude",
+        "p123_aliases": [],
+    },
+
+    # --- Operating Cash Flow Growth ---
+    "ocf_growth_yoy": {
+        "name": "Operating Cash Flow Growth YoY",
+        "category": "growth",
+        "subcategory": "cash_flow",
+        "description": "Year-over-year operating cash flow growth",
+        "rank_direction": "higher",
+        "scope": "universe",
+        "data_source": "dart",
+        "implementation_status": "real",
+        "point_in_time_safe": True,
+        "required_fields": ["operating_cash_flow"],
+        "lookback_days": 0,
+        "compute_function": "calc_ocf_growth_yoy",
+        "missing_value_policy": "exclude",
+        "p123_aliases": [],
+    },
+
+    # --- Free Cash Flow Growth ---
+    "fcf_growth_yoy": {
+        "name": "Free Cash Flow Growth YoY",
+        "category": "growth",
+        "subcategory": "cash_flow",
+        "description": "Year-over-year free cash flow growth",
+        "rank_direction": "higher",
+        "scope": "universe",
+        "data_source": "dart",
+        "implementation_status": "real",
+        "point_in_time_safe": True,
+        "required_fields": ["free_cash_flow"],
+        "lookback_days": 0,
+        "compute_function": "calc_fcf_growth_yoy",
         "missing_value_policy": "exclude",
         "p123_aliases": [],
     },

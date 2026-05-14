@@ -221,3 +221,59 @@ def calc_net_income_growth_yoy(fin, prior, market_cap, shares):
     if fin is None or prior is None:
         return None
     return _growth(fin.get("net_income"), prior.get("net_income"))
+
+
+def calc_ocf_growth_yoy(fin, prior, market_cap, shares):
+    """YoY operating cash flow growth.
+
+    OCF can be negative for both current and prior periods. _growth uses
+    abs(prior) in the denominator so a sign-flip-to-positive yields a
+    positive growth number, which is the desired behavior.
+    """
+    if fin is None or prior is None:
+        return None
+    return _growth(fin.get("operating_cash_flow"),
+                    prior.get("operating_cash_flow"))
+
+
+def calc_fcf_growth_yoy(fin, prior, market_cap, shares):
+    """YoY free cash flow growth.
+
+    FCF is often negative for growth-stage companies; same abs-denominator
+    convention as OCF growth applies.
+    """
+    if fin is None or prior is None:
+        return None
+    return _growth(fin.get("free_cash_flow"),
+                    prior.get("free_cash_flow"))
+
+
+def calc_buyback_yield_yoy(fin, prior, market_cap, shares):
+    """Buyback yield = (prior_shares - current_shares) / current_shares.
+
+    Interpretation:
+      positive = shares decreased = net buyback / treasury retirement
+      zero     = unchanged
+      negative = shares increased = issuance / dilution
+
+    A clean factor for shareholder return; sibling of dividend yield.
+    Especially relevant in Korea since the 2024 Value-Up policy push
+    that's driven a wave of corporate buybacks.
+
+    Caveat: stock splits / consolidations would show as huge spurious
+    changes. Korean splits are rare; percentile-ranking will compress
+    extreme values into the top/bottom buckets without affecting the
+    rank order of the meaningful (single-digit-percent) buyback signals.
+
+    `fin` and `prior` must both have `shares_outstanding`. Returns None
+    if either is missing or zero.
+    """
+    if fin is None or prior is None:
+        return None
+    cur = fin.get("shares_outstanding")
+    pri = prior.get("shares_outstanding")
+    if cur is None or pri is None:
+        return None
+    if cur == 0:
+        return None
+    return (float(pri) - float(cur)) / float(cur)

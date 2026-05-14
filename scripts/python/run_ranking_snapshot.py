@@ -186,10 +186,17 @@ P123_TREE = {
                     {"id": "f-ocfy", "type": "factor", "name": "OCF Yield", "weight": 30, "factorId": "ocf_mcap"},
                     {"id": "f-ufcf", "type": "factor", "name": "Unlevered FCF/EV", "weight": 30, "factorId": "ufcf_ev"},
                  ]},
+                # Asset-Based renormalized from 60/40 -> 50/25/25 when
+                # Buyback Yield was added as a third shareholder-return
+                # signal. Book/Market remains the dominant factor in
+                # this sub-composite. Dividend Yield is still defined
+                # but currently empty (no ingest source); the composite
+                # will route weight to whichever sub-factors are present.
                 {"id": "sub-val-asset", "type": "composite", "name": "Asset-Based", "weight": 15,
                  "children": [
-                    {"id": "f-pb", "type": "factor", "name": "Book/Market", "weight": 60, "factorId": "price_book"},
-                    {"id": "f-divy", "type": "factor", "name": "Dividend Yield", "weight": 40, "factorId": "dividend_yield"},
+                    {"id": "f-pb", "type": "factor", "name": "Book/Market", "weight": 50, "factorId": "price_book"},
+                    {"id": "f-divy", "type": "factor", "name": "Dividend Yield", "weight": 25, "factorId": "dividend_yield"},
+                    {"id": "f-bby", "type": "factor", "name": "Buyback Yield", "weight": 25, "factorId": "buyback_yield_yoy"},
                  ]},
             ],
         },
@@ -221,41 +228,58 @@ P123_TREE = {
         {
             "id": "cat-growth", "type": "category", "name": "Growth", "weight": 15,
             "children": [
-                {"id": "sub-g-sales", "type": "composite", "name": "Sales Growth", "weight": 35,
+                # Sub-weights total 100. Cash Flow Growth was added at
+                # weight 20; the existing three were renormalized
+                # 35/30/35 -> 30/25/25. The category's overall 15% in
+                # the composite is unchanged.
+                {"id": "sub-g-sales", "type": "composite", "name": "Sales Growth", "weight": 30,
                  "children": [
                     {"id": "f-sg", "type": "factor", "name": "Sales Growth YoY", "weight": 100, "factorId": "sales_growth_yoy"},
                  ]},
-                {"id": "sub-g-opinc", "type": "composite", "name": "Op Income Growth", "weight": 30,
+                {"id": "sub-g-opinc", "type": "composite", "name": "Op Income Growth", "weight": 25,
                  "children": [
                     {"id": "f-oig", "type": "factor", "name": "Op Income Growth YoY", "weight": 100, "factorId": "op_income_growth_yoy"},
                  ]},
-                {"id": "sub-g-eps", "type": "composite", "name": "EPS Growth", "weight": 35,
+                {"id": "sub-g-eps", "type": "composite", "name": "EPS Growth", "weight": 25,
                  "children": [
                     {"id": "f-epsg", "type": "factor", "name": "EPS Growth YoY", "weight": 50, "factorId": "eps_growth_yoy"},
                     {"id": "f-nig", "type": "factor", "name": "Net Income Growth YoY", "weight": 50, "factorId": "net_income_growth_yoy"},
+                 ]},
+                {"id": "sub-g-cf", "type": "composite", "name": "Cash Flow Growth", "weight": 20,
+                 "children": [
+                    {"id": "f-ocfg", "type": "factor", "name": "OCF Growth YoY", "weight": 50, "factorId": "ocf_growth_yoy"},
+                    {"id": "f-fcfg", "type": "factor", "name": "FCF Growth YoY", "weight": 50, "factorId": "fcf_growth_yoy"},
                  ]},
             ],
         },
         {
             "id": "cat-momentum", "type": "category", "name": "Momentum", "weight": 10,
             "children": [
-                {"id": "sub-m-price", "type": "composite", "name": "Price Changes", "weight": 35,
+                # Sub-weights total to 100 and were renormalized when Industry
+                # Momentum was added (previously 35/35/30; now 30/30/25/15).
+                # The category's overall 10% in the composite is unchanged.
+                {"id": "sub-m-price", "type": "composite", "name": "Price Changes", "weight": 30,
                  "children": [
                     {"id": "f-pc120", "type": "factor", "name": "120d Return", "weight": 50, "factorId": "price_change_120d"},
                     {"id": "f-pc180", "type": "factor", "name": "180d Return", "weight": 50, "factorId": "price_change_180d"},
                  ]},
-                {"id": "sub-m-tech", "type": "composite", "name": "Technical", "weight": 35,
+                {"id": "sub-m-tech", "type": "composite", "name": "Technical", "weight": 30,
                  "children": [
                     {"id": "f-udr20", "type": "factor", "name": "UpDown 20d", "weight": 20, "factorId": "up_down_ratio_20"},
                     {"id": "f-udr60", "type": "factor", "name": "UpDown 60d", "weight": 30, "factorId": "up_down_ratio_60"},
                     {"id": "f-udr120", "type": "factor", "name": "UpDown 120d", "weight": 25, "factorId": "up_down_ratio_120"},
                     {"id": "f-rsi200", "type": "factor", "name": "RSI 200", "weight": 25, "factorId": "rsi_200"},
                  ]},
-                {"id": "sub-m-qtr", "type": "composite", "name": "Quarterly Returns", "weight": 30,
+                {"id": "sub-m-qtr", "type": "composite", "name": "Quarterly Returns", "weight": 25,
                  "children": [
                     {"id": "f-m3", "type": "factor", "name": "3M Return", "weight": 30, "factorId": "momentum_3m"},
                     {"id": "f-m6", "type": "factor", "name": "6M Return", "weight": 35, "factorId": "momentum_6m"},
                     {"id": "f-m121", "type": "factor", "name": "12-1M Momentum", "weight": 35, "factorId": "momentum_12_1"},
+                 ]},
+                {"id": "sub-m-industry", "type": "composite", "name": "Industry Momentum", "weight": 15,
+                 "children": [
+                    {"id": "f-im26", "type": "factor", "name": "Industry 26W Momentum", "weight": 50, "factorId": "industry_momentum_26w"},
+                    {"id": "f-im52", "type": "factor", "name": "Industry 52W Momentum", "weight": 50, "factorId": "industry_momentum_52w"},
                  ]},
             ],
         },
@@ -571,21 +595,31 @@ def ensure_ranking_systems(conn):
         ))
         conn.commit()
 
-    cur.execute("SELECT id FROM ranking_systems WHERE id = 'p123-inspired'")
-    if not cur.fetchone():
-        print("  Seeding 'p123-inspired' ranking system...")
-        cur.execute("""
-            INSERT INTO ranking_systems (id, name, description, tree, options)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO NOTHING
-        """, (
-            "p123-inspired",
-            "P123 Inspired Korea Multi-Factor",
-            "P123-inspired multi-factor: Value 25%, Quality 30%, Growth 15%, Momentum 10%, Low Volatility 10%, Sentiment 10%",
-            PgJson(P123_TREE),
-            PgJson(DEFAULT_OPTIONS),
-        ))
-        conn.commit()
+    # Upsert (not just insert-if-absent) so the DB metadata row stays in
+    # sync as P123_TREE evolves. Without this, edits to the tree above
+    # (e.g. adding Industry Momentum as a Momentum sub-composite) would
+    # not propagate to ranking_systems.tree and audit queries would show
+    # a stale model definition.
+    print("  Seeding/refreshing 'p123-inspired' ranking system...")
+    cur.execute("""
+        INSERT INTO ranking_systems (id, name, description, tree, options)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            tree = EXCLUDED.tree,
+            options = EXCLUDED.options
+    """, (
+        "p123-inspired",
+        "P123 Inspired Korea Multi-Factor",
+        "P123-inspired multi-factor: Value 25%, Quality 30%, "
+        "Growth 15% (Sales 30 / OpInc 25 / EPS 25 / CashFlow 20), "
+        "Momentum 10% (Price 30 / Technical 30 / Quarterly 25 / Industry 15), "
+        "Low Volatility 10%, Sentiment 10%",
+        PgJson(P123_TREE),
+        PgJson(DEFAULT_OPTIONS),
+    ))
+    conn.commit()
 
     cur.close()
 

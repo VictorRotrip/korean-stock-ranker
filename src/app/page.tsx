@@ -1,15 +1,25 @@
 import Link from "next/link";
-import { Layers, TrendingUp, List, ArrowRight } from "lucide-react";
+import { Layers, TrendingUp, List, ArrowRight, Trophy } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { getStocks, getLatestPrices } from "@/lib/mock-data";
+import {
+  fetchStocks,
+  fetchLatestPrices,
+  fetchLatestRankingSnapshot,
+  getDataSource,
+} from "@/lib/data-service.server";
 import { getFactorDefinitions, getCategories, CATEGORY_LABELS } from "@/lib/factors";
 import { formatKRW } from "@/lib/utils";
 
-export default function DashboardPage() {
-  const stocks = getStocks();
-  const latestPrices = getLatestPrices();
+// Dashboard is a Server Component — it can await async data-service calls directly.
+export default async function DashboardPage() {
+  const dataSource = getDataSource();
+  const [stocks, latestPrices, snapshot] = await Promise.all([
+    fetchStocks(),
+    fetchLatestPrices(),
+    fetchLatestRankingSnapshot("p123-inspired", "krx_all_current"),
+  ]);
   const factors = getFactorDefinitions();
   const categories = getCategories();
 
@@ -80,9 +90,13 @@ export default function DashboardPage() {
             <CardTitle className="text-sm font-medium">Data Mode</CardTitle>
           </CardHeader>
           <CardContent>
-            <Badge variant="outline" className="text-xs">Mock Data</Badge>
+            <Badge variant={dataSource === "db" ? "default" : "outline"} className="text-xs">
+              {dataSource === "db" ? "Live (Supabase)" : "Mock Data"}
+            </Badge>
             <p className="text-xs text-muted-foreground mt-2">
-              60 stocks, ~1 year of prices, 4 years of financials
+              {snapshot
+                ? `Snapshot id=${snapshot.id} · ${snapshot.date} · ${snapshot.universeSize ?? "?"} stocks`
+                : "No ranking snapshot found yet"}
             </p>
           </CardContent>
         </Card>
@@ -93,18 +107,18 @@ export default function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle className="text-lg">Quick Start</CardTitle>
-            <CardDescription>Build and run a ranking system</CardDescription>
+            <CardDescription>Browse the latest ranking or build a system</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            <Link href="/ranking-systems">
+            <Link href="/ranking">
               <Button className="w-full justify-between">
-                View Ranking Systems
+                <span className="flex items-center gap-2"><Trophy className="h-4 w-4" /> Today&apos;s Ranking</span>
                 <ArrowRight className="h-4 w-4" />
               </Button>
             </Link>
-            <Link href="/ranking-systems/default">
+            <Link href="/ranking-systems">
               <Button variant="outline" className="w-full justify-between">
-                Open Default Multi-Factor System
+                View Ranking Systems
                 <ArrowRight className="h-4 w-4" />
               </Button>
             </Link>
