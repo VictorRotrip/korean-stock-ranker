@@ -57,7 +57,7 @@ jobs:
       # ----- Step 1: prices + market cap snapshot for today -----
       - name: Ingest marcap (today's snapshot)
         working-directory: scripts/python
-        run: python -u ingest_marcap.py --source snapshot
+        run: python -u ingest_marcap.py --source snapshot --as-of-date "${{ steps.date.outputs.as_of }}"
 
       # ----- Step 2: pykrx valuation fundamentals -----
       - name: Ingest pykrx fundamentals
