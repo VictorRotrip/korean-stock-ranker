@@ -802,8 +802,13 @@ ACCOUNT_MAP = {
     "영업이익(손실)": "operating_income",
     "당기순이익": "net_income",
     "당기순이익(손실)": "net_income",
+    "당기순손익": "net_income",                  # alt phrasing: 손익 instead of 이익
     "주당이익": "eps",
     "기본주당이익(손실)": "eps",
+    "기본주당순이익": "eps",
+    "기본주당순손익": "eps",                      # 한솔제지-style phrasing
+    "주당순이익": "eps",
+    "기본주당순이익(손실)": "eps",
     # Balance Sheet
     "자산총계": "total_assets",
     "부채총계": "total_liabilities",
@@ -813,7 +818,11 @@ ACCOUNT_MAP = {
     "현금및현금성자산": "cash",
     "현금": "cash",
     "단기차입금": "short_term_debt",
+    "단기차입금및사채": "short_term_debt",        # combined form: borrowings + bonds
     "장기차입금": "long_term_debt",
+    "장기차입금및사채": "long_term_debt",
+    "유동성장기부채": "short_term_debt",          # current portion of LT debt
+    "유동성장기차입금": "short_term_debt",
     "사채": "bonds_payable",
     "차입금": "total_debt",
     "재고자산": "inventory",
@@ -821,9 +830,12 @@ ACCOUNT_MAP = {
     # Cash Flow
     "영업활동현금흐름": "operating_cash_flow",
     "영업활동으로인한현금흐름": "operating_cash_flow",
+    "영업활동순현금흐름": "operating_cash_flow",
     "투자활동현금흐름": "investing_cash_flow",
-    "유형자산의 취득": "capex_tangible",
-    "무형자산의 취득": "capex_intangible",
+    "유형자산의취득": "capex_tangible",
+    "유형자산취득": "capex_tangible",
+    "무형자산의취득": "capex_intangible",
+    "무형자산취득": "capex_intangible",
     "감가상각비": "depreciation",
     "무형자산상각비": "amortization",
     "이자비용": "interest_expense",
@@ -831,7 +843,36 @@ ACCOUNT_MAP = {
     "배당금의지급": "dividends_paid",
     # Shares
     "발행주식수": "shares_outstanding",
+    "유통주식수": "shares_outstanding",
 }
+
+
+import unicodedata as _unicodedata
+
+
+def _normalize_account_name(s):
+    """Canonicalise a DART account name for lookup. Strips whitespace
+    (DART filings inconsistently include spaces inside Korean compound
+    words like "영업활동으로 인한 현금흐름" vs "영업활동으로인한현금흐름") AND
+    applies Unicode NFC composition (some DART responses use decomposed
+    Hangul, which doesn't byte-match composed Hangul in source code)."""
+    if not s:
+        return ""
+    return "".join(_unicodedata.normalize("NFC", s).split())
+
+
+# Pre-normalised lookup table, built once at import time.
+_ACCOUNT_MAP_NORM = {
+    _normalize_account_name(k): v for k, v in ACCOUNT_MAP.items()
+}
+
+
+def _lookup_field(account_name):
+    """Return the canonical field for a DART account name, tolerant of
+    whitespace and Unicode-form differences."""
+    if not account_name:
+        return None
+    return _ACCOUNT_MAP_NORM.get(_normalize_account_name(account_name))
 
 
 # Per-field priority lists for fields that have multiple Korean K-IFRS
@@ -1005,9 +1046,9 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
 
     for item in accounts:
         account_name = str(item.get("account_nm", "")).strip()
-        if account_name not in ACCOUNT_MAP:
+        field = _lookup_field(account_name)
+        if field is None:
             continue
-        field = ACCOUNT_MAP[account_name]
         # Statement-type filter: skip rows whose sj_div doesn't match the
         # statement(s) this field is supposed to come from. Prevents the
         # SCE 당기순이익 = 0 contamination that was zeroing net_income for
@@ -1025,16 +1066,19 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
     # priority (lowest list-index) one. Overwrites whatever the simple
     # ACCOUNT_MAP loop above wrote, so the more precise concept wins.
     for target_field, priority_list in ACCOUNT_PRIORITY.items():
+        # Whitespace + Unicode-normalised priority list for tolerant matching.
+        priority_norm = [_normalize_account_name(p) for p in priority_list]
         best_idx = None
         best_val = None
         for item in accounts:
             name = str(item.get("account_nm", "")).strip()
-            if name not in priority_list:
+            name_norm = _normalize_account_name(name)
+            if name_norm not in priority_norm:
                 continue
             sj_div = str(item.get("sj_div") or "").upper()
             if not _sj_div_ok(target_field, sj_div):
                 continue
-            idx = priority_list.index(name)
+            idx = priority_norm.index(name_norm)
             if best_idx is not None and idx >= best_idx:
                 # already have a more-or-equally-precise candidate
                 continue
@@ -1067,6 +1111,14 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
                 capex += result[k]
         if capex != 0:
             result["capex"] = capex
+
+    # Mirror the internal `capex` field into the DB column name. The upsert
+    # reads `capital_expenditure`, not `capex`, so without this copy capex
+    # silently never reaches the database. (It was already used to derive
+    # free_cash_flow above, which is why FCF appears but capital_expenditure
+    # stays NULL — a quiet bug introduced when capex aggregation was added.)
+    if "capital_expenditure" not in result and "capex" in result:
+        result["capital_expenditure"] = result["capex"]
 
     if "free_cash_flow" not in result:
         if "operating_cash_flow" in result and ("capex" in result or "capital_expenditure" in result):
@@ -1155,6 +1207,8 @@ def upsert_financials(conn, records):
         ebitda = COALESCE(EXCLUDED.ebitda, financial_statements.ebitda),
         interest_expense = COALESCE(EXCLUDED.interest_expense, financial_statements.interest_expense),
         depreciation = COALESCE(EXCLUDED.depreciation, financial_statements.depreciation),
+        dividends_paid = COALESCE(EXCLUDED.dividends_paid, financial_statements.dividends_paid),
+        book_value_per_share = COALESCE(EXCLUDED.book_value_per_share, financial_statements.book_value_per_share),
         shares_outstanding = COALESCE(EXCLUDED.shares_outstanding, financial_statements.shares_outstanding)
     """
     execute_values(cur, query, values)

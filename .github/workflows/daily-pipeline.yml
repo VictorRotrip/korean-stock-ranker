@@ -1,0 +1,118 @@
+name: Daily pipeline
+
+# Runs the full ingest + ranking pipeline on GitHub's runners, writes
+# everything to Supabase. Vercel ISR cache (revalidate=3600) picks up the
+# new data within ~1 hour automatically — no explicit revalidation call
+# required.
+#
+# Schedule: 11:00 UTC weekdays = 20:00 KST, ~4.5h after KRX close (15:30 KST).
+# This gives marcap time to publish the day's snapshot before we ingest.
+#
+# Also runnable manually via the Actions tab → "Daily pipeline" → "Run workflow".
+
+on:
+  schedule:
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      as_of_date:
+        description: "Override 'as of' date (YYYY-MM-DD). Defaults to today (UTC)."
+        required: false
+        type: string
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+      OPENDART_API_KEY: ${{ secrets.DART_API_KEY }}    # legacy name some scripts read
+      UNIVERSE: krx_all_current
+      SYSTEM_ID: p123-inspired
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: scripts/python/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/python/requirements.txt
+
+      - name: Resolve AS_OF date
+        id: date
+        run: |
+          if [ -n "${{ inputs.as_of_date }}" ]; then
+            echo "as_of=${{ inputs.as_of_date }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "as_of=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "year=$(date -u +%Y)" >> "$GITHUB_OUTPUT"
+
+      # ----- Step 1: prices + market cap snapshot for today -----
+      - name: Ingest marcap (today's snapshot)
+        working-directory: scripts/python
+        run: python -u ingest_marcap.py --source snapshot
+
+      # ----- Step 2: pykrx valuation fundamentals -----
+      - name: Ingest pykrx fundamentals
+        working-directory: scripts/python
+        run: python -u ingest_pykrx_fundamentals.py --date "${{ steps.date.outputs.as_of }}"
+        continue-on-error: true   # pykrx can be flaky; don't block ranking on it
+
+      # ----- Step 3: short selling -----
+      - name: Ingest KRX short selling
+        working-directory: scripts/python
+        run: python -u ingest_short_selling_krx.py --date "${{ steps.date.outputs.as_of }}"
+        continue-on-error: true
+
+      # ----- Step 4: DART new filings (current year, annual + quarterlies) -----
+      # `--resume` skips filings already in financial_statements so this runs
+      # quickly most days. Only picks up newly-filed reports.
+      - name: Ingest new DART filings
+        working-directory: scripts/python
+        run: |
+          python -u ingest_dart.py \
+            --universe "$UNIVERSE" \
+            --years "${{ steps.date.outputs.year }}" \
+            --reports 11011,11013,11012,11014 \
+            --resume
+        continue-on-error: true   # rate-limit failures shouldn't kill the run
+
+      # ----- Step 5: compute factors -----
+      - name: Calculate factors
+        working-directory: scripts/python
+        run: |
+          python -u calculate_factors.py \
+            --as-of-date "${{ steps.date.outputs.as_of }}" \
+            --universe "$UNIVERSE"
+
+      # ----- Step 6: ranking snapshot -----
+      - name: Run ranking snapshot
+        working-directory: scripts/python
+        run: |
+          python -u run_ranking_snapshot.py \
+            --as-of-date "${{ steps.date.outputs.as_of }}" \
+            --universe "$UNIVERSE" \
+            --system-id "$SYSTEM_ID" \
+            --missing-category-policy neutral \
+            --min-active-weight-coverage 0.60 \
+            --min-category-count 3 \
+            --min-factor-count 10
+
+      # ----- Step 7: forward returns (fills in for any newly-passed horizon) -----
+      - name: Update forward returns
+        working-directory: scripts/python
+        run: python -u backtest_forward_returns.py --universe "$UNIVERSE"
+
+      # ----- Summary -----
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "Pipeline finished for as-of-date ${{ steps.date.outputs.as_of }}"
+          echo "Run id: ${{ github.run_id }}"

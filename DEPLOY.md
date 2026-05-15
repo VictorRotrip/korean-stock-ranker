@@ -87,6 +87,45 @@ nearest to Supabase's `eu-west-1`. This keeps DB latency under ~10ms.
 
 In Vercel → Project → Domains, add your CNAME. SSL is automatic.
 
+## Daily pipeline via GitHub Actions
+
+The Python pipeline (marcap → pykrx → DART → factors → ranking → forward
+returns) runs every weekday at 11:00 UTC (20:00 KST, ~4.5h after KRX
+close) on GitHub's runners and writes directly to Supabase. Vercel's
+ISR cache picks up the fresh data within ~1h.
+
+Workflow file: `.github/workflows/daily-pipeline.yml`.
+
+### Required GitHub secrets
+
+In **Settings → Secrets and variables → Actions**, add:
+
+| Name           | Source                                              |
+|---------------:|-----------------------------------------------------|
+| `DATABASE_URL` | Same Supabase pooler URL used by Vercel             |
+| `DART_API_KEY` | OpenDART API key — get one at https://opendart.fss.or.kr |
+
+### Triggering manually
+
+The workflow also has `workflow_dispatch`, so you can trigger a run from
+the GitHub UI: **Actions → Daily pipeline → Run workflow**. You can
+optionally override the as-of date (defaults to today UTC).
+
+### Failure handling
+
+`pykrx` and `short_selling` ingest are marked `continue-on-error` — they
+hit external APIs that occasionally flake (KRX or Naver returning 5xx).
+The ranking still runs on whatever fundamentals + prices we have.
+
+DART ingest also uses `continue-on-error`. New filings drop unevenly; if
+DART rate-limits, we just pick them up tomorrow.
+
+### Monitoring
+
+GitHub Actions UI shows green/red per run. For deeper diagnostics, click
+a run → expand each step's log. The "Pipeline summary" final step always
+runs, even on partial failures, and reports the as-of date.
+
 ## Smoke test after deploy
 
 From a fresh browser:
