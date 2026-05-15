@@ -60,16 +60,27 @@ jobs:
         run: python -u ingest_marcap.py --source snapshot --as-of-date "${{ steps.date.outputs.as_of }}"
 
       # ----- Step 2: pykrx valuation fundamentals -----
-      - name: Ingest pykrx fundamentals
-        working-directory: scripts/python
-        run: python -u ingest_pykrx_fundamentals.py --date "${{ steps.date.outputs.as_of }}"
-        continue-on-error: true   # pykrx can be flaky; don't block ranking on it
+      # Skipped: KRX changed their API in 2026 to require KRX_ID + KRX_PW
+      # credentials. After the DART parser fix, we get EPS, BPS, total_debt,
+      # dividends, OCF, capex etc. directly from DART, and PER/PBR are
+      # derivable as price / EPS and price / BPS — so pykrx is now
+      # redundant. Re-enable only if KRX-direct ratios are needed.
+      # - name: Ingest pykrx fundamentals
+      #   working-directory: scripts/python
+      #   run: python -u ingest_pykrx_fundamentals.py --date "${{ steps.date.outputs.as_of }}"
+      #   continue-on-error: true
 
       # ----- Step 3: short selling -----
-      - name: Ingest KRX short selling
-        working-directory: scripts/python
-        run: python -u ingest_short_selling_krx.py --date "${{ steps.date.outputs.as_of }}"
-        continue-on-error: true
+      # Skipped: KRX bulk endpoint started requiring auth in 2026 (same
+      # policy change that broke pykrx). Without short selling data the
+      # `short_interest_pct` factor in the Sentiment category is NULL —
+      # `calculate_factors.py` will skip it and the composite renormalizes
+      # over the remaining sentiment factors. Re-enable if you get a
+      # KRX_ID / KRX_PW account, or after we wire a different data source.
+      # - name: Ingest KRX short selling
+      #   working-directory: scripts/python
+      #   run: python -u ingest_short_selling_krx.py --date "${{ steps.date.outputs.as_of }}"
+      #   continue-on-error: true
 
       # ----- Step 4: DART new filings (current year, annual + quarterlies) -----
       # `--resume` skips filings already in financial_statements so this runs
