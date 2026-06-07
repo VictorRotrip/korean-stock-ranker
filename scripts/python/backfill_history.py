@@ -287,21 +287,49 @@ if __name__ == "__main__":
     n_ok = 0
     n_failed = 0
     n_skipped = 0
+    MAX_ATTEMPTS = 3
     try:
+        import time as _time
         for i, d in enumerate(pending, 1):
             print("\n" + "=" * 70)
             print("[{0}/{1}] {2}".format(i, len(pending), d))
             print("=" * 70)
-            ok1 = run_calc_factors(d, args.universe,
-                                     args.allow_snapshot_market_cap)
+            # Per-date retry. calculate_factors.py and run_ranking_snapshot.py
+            # have no built-in DB-reconnect logic, so a brief Supabase pooler
+            # hiccup mid-run will return a non-zero exit code. Retrying with
+            # backoff (30s, 60s) gives the network time to settle without
+            # losing the date.
+            ok1 = ok2 = False
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                ok1 = run_calc_factors(d, args.universe,
+                                       args.allow_snapshot_market_cap)
+                if ok1:
+                    break
+                if attempt < MAX_ATTEMPTS:
+                    wait = 30 * attempt
+                    print("  ! calculate_factors failed (attempt {0}/{1}); "
+                          "waiting {2}s before retry...".format(
+                              attempt, MAX_ATTEMPTS, wait))
+                    _time.sleep(wait)
             if not ok1:
-                print("  ! calculate_factors failed; skipping ranking step.")
+                print("  ! calculate_factors failed after {0} attempts; "
+                      "skipping ranking step.".format(MAX_ATTEMPTS))
                 n_failed += 1
                 continue
-            ok2 = run_rank_snapshot(d, args.universe,
-                                     args.allow_snapshot_market_cap)
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                ok2 = run_rank_snapshot(d, args.universe,
+                                        args.allow_snapshot_market_cap)
+                if ok2:
+                    break
+                if attempt < MAX_ATTEMPTS:
+                    wait = 30 * attempt
+                    print("  ! run_ranking_snapshot failed (attempt {0}/{1}); "
+                          "waiting {2}s before retry...".format(
+                              attempt, MAX_ATTEMPTS, wait))
+                    _time.sleep(wait)
             if not ok2:
-                print("  ! run_ranking_snapshot failed.")
+                print("  ! run_ranking_snapshot failed after {0} attempts.".format(
+                    MAX_ATTEMPTS))
                 n_failed += 1
                 continue
             n_ok += 1

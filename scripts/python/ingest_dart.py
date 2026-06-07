@@ -35,6 +35,7 @@ Rate limit: DART API allows ~1000 requests/day for free keys.
 import os
 import sys
 import json
+import re
 import argparse
 import time
 import urllib.request
@@ -82,10 +83,16 @@ SCRIPT_NAME = "ingest_dart"
 #                             retries once. Returns (conn, result) so the
 #                             caller can keep using the (possibly new) conn.
 
-# Errors that mean "the connection is dead, throw it away and reconnect":
+# Errors that mean "the connection is dead, throw it away and reconnect".
+# DatabaseError is the parent of OperationalError/InterfaceError and is
+# what Supabase pooler drops surface as in psycopg2 2.9.x — catching it
+# here means we recover from "server closed the connection unexpectedly"
+# instead of dying. Non-connection DatabaseErrors (IntegrityError etc.)
+# never get raised in our hot paths, so this is safe in practice.
 _CONN_DEAD_ERRORS = (
     psycopg2.OperationalError,
     psycopg2.InterfaceError,
+    psycopg2.DatabaseError,
 )
 
 
@@ -101,8 +108,8 @@ def connect_db():
     )
 
 
-def ensure_connection(conn, verify=False):
-    """Return a live DB connection.
+def ensure_connection(conn, verify=False, max_attempts=8):
+    """Return a live DB connection, with retry-with-backoff resilience.
 
     Reconnects (with a "DB connection lost; reconnecting..." log line) when:
       * conn is None,
@@ -110,26 +117,61 @@ def ensure_connection(conn, verify=False):
         server drops the connection), or
       * verify=True and a `SELECT 1` liveness probe raises a connection error.
 
-    Does NOT raise on its own: a brand-new connect_db() failure (rare but
-    possible) propagates, which is the right behaviour — we can't continue.
+    Backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped). After `max_attempts`
+    consecutive failures we raise — at that point either Supabase is down or
+    the local network is broken and there's nothing useful to retry.
     """
-    if conn is None or getattr(conn, "closed", 0):
-        print("  DB connection lost; reconnecting...", flush=True)
-        return connect_db()
-    if verify:
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            cur.fetchone()
-            cur.close()
-        except _CONN_DEAD_ERRORS:
-            print("  DB connection stale; reconnecting...", flush=True)
+    import time as _time
+
+    # Fast path: existing conn that probably works
+    if conn is not None and not getattr(conn, "closed", 0) and not verify:
+        return conn
+
+    # Loop attempts: either initial connect, or reconnect after dead conn
+    last_err = None
+    for attempt in range(max_attempts):
+        # 1. Try the verify path first if we have a conn (cheap if alive)
+        if attempt == 0 and conn is not None and not getattr(conn, "closed", 0) and verify:
             try:
-                conn.close()
-            except Exception:
-                pass
-            return connect_db()
-    return conn
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.close()
+                return conn  # alive
+            except Exception as e:
+                last_err = e
+                print("  DB connection stale ({0}); reconnecting...".format(
+                    str(e).strip()[:60]), flush=True)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+
+        # 2. Try a fresh connection (and verify it)
+        try:
+            new_conn = connect_db()
+            if verify:
+                cur = new_conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.close()
+            return new_conn
+        except Exception as e:
+            last_err = e
+            backoff = min(60, 2 ** attempt)  # 1, 2, 4, 8, 16, 32, 60, 60
+            print(
+                "  Reconnect attempt {0}/{1} failed ({2}); waiting {3}s...".format(
+                    attempt + 1, max_attempts,
+                    str(e).strip()[:60], backoff),
+                flush=True,
+            )
+            _time.sleep(backoff)
+
+    raise RuntimeError(
+        "ensure_connection: could not connect after {0} attempts; "
+        "last error: {1}".format(max_attempts, last_err)
+    )
 
 
 def db_write_with_retry(conn, fn, *args, **kwargs):
@@ -1270,6 +1312,64 @@ def get_already_ingested(conn, tickers, years, report_codes):
     return {(r[0], r[1], type_to_code.get(r[2], r[2])) for r in results}
 
 
+# Map the human-readable report label back to the API report_code.
+_LABEL_TO_REPORT_CODE = {
+    "Annual": "11011",
+    "Q1": "11013",
+    "Q2 Semi-annual": "11012",
+    "Q3": "11014",
+}
+
+# Match a single ingest-log line ending in "skip: no data" or
+# "skip: no report". Anchored to the bracketed counter at the start so we
+# don't accidentally match a stray Korean ticker name containing the word
+# "skip". Tested against the real log format:
+#   [34/107976] 000030 우리은행 / 2015 / Q1 -> skip: no data in filing (4.0s)
+#   [35/107976] 000030 우리은행 / 2015 / Q3 -> skip: no report (1.6s)
+_LOG_EMPTY_LINE_RE = re.compile(
+    # The display_name segment between ticker and first `/` may be empty
+    # for delisted stocks with no Korean name on file, so we accept any
+    # non-`/` content (including just whitespace).
+    r"\[\d+/\d+\]\s+(\d{6})\s+[^/]*?/\s*(\d{4})\s*/\s*"
+    r"(Annual|Q1|Q2 Semi-annual|Q3)\s*->\s*skip:\s+no\s+(?:data|report)"
+)
+
+
+def load_known_empty_from_logs(log_dir):
+    """Scan dart_*.log files in `log_dir` for past "no data" / "no report"
+    entries. Returns a set of (ticker, year, report_code) tuples that we
+    can confidently skip on resume — DART has already told us these are
+    empty.
+
+    Files older than 30 days are still scanned (DART filings don't move
+    once filed), so this is a near-permanent negative cache. The cost of
+    a false positive (skipping a filing that secretly does have data now)
+    is negligible: it just means we'd miss one filing until a fresh full
+    run without --skip-existing. Users can force a re-check by deleting
+    the log files.
+    """
+    import glob
+    known = set()
+    log_pattern = os.path.join(log_dir, "dart_*.log")
+    log_files = sorted(glob.glob(log_pattern))
+    if not log_files:
+        return known
+    for path in log_files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    m = _LOG_EMPTY_LINE_RE.search(line)
+                    if not m:
+                        continue
+                    ticker, year_s, label = m.group(1), m.group(2), m.group(3)
+                    code = _LABEL_TO_REPORT_CODE.get(label)
+                    if code:
+                        known.add((ticker, int(year_s), code))
+        except OSError:
+            continue
+    return known
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1463,6 +1563,21 @@ if __name__ == "__main__":
     already_ingested = set()
     if resume:
         already_ingested = get_already_ingested(conn, active_tickers, years, report_codes)
+        # Also load "known empty" combos from past log files. These are
+        # filings that previous runs already confirmed have no parseable
+        # data in DART (either "no report" or "no data in filing"). Since
+        # they never landed in financial_statements, --skip-existing alone
+        # would re-ask DART on every restart, wasting ~3-4 sec per filing.
+        # Treating them as already-done saves ~20 hours of catch-up time
+        # per restart for a full quarterly run.
+        known_empty = load_known_empty_from_logs(os.path.dirname(__file__))
+        if known_empty:
+            before = len(already_ingested)
+            already_ingested |= known_empty
+            added = len(already_ingested) - before
+            print("  Loaded {0} known-empty combos from past logs "
+                  "({1} new beyond DB rows)".format(
+                      len(known_empty), added), flush=True)
 
     log_id = log_start(conn, {
         "tickers": ",".join(active_tickers[:20]),

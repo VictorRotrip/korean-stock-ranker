@@ -132,37 +132,36 @@ def get_active_tickers(conn, tickers_filter=None, limit=None, as_of=None,
     cur = conn.cursor()
 
     if pit_universe and as_of:
-        # PIT mode — candidate pool first (no is_active filter), then
-        # the "had a price recently before as_of" filter.
+        # PIT mode — find all tickers with a price in the lookback window
+        # in ONE indexed scan on daily_prices, then intersect with the
+        # universe membership in Python. This is much faster than 3,400
+        # individual EXISTS subqueries (which timed out on the Supabase
+        # pooler for some dates with denser daily_prices history).
+        cur.execute("""
+            SELECT DISTINCT ticker FROM daily_prices
+            WHERE date <= %s
+              AND date >= (%s::date - %s::int)
+        """, (as_of, as_of, pit_lookback_days))
+        alive = {r[0] for r in cur.fetchall()}
+
         if tickers_filter:
-            cur.execute("""
-                SELECT s.ticker
-                FROM stocks s
-                WHERE s.ticker = ANY(%s)
-                  AND EXISTS (
-                    SELECT 1 FROM daily_prices dp
-                    WHERE dp.ticker = s.ticker
-                      AND dp.date <= %s
-                      AND dp.date >= (%s::date - %s::int)
-                  )
-                ORDER BY s.ticker
-            """, (list(tickers_filter), as_of, as_of, pit_lookback_days))
+            # Preserve the universe ordering (sorted) and only keep
+            # candidates that also exist in `stocks` so downstream
+            # JOINs don't fail on orphan tickers.
+            cur.execute(
+                "SELECT ticker FROM stocks WHERE ticker = ANY(%s) ORDER BY ticker",
+                (list(tickers_filter),))
+            candidates = [r[0] for r in cur.fetchall()]
+            cur.close()
+            return [t for t in candidates if t in alive]
         else:
-            q = """
-                SELECT s.ticker
-                FROM stocks s
-                WHERE EXISTS (
-                    SELECT 1 FROM daily_prices dp
-                    WHERE dp.ticker = s.ticker
-                      AND dp.date <= %s
-                      AND dp.date >= (%s::date - %s::int)
-                )
-                ORDER BY s.ticker
-            """
-            params = [as_of, as_of, pit_lookback_days]
+            q = "SELECT ticker FROM stocks ORDER BY ticker"
             if limit:
                 q += " LIMIT {0}".format(int(limit))
-            cur.execute(q, params)
+            cur.execute(q)
+            candidates = [r[0] for r in cur.fetchall()]
+            cur.close()
+            return [t for t in candidates if t in alive]
     else:
         # Legacy mode — preserve old behaviour for any edge callers.
         if tickers_filter:
@@ -195,32 +194,45 @@ def get_stock_metadata(conn, ticker):
     return {"sector": None, "industry": None}
 
 
-def get_pit_marcap_status(conn, tickers, as_of):
+def get_pit_marcap_status(conn, tickers, as_of, lookback_days=30):
     """For each ticker, determine the source of its effective market_cap row.
 
     Returns dict {ticker: source_label} where source_label is what's stored
     in daily_prices.source for the most recent market_cap row on or before
-    as_of. Tickers with no market_cap row are absent from the result.
+    as_of. Tickers with no market_cap row within the lookback window are
+    absent from the result.
+
+    Implementation note: this uses one indexed date-range scan and then
+    finds the latest-per-ticker in Python. The earlier SQL-side correlated
+    subquery (WITH latest ... JOIN) timed out on Supabase's pooler for
+    ~2,700-ticker universes because it couldn't decide between the date
+    and ticker-date indexes without a bounded date window. The 30-day
+    lookback is plenty for "is this stock actively traded near as_of" —
+    anything older than that means the stock is effectively delisted on
+    this date.
     """
     if not tickers:
         return {}
     cur = conn.cursor()
     cur.execute("""
-        WITH latest AS (
-            SELECT ticker, MAX(date) AS d
-            FROM daily_prices
-            WHERE ticker = ANY(%s)
-              AND date <= %s
-              AND market_cap IS NOT NULL AND market_cap > 0
-            GROUP BY ticker
-        )
-        SELECT dp.ticker, dp.source
-        FROM latest l
-        JOIN daily_prices dp ON dp.ticker = l.ticker AND dp.date = l.d
-    """, (list(tickers), as_of))
+        SELECT ticker, date, source
+        FROM daily_prices
+        WHERE date <= %s
+          AND date >= (%s::date - %s::int)
+          AND market_cap IS NOT NULL AND market_cap > 0
+    """, (as_of, as_of, lookback_days))
     rows = cur.fetchall()
     cur.close()
-    return {t: s for t, s in rows}
+
+    ticker_set = set(tickers)
+    latest = {}  # ticker -> (date, source)
+    for ticker, dt, source in rows:
+        if ticker not in ticker_set:
+            continue
+        existing = latest.get(ticker)
+        if existing is None or dt > existing[0]:
+            latest[ticker] = (dt, source)
+    return {t: ds[1] for t, ds in latest.items()}
 
 
 # Factors that consume market_cap directly. When a stock's effective marcap
@@ -990,26 +1002,26 @@ def clear_existing_snapshots(conn, universe_name, as_of, tickers):
     return deleted
 
 
-def upsert_factor_snapshots(conn, rows):
+def upsert_factor_snapshots(conn, rows, chunk_size=5000):
     """Write factor snapshot rows, scoped by universe_name.
 
     Args:
         rows: list of (universe_name, ticker, factor_id, date, raw_value,
                        percentile_rank, source)
+        chunk_size: how many rows per commit. Smaller chunks keep
+                    individual transactions short, which prevents the
+                    Supabase pooler from idle-timing-out mid-upsert when
+                    we have ~100k rows (the previous one-big-transaction
+                    approach hung for hours on dates with 2,400+ tickers).
 
     Universe-awareness: percentile ranks depend on the universe in which the
     stock was ranked, so the unique key includes universe_name. Two universes
     can both have a factor_snapshot row for the same (ticker, factor_id, date)
     with different percentile ranks -- they live side by side.
-
-    Requires migration 004 (adds universe_name column and unique index).
-    The OLD primary key on (ticker, factor_id, date) must be dropped manually
-    in Supabase SQL Editor; see scripts/sql/004_universe_aware_factor_snapshots.sql
-    for the exact statement.
     """
     if not rows:
         return 0
-    cur = conn.cursor()
+
     query = """
     INSERT INTO factor_snapshots
         (universe_name, ticker, factor_id, date, raw_value, percentile_rank, source)
@@ -1019,10 +1031,46 @@ def upsert_factor_snapshots(conn, rows):
         percentile_rank = EXCLUDED.percentile_rank,
         source = EXCLUDED.source
     """
-    execute_values(cur, query, rows)
-    conn.commit()
-    cur.close()
-    return len(rows)
+
+    total = len(rows)
+    written = 0
+    n_chunks = (total + chunk_size - 1) // chunk_size
+    for ci in range(n_chunks):
+        chunk = rows[ci * chunk_size : (ci + 1) * chunk_size]
+        if not chunk:
+            continue
+        # Retry-with-backoff per chunk so a transient SSL drop on one
+        # batch doesn't lose all the others. After 3 failures we re-raise.
+        last_err = None
+        for attempt in range(3):
+            try:
+                cur = conn.cursor()
+                execute_values(cur, query, chunk, page_size=500)
+                conn.commit()
+                cur.close()
+                written += len(chunk)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                import time as _t
+                wait = 5 * (attempt + 1)
+                print("    upsert chunk {0}/{1} failed (attempt {2}/3): {3}; "
+                      "waiting {4}s".format(
+                          ci + 1, n_chunks, attempt + 1,
+                          str(e).strip()[:60], wait),
+                      flush=True)
+                _t.sleep(wait)
+        if last_err is not None:
+            raise last_err
+        if (ci + 1) % 4 == 0 or ci + 1 == n_chunks:
+            print("    upserted {0}/{1} factor snapshot rows".format(
+                written, total), flush=True)
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -1142,10 +1190,16 @@ if __name__ == "__main__":
     else:
         universe_name_for_scope = "__all_active__"
 
+    # Use a generous statement_timeout for long-running PIT-universe and
+    # marcap-status queries that scan multi-million-row daily_prices.
+    # Supabase defaults to 60s on the pooler and varies on direct; setting
+    # this explicitly per-session keeps the backfill safe across both.
+    _conn_opts = "-c statement_timeout=600000"   # 10 minutes
+
     if args.tickers:
         tickers_filter = args.tickers.split(",")
     elif args.universe:
-        cur = psycopg2.connect(DATABASE_URL).cursor()
+        cur = psycopg2.connect(DATABASE_URL, options=_conn_opts).cursor()
         cur.execute("SELECT ticker FROM universe_memberships WHERE universe_name = %s ORDER BY ticker", (args.universe,))
         tickers_filter = [r[0] for r in cur.fetchall()]
         cur.close()
@@ -1154,7 +1208,7 @@ if __name__ == "__main__":
             sys.exit(1)
         print("  Universe '{}': {} tickers".format(args.universe, len(tickers_filter)))
 
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL, options=_conn_opts)
     # PIT universe: only consider tickers that had a price in the 14 days
     # before `as_of`. This is what eliminates survivorship bias for a
     # historical backfill — a delisted ticker is in `stocks` (with no
