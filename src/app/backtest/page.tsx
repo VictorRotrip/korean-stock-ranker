@@ -5,9 +5,9 @@ import BacktestClient from "./BacktestClient";
 // Re-render once per hour. Daily Python pipeline updates ranking_snapshots
 // each morning, so an hour-old cache on Vercel is plenty fresh.
 export const revalidate = 3600;
-// Backtest data payload is hefty (~28 snapshots × 2300 tickers + forward
-// returns). Default 10s timeout can be tight on first regen; give it 30s.
-export const maxDuration = 30;
+// Backtest data payload is hefty (~137 snapshots × 3,400 tickers + forward
+// returns). 60-second budget for the first regen after deploy.
+export const maxDuration = 60;
 
 // Default weights (Portfolio123-style balanced). Mirror the seeds used by
 // run_ranking_snapshot.py for the p123-inspired system so the page lands on
@@ -22,7 +22,7 @@ const DEFAULT_WEIGHTS: Record<string, number> = {
 };
 
 export default async function BacktestPage() {
-  const payload = await fetchBacktestPayload("p123-inspired", "krx_all_current", 30);
+  const payload = await fetchBacktestPayload("p123-inspired", "krx_all_historical", 30);
 
   if (!payload || payload.snapshots.length === 0) {
     return (
