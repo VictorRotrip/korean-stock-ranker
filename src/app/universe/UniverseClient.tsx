@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatKRW } from "@/lib/utils";
+import { translateIndustry } from "@/lib/i18n";
 import type { Stock } from "@/types";
 
 export interface EnrichedStock extends Stock {
@@ -120,7 +121,7 @@ export default function UniverseClient({ stocks }: Props) {
                     <td className="px-4 py-3">
                       <Badge variant="outline" className="text-xs">{stock.market}</Badge>
                     </td>
-                    <td className="px-4 py-3 text-xs text-muted-foreground">{stock.sector || "-"}</td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">{translateIndustry(stock.sector) || "-"}</td>
                     <td className="px-4 py-3 text-right font-mono text-xs">
                       {stock.price.toLocaleString("ko-KR")}
                     </td>

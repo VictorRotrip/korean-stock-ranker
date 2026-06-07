@@ -192,6 +192,14 @@ export function runBacktest({
       if (universeFilter === "passed" && !row.passed) continue;
       const ret = retByTicker.get(row.ticker);
       if (ret === undefined) continue;
+      // Filter out unrealistic 30-day returns. Real stocks don't 3x in 30
+      // days from organic price moves — anything above +200% (or below
+      // -90%) is almost certainly a corporate action artifact (reverse
+      // stock split, consolidation) that wasn't adjusted in our raw
+      // marcap close prices. Notable case: Q4 2022 had a wave of Korean
+      // KOSDAQ small-caps consolidating 100:1 to avoid penny-stock
+      // delisting risk, which previously produced absurd D10 returns.
+      if (ret > 2.0 || ret < -0.9) continue;
       const { score } = compositeScore(row.cats, weights);
       if (score === null) continue;
       scored.push({ ticker: row.ticker, score });

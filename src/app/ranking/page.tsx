@@ -4,6 +4,7 @@ import {
   fetchStocks,
   fetchLatestPrices,
 } from "@/lib/data-service.server";
+import { displayName, translateIndustry } from "@/lib/i18n";
 import RankingClient, { type RankingRow } from "./RankingClient";
 
 export const revalidate = 1800;  // 30 min — daily snapshot updates land in the morning
@@ -42,9 +43,9 @@ export default async function RankingPage() {
     return {
       rank: r.rank,
       ticker: r.ticker,
-      name: stock?.name ?? r.ticker,
+      name: stock ? displayName(stock) : r.ticker,
       market: stock?.market ?? "?",
-      sector: stock?.sector ?? null,
+      sector: translateIndustry(stock?.sector ?? null),
       marketCap: price?.marketCap ?? null,
       composite: r.composite_score,
       categories: r.category_scores_simple ?? {},

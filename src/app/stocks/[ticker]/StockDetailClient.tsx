@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FACTOR_REGISTRY, type FactorInput } from "@/lib/factors";
 import { formatKRW, formatNumber } from "@/lib/utils";
+import { displayName, translateIndustry } from "@/lib/i18n";
 import type { Stock, DailyPrice, FinancialStatement } from "@/types";
 
 interface FactorSnapshotRow {
@@ -118,13 +119,14 @@ export default function StockDetailClient({
         </Link>
         <div className="flex-1">
           <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold">{stock.name}</h1>
+            <h1 className="text-2xl font-bold">{displayName(stock)}</h1>
             <Badge variant="outline">{stock.market}</Badge>
           </div>
           <p className="text-muted-foreground text-sm">
-            {stock.ticker}{stock.nameEn ? ` · ${stock.nameEn}` : ""}
-            {stock.sector ? ` · ${stock.sector}` : ""}
-            {stock.industry && stock.industry !== stock.sector ? ` · ${stock.industry}` : ""}
+            {stock.ticker}
+            {/* Show the Korean name as the secondary label when the English name is the headline */}
+            {stock.nameEn && stock.nameEn.trim() ? ` · ${stock.name}` : ""}
+            {translateIndustry(stock.sector) ? ` · ${translateIndustry(stock.sector)}` : ""}
           </p>
         </div>
         {latestPrice && (
@@ -173,8 +175,8 @@ export default function StockDetailClient({
             <Card>
               <CardContent className="pt-4">
                 <p className="text-xs text-muted-foreground">Sector / Industry</p>
-                <p className="text-sm font-medium">{stock.sector ?? "-"}</p>
-                <p className="text-xs text-muted-foreground">{stock.industry ?? "-"}</p>
+                <p className="text-sm font-medium">{translateIndustry(stock.sector) ?? "-"}</p>
+                <p className="text-xs text-muted-foreground">{translateIndustry(stock.industry) ?? "-"}</p>
               </CardContent>
             </Card>
           </div>
