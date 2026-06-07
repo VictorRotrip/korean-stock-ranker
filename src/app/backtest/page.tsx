@@ -2,11 +2,12 @@ import { Card, CardContent } from "@/components/ui/card";
 import { fetchBacktestPayload } from "@/lib/data-service.server";
 import BacktestClient from "./BacktestClient";
 
-// Re-render once per hour. Daily Python pipeline updates ranking_snapshots
-// each morning, so an hour-old cache on Vercel is plenty fresh.
-export const revalidate = 3600;
-// Backtest data payload is hefty (~137 snapshots × 3,400 tickers + forward
-// returns). 60-second budget for the first regen after deploy.
+// Historical-universe payload (~137 snapshots × 3,400 tickers + forward
+// returns) is ~50MB — larger than Vercel's 19MB ISR fallback limit. So we
+// render dynamically on each request; Vercel's edge cache + the browser's
+// in-memory React state still keep slider drags snappy.
+export const dynamic = "force-dynamic";
+// Generous timeout for the heavy initial data fetch.
 export const maxDuration = 60;
 
 // Default weights (Portfolio123-style balanced). Mirror the seeds used by
