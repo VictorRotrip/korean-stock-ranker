@@ -5,18 +5,44 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-/** Format a number as Korean Won */
+/** Format a number as Korean Won using Korean-style 조/억/만 suffixes.
+ *  Handles negative values (e.g., Free Cash Flow can be negative for a
+ *  company in heavy capex, which previously displayed as raw integers
+ *  like "-10,898,849,938" because the magnitude checks were one-sided). */
 export function formatKRW(value: number): string {
-  if (value >= 1_000_000_000_000) {
-    return `${(value / 1_000_000_000_000).toFixed(1)}조`;
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000_000) {
+    return `${sign}${(abs / 1_000_000_000_000).toFixed(1)}조`;
   }
-  if (value >= 100_000_000) {
-    return `${(value / 100_000_000).toFixed(0)}억`;
+  if (abs >= 100_000_000) {
+    return `${sign}${(abs / 100_000_000).toFixed(0)}억`;
   }
-  if (value >= 10_000) {
-    return `${(value / 10_000).toFixed(0)}만`;
+  if (abs >= 10_000) {
+    return `${sign}${(abs / 10_000).toFixed(0)}만`;
   }
   return value.toLocaleString("ko-KR");
+}
+
+/** Format a number as Korean Won using English suffixes (T/B/M/K).
+ *  Same magnitude buckets as formatKRW but with English unit labels,
+ *  intended for the i18n-aware parts of the UI. */
+export function formatKRWEn(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000_000) {
+    return `${sign}₩${(abs / 1_000_000_000_000).toFixed(2)}T`;
+  }
+  if (abs >= 1_000_000_000) {
+    return `${sign}₩${(abs / 1_000_000_000).toFixed(2)}B`;
+  }
+  if (abs >= 1_000_000) {
+    return `${sign}₩${(abs / 1_000_000).toFixed(1)}M`;
+  }
+  if (abs >= 1_000) {
+    return `${sign}₩${(abs / 1_000).toFixed(0)}K`;
+  }
+  return `${sign}₩${abs.toLocaleString("en-US")}`;
 }
 
 /** Format a number as percentage */
