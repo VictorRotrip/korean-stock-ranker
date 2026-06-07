@@ -108,6 +108,9 @@ export function compositeScore(
 export interface ScoredTicker {
   ticker: string;
   score: number;
+  /** The (winsorised) forward return cached alongside the score so the
+   *  bucket-mean computation doesn't have to re-look-up retByTicker. */
+  ret?: number;
 }
 
 /**
@@ -213,17 +216,17 @@ export function runBacktest({
       if (universeFilter === "passed" && !row.passed) continue;
       const ret = retByTicker.get(row.ticker);
       if (ret === undefined) continue;
-      // Filter out unrealistic 30-day returns. Real stocks don't 3x in 30
-      // days from organic price moves — anything above +200% (or below
-      // -90%) is almost certainly a corporate action artifact (reverse
-      // stock split, consolidation) that wasn't adjusted in our raw
-      // marcap close prices. Notable case: Q4 2022 had a wave of Korean
-      // KOSDAQ small-caps consolidating 100:1 to avoid penny-stock
-      // delisting risk, which previously produced absurd D10 returns.
-      if (ret > 2.0 || ret < -0.9) continue;
+      // Backstop only — splits are already adjusted in
+      // backtest_forward_returns.py via the shares-outstanding-based
+      // detector. We keep a much looser winsorisation here as
+      // defence-in-depth (in case the split detector misses something
+      // because shares_outstanding is null for a given date). Bounds:
+      // -95% (max realistic loss without delisting) to +500% (top of
+      // realistic biotech/M&A catalyst territory).
+      const winsorisedRet = Math.max(-0.95, Math.min(5.0, ret));
       const { score } = compositeScore(row.cats, weights);
       if (score === null) continue;
-      scored.push({ ticker: row.ticker, score });
+      scored.push({ ticker: row.ticker, score, ret: winsorisedRet });
     }
 
     if (scored.length < nBuckets) continue;  // not enough names to bucket
@@ -238,7 +241,10 @@ export function runBacktest({
     for (const t of scored) {
       const b = bucketMap.get(t.ticker);
       if (b === undefined) continue;
-      const r = retByTicker.get(t.ticker)!;
+      // Use the winsorised return cached on the scored ticker rather than
+      // the raw retByTicker. This way both bucket means AND the universe
+      // benchmark line use the same outlier handling.
+      const r = t.ret ?? retByTicker.get(t.ticker)!;
       sumByBucket[b - 1] += r;
       countByBucket[b - 1] += 1;
       marketSum += r;
