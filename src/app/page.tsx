@@ -11,6 +11,7 @@ import {
 } from "@/lib/data-service.server";
 import { getFactorDefinitions, getCategories, CATEGORY_LABELS } from "@/lib/factors";
 import { formatKRW } from "@/lib/utils";
+import { displayName, translateIndustry } from "@/lib/i18n";
 
 // Dashboard is a Server Component — it can await async data-service calls directly.
 export default async function DashboardPage() {
@@ -143,13 +144,13 @@ export default async function DashboardPage() {
                   <div className="flex items-center gap-3">
                     <span className="text-sm font-medium text-muted-foreground w-4">{i + 1}</span>
                     <div>
-                      <p className="text-sm font-medium">{stock.name}</p>
+                      <p className="text-sm font-medium">{displayName(stock)}</p>
                       <p className="text-xs text-muted-foreground">{stock.ticker} · {stock.market}</p>
                     </div>
                   </div>
                   <div className="text-right">
                     <p className="text-sm font-medium">{formatKRW(stock.marketCap)}</p>
-                    <p className="text-xs text-muted-foreground">{stock.sector}</p>
+                    <p className="text-xs text-muted-foreground">{translateIndustry(stock.sector) ?? ""}</p>
                   </div>
                 </div>
               ))}

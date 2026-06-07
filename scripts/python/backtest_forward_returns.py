@@ -314,25 +314,39 @@ def find_close_on_or_after(rows, target_date, max_days_forward=5):
     return None
 
 
-def find_end_close(rows, target_date, start_date, max_days_forward=5):
+def find_end_close(rows, target_date, start_date, max_data_date=None,
+                   max_days_forward=5):
     """Return (end_date, end_close, is_delisting_proxy) for the holding period.
 
     Logic:
       1. Try the normal "first price on/after target_date within window".
-      2. If that fails AND we have at least one price strictly after the
-         start_date but before target_date, the stock probably DELISTED
-         mid-window. Use the latest available price as a delisting proxy.
-         The investor sold at the last quoted price (M&A take-out, last
-         tick before bankruptcy halt, etc.).
-      3. Otherwise return None — the horizon simply hasn't elapsed yet.
+      2. If that fails because target_date is PAST our overall daily_prices
+         data window, return None — the horizon hasn't elapsed yet for
+         ANY stock and we shouldn't fabricate a return. This is the
+         critical distinction from delisting: "no future data anywhere"
+         vs. "this stock specifically stopped trading mid-window".
+      3. If target_date is within our data window AND we have at least one
+         price strictly inside (start_date, target_date), the stock
+         DELISTED mid-window. Use the latest available price as a
+         delisting proxy.
+      4. Otherwise return None.
     """
     # Normal path: price on/after target_date
     after = find_close_on_or_after(rows, target_date, max_days_forward)
     if after is not None:
         return after[0], after[1], False
 
+    # If target_date is past the latest date we have in daily_prices for
+    # ANY ticker, the horizon hasn't elapsed yet — don't treat this as
+    # delisting. Buffer of 5 days catches edge cases at the data boundary.
+    if max_data_date is not None and target_date > max_data_date:
+        # Strict: if target is past max, we never had a chance to observe
+        # an end price. Skip.
+        return None
+
     # Delisting proxy: latest available price strictly inside (start, target)
-    # — that means the stock stopped trading mid-window.
+    # — that means the stock stopped trading mid-window even though OTHER
+    # stocks have prices around target_date.
     last_in_window = None
     for r in rows:
         d, c, _ = r
@@ -344,8 +358,17 @@ def find_end_close(rows, target_date, start_date, max_days_forward=5):
     return None
 
 
-def compute_returns_for_date(conn, snapshot_date, tickers, horizons):
-    """Returns list of upsert tuples for this snapshot_date."""
+def compute_returns_for_date(conn, snapshot_date, tickers, horizons,
+                              max_data_date=None):
+    """Returns list of upsert tuples for this snapshot_date.
+
+    max_data_date is the latest date present in daily_prices for ANY
+    ticker — used to distinguish "this stock delisted mid-window" from
+    "the horizon hasn't elapsed yet because nobody has data that far
+    forward". Without this, find_end_close() will incorrectly fabricate
+    delisting-proxy returns for stocks whose horizon extends past our
+    daily_prices coverage.
+    """
     max_h = max(horizons)
     window_start = snapshot_date - timedelta(days=10)
     window_end = snapshot_date + timedelta(days=max_h + 10)
@@ -369,10 +392,12 @@ def compute_returns_for_date(conn, snapshot_date, tickers, horizons):
         ticker_divs = divs_by_ticker.get(ticker, [])
         for h in horizons:
             target_end = snapshot_date + timedelta(days=h)
-            end = find_end_close(rows, target_end, start_date)
+            end = find_end_close(rows, target_end, start_date,
+                                 max_data_date=max_data_date)
             if end is None:
-                # Horizon hasn't elapsed yet. Will be filled on a future
-                # run once daily_prices catches up.
+                # Horizon hasn't elapsed yet, or stock has no end price.
+                # Will be filled on a future run once daily_prices catches
+                # up.
                 continue
             end_date, end_close, is_delisted = end
 
@@ -499,6 +524,16 @@ if __name__ == "__main__":
     tickers = get_universe_tickers(conn, args.universe)
     print("{0} tickers in scope".format(len(tickers)))
 
+    # Maximum date we have data for, across all tickers. Any (snapshot,
+    # horizon) pair whose target_end falls past this date can't possibly
+    # have a real end price — we shouldn't fabricate a delisting-proxy
+    # for it.
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(date) FROM daily_prices")
+    max_data_date = cur.fetchone()[0]
+    cur.close()
+    print("  Max daily_prices date: {0}".format(max_data_date))
+
     log_id = log_start(conn, {
         "universe": args.universe, "since": args.since, "until": args.until,
         "horizons": horizons, "dry_run": args.dry_run,
@@ -508,7 +543,8 @@ if __name__ == "__main__":
     n_total_rows = 0
     try:
         for d in dates:
-            rows = compute_returns_for_date(conn, d, tickers, horizons)
+            rows = compute_returns_for_date(conn, d, tickers, horizons,
+                                            max_data_date=max_data_date)
             n_total_rows += len(rows)
             if args.dry_run:
                 print("  {0}: {1} (ticker, horizon) rows".format(d, len(rows)))
