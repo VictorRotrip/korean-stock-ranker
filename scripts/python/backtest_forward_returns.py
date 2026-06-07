@@ -137,11 +137,14 @@ def get_universe_tickers(conn, universe_name=None):
 # ---------------------------------------------------------------------------
 
 def fetch_close_window(conn, tickers, start_date, end_date):
-    """Return dict ticker -> sorted list of (date, close) within
-    [start_date, end_date]."""
+    """Return dict ticker -> sorted list of (date, close, shares_outstanding).
+
+    shares_outstanding may be None for days where we don't have it (older
+    marcap rows occasionally lack it). The split detector skips those days.
+    """
     cur = conn.cursor()
     cur.execute("""
-        SELECT ticker, date, close
+        SELECT ticker, date, close, shares_outstanding
         FROM daily_prices
         WHERE ticker = ANY(%s)
           AND date >= %s AND date <= %s
@@ -149,18 +152,139 @@ def fetch_close_window(conn, tickers, start_date, end_date):
         ORDER BY ticker, date
     """, (tickers, start_date, end_date))
     out = {}
-    for ticker, d, c in cur.fetchall():
-        out.setdefault(ticker, []).append((d, float(c)))
+    for ticker, d, c, sh in cur.fetchall():
+        sh_f = float(sh) if (sh is not None and sh > 0) else None
+        out.setdefault(ticker, []).append((d, float(c), sh_f))
+    cur.close()
+    return out
+
+
+def detect_splits_in_window(rows, window_start, window_end,
+                            min_shares_ratio=1.5):
+    """Detect stock splits / reverse splits within (window_start, window_end].
+
+    Args:
+      rows: list of (date, close, shares_outstanding) sorted ascending,
+            covering at least a few days before window_start.
+      window_start, window_end: inclusive-exclusive split-search range.
+      min_shares_ratio: minimum |log(shares_today / shares_yesterday)| that
+                        qualifies for a split candidate. 1.5 covers the
+                        smallest realistic split (3:2 = 1.5x) and excludes
+                        normal dilutive issuance (typically <10% per event).
+
+    Returns:
+      list of (effective_date, split_factor) where:
+        split_factor = post_shares / pre_shares
+        > 1 = forward split (e.g. 2 for a 2:1 split)
+        < 1 = reverse split / consolidation (e.g. 0.1 for a 10:1 reverse)
+
+    Logic:
+      A clean split has:
+        * Sharp shares-outstanding jump (>=1.5x in either direction)
+        * Price moves approximately inversely (so market cap is preserved,
+          ±20% tolerance for normal day's volatility)
+      Anything that doesn't pass both filters is left alone — it's
+      probably an issuance, buyback, or just noisy data.
+    """
+    splits = []
+    prev = None
+    for cur in rows:
+        d, close, sh = cur
+        if prev is not None:
+            prev_d, prev_close, prev_sh = prev
+            if (prev_sh is not None and sh is not None
+                    and prev_sh > 0 and sh > 0
+                    and prev_close > 0 and close > 0):
+                shares_ratio = sh / prev_sh
+                price_ratio = close / prev_close
+                # Big enough share-count jump?
+                big = shares_ratio >= min_shares_ratio or shares_ratio <= 1.0 / min_shares_ratio
+                if big:
+                    # Market cap should be preserved (clean split). The
+                    # combined ratio shares_ratio * price_ratio should be
+                    # ~1.0 within ±20% tolerance.
+                    combined = shares_ratio * price_ratio
+                    if 0.8 <= combined <= 1.25:
+                        if window_start < d <= window_end:
+                            splits.append((d, shares_ratio))
+        prev = cur
+    return splits
+
+
+def fetch_dividends_window(conn, tickers, start_year, end_year):
+    """Return dict ticker -> list of (ex_date, dps) for dividends with
+    fiscal-year ends in [start_year, end_year].
+
+    Dividends per share are derived from `financial_statements.dividends_paid`
+    (total cash dividends in fiscal year, from DART) divided by
+    `shares_outstanding`. The ex-date is approximated as the fiscal year-end
+    minus 3 calendar days — close enough for monthly rebalances since
+    Korean Dec-fiscal-year companies have ex-dates around Dec 27-29.
+
+    Notes & caveats:
+      * dividends_paid in DART is signed: companies report a NEGATIVE
+        figure when reporting cash *outflows* on the cash-flow statement.
+        We take abs() so the dividend amount is positive for our addition.
+      * Companies that don't report dividends or have null shares
+        outstanding are silently absent from the result.
+      * For Mar/Jun-fiscal-year-end companies (rare), the approximation
+        is closer to those year-ends. Still reasonable.
+      * Interim dividends (paid mid-year) are NOT captured here — we'd
+        need precise dividend-decision filings from DART for that.
+        Lump-sum annual treatment understates ~5-10% of stocks that pay
+        semi-annually.
+    """
+    if not tickers:
+        return {}
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT fs.ticker, fs.period_end,
+               fs.dividends_paid,
+               COALESCE(fs.shares_outstanding,
+                        dp.shares_outstanding) AS sh_out
+        FROM financial_statements fs
+        LEFT JOIN LATERAL (
+            SELECT shares_outstanding
+            FROM daily_prices
+            WHERE daily_prices.ticker = fs.ticker
+              AND daily_prices.date <= fs.period_end
+              AND daily_prices.shares_outstanding IS NOT NULL
+              AND daily_prices.shares_outstanding > 0
+            ORDER BY date DESC LIMIT 1
+        ) dp ON TRUE
+        WHERE fs.ticker = ANY(%s)
+          AND fs.statement_type = 'annual'
+          AND fs.dividends_paid IS NOT NULL
+          AND fs.dividends_paid <> 0
+          AND EXTRACT(YEAR FROM fs.period_end) >= %s
+          AND EXTRACT(YEAR FROM fs.period_end) <= %s
+    """, (tickers, start_year, end_year))
+    out = {}
+    for ticker, period_end, dividends_paid, sh_out in cur.fetchall():
+        if not sh_out or sh_out <= 0:
+            continue
+        # Cash dividends paid can come in as a negative number (cash
+        # outflow convention) — take absolute value.
+        amount = abs(float(dividends_paid)) / float(sh_out)
+        if amount <= 0:
+            continue
+        # Approximate ex-date as fiscal year-end minus 3 calendar days
+        ex_date = period_end - timedelta(days=3)
+        out.setdefault(ticker, []).append((ex_date, amount))
+    # Sort each ticker's list by ex_date
+    for t in out:
+        out[t].sort(key=lambda x: x[0])
     cur.close()
     return out
 
 
 def find_close_on_or_before(rows, target_date, max_days_back=5):
-    """rows = list of (date, close) sorted ascending. Return the last
-    (date, close) with date <= target_date, but not more than
+    """rows = list of (date, close, shares_outstanding) sorted ascending.
+    Return the last (date, close) with date <= target_date, but not more than
     max_days_back calendar days earlier. None if no match."""
     best = None
-    for d, c in rows:
+    for r in rows:
+        d, c, _ = r
         if d > target_date:
             break
         best = (d, c)
@@ -174,14 +298,49 @@ def find_close_on_or_before(rows, target_date, max_days_back=5):
 
 def find_close_on_or_after(rows, target_date, max_days_forward=5):
     """First (date, close) with date >= target_date, within
-    max_days_forward calendar days. None if no match."""
-    for d, c in rows:
+    max_days_forward calendar days. None if no match.
+
+    Accepts 3-tuples (date, close, shares_outstanding) from fetch_close_window
+    but returns only (date, close).
+    """
+    for r in rows:
+        d, c, _ = r
         if d < target_date:
             continue
         days_gap = (d - target_date).days
         if days_gap > max_days_forward:
             return None
         return (d, c)
+    return None
+
+
+def find_end_close(rows, target_date, start_date, max_days_forward=5):
+    """Return (end_date, end_close, is_delisting_proxy) for the holding period.
+
+    Logic:
+      1. Try the normal "first price on/after target_date within window".
+      2. If that fails AND we have at least one price strictly after the
+         start_date but before target_date, the stock probably DELISTED
+         mid-window. Use the latest available price as a delisting proxy.
+         The investor sold at the last quoted price (M&A take-out, last
+         tick before bankruptcy halt, etc.).
+      3. Otherwise return None — the horizon simply hasn't elapsed yet.
+    """
+    # Normal path: price on/after target_date
+    after = find_close_on_or_after(rows, target_date, max_days_forward)
+    if after is not None:
+        return after[0], after[1], False
+
+    # Delisting proxy: latest available price strictly inside (start, target)
+    # — that means the stock stopped trading mid-window.
+    last_in_window = None
+    for r in rows:
+        d, c, _ = r
+        if d > start_date and d < target_date:
+            last_in_window = (d, c)
+    if last_in_window is not None:
+        return last_in_window[0], last_in_window[1], True
+
     return None
 
 
@@ -193,22 +352,79 @@ def compute_returns_for_date(conn, snapshot_date, tickers, horizons):
 
     by_ticker = fetch_close_window(conn, tickers, window_start, window_end)
 
+    # Pre-fetch dividends for all relevant fiscal years touched by any
+    # horizon at this snapshot date. With max_h = 365, this is 1 year
+    # forward and we widen by 1 to capture year-end dividends comfortably.
+    div_start_year = snapshot_date.year
+    div_end_year = snapshot_date.year + 2
+    divs_by_ticker = fetch_dividends_window(conn, tickers,
+                                            div_start_year, div_end_year)
+
     out = []
     for ticker, rows in by_ticker.items():
         start = find_close_on_or_before(rows, snapshot_date)
         if start is None:
             continue
         start_date, start_close = start
+        ticker_divs = divs_by_ticker.get(ticker, [])
         for h in horizons:
             target_end = snapshot_date + timedelta(days=h)
-            end = find_close_on_or_after(rows, target_end)
+            end = find_end_close(rows, target_end, start_date)
             if end is None:
-                # Probably the horizon stretches past the latest price
-                # we have. Skip; the row simply isn't materialised yet
-                # and will appear once daily_prices catches up.
+                # Horizon hasn't elapsed yet. Will be filled on a future
+                # run once daily_prices catches up.
                 continue
-            end_date, end_close = end
-            forward_return = end_close / start_close - 1.0
+            end_date, end_close, is_delisted = end
+
+            # ----- Split adjustment ------------------------------------
+            # Detect any stock splits / reverse splits that occurred
+            # strictly INSIDE (snapshot_date, end_date]. For each split,
+            # split_factor = post_shares / pre_shares. The end_close on
+            # those post-split days is artificially scaled by 1/factor
+            # (forward split = lower price; reverse split = higher
+            # price). To recover the actual investor return we divide
+            # the end_close by the cumulative product of split_factors.
+            #
+            # Worked example (100:1 reverse split, Q4 2022 KOSDAQ wave):
+            #   pre: 100M shares @ 400 KRW close
+            #   post: 1M shares @ 40,000 KRW close
+            #   split_factor = 1/100 = 0.01
+            #   raw end_close = 40,000
+            #   adjusted = 40,000 / 0.01 ... wait that gives 4,000,000
+            # Hmm let me re-check. Adjusted should match the pre-split
+            # price scale (~400-ish if organic flat). Adjusted should be
+            # end_close * (split_factor). Let me redo:
+            #   end_close = 40,000  (post-split close)
+            #   investor's shares at end = pre_shares × split_factor
+            #     = 100M × 0.01 = 1M shares
+            #   end_value = 1M × 40,000 = 40B
+            #   start_value = 100M × 400 = 40B
+            #   ratio = end_value / start_value = 1.0 — flat, correct.
+            # Equivalent per-share view: adjusted_end_per_share =
+            #   end_close × split_factor = 40,000 × 0.01 = 400. Matches
+            #   start_close = 400. So we MULTIPLY end_close by the
+            #   cumulative split_factor.
+            splits_in_window = detect_splits_in_window(
+                rows, snapshot_date, end_date,
+            )
+            cum_split_factor = 1.0
+            for _sd, sf in splits_in_window:
+                cum_split_factor *= sf
+            adjusted_end_close = end_close * cum_split_factor
+
+            # Sum dividends paid out with ex-date strictly inside
+            # (snapshot_date, end_date]. Investor of record at snapshot
+            # would have received any dividend with ex-date in the
+            # holding window.
+            dividends_in_period = sum(
+                amt for ex_d, amt in ticker_divs
+                if snapshot_date < ex_d <= end_date
+            )
+
+            # Total return = (split-adjusted price + dividends) / start
+            forward_return = (
+                (adjusted_end_close + dividends_in_period) / start_close - 1.0
+            )
             out.append((
                 ticker, snapshot_date, h,
                 forward_return,
