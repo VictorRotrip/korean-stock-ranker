@@ -51,31 +51,52 @@ export interface BacktestPayload {
 
 /**
  * For one ticker, combine category percentile scores using the weight map.
- * If a category is null for the ticker, its weight is removed from the
- * denominator (renormalization), so a stock with 4-of-6 categories is still
- * comparable to one with 6-of-6. Returns null if no category has data.
+ *
+ * Uses NEUTRAL IMPUTATION for missing categories (null → 50). This matches
+ * the snapshot generation methodology (run_ranking_snapshot.py runs with
+ * `--missing-category-policy neutral`), so the decile assignment a user
+ * sees in the backtest matches what the saved ranking would produce.
+ *
+ * The previous "renormalize" approach (drop null categories from the
+ * denominator) produced systematically different rankings: a stock with
+ * only Momentum scored got a 100% Momentum weight, biasing it heavily in
+ * the bucketing. Neutral imputation is the standard P123 approach and
+ * keeps stocks with partial coverage comparable to fully-covered ones.
+ *
+ * Returns null only if EVERY category is null AND the stock has no
+ * weight signal at all — in practice this should never happen for stocks
+ * that passed `passes_minimum` in the snapshot.
  */
 export function compositeScore(
   cats: Record<string, number | null>,
   weights: Record<string, number>,
 ): { score: number | null; coverage: number } {
+  const NEUTRAL = 50;
   let weightedSum = 0;
   let totalWeight = 0;
   let activeWeight = 0;
+  let sawAnyCategory = false;
   for (const cat of Object.keys(weights)) {
     const w = weights[cat];
     if (w <= 0) continue;
     totalWeight += w;
     const v = cats[cat];
-    if (v === null || v === undefined) continue;
-    weightedSum += w * v;
-    activeWeight += w;
+    if (v !== null && v !== undefined) {
+      weightedSum += w * v;
+      activeWeight += w;
+      sawAnyCategory = true;
+    } else {
+      // Neutral imputation: missing category gets the median percentile
+      // (50). The weight still counts toward the denominator so the
+      // contribution doesn't get artificially amplified.
+      weightedSum += w * NEUTRAL;
+    }
   }
-  if (activeWeight === 0 || totalWeight === 0) {
+  if (totalWeight === 0 || !sawAnyCategory) {
     return { score: null, coverage: 0 };
   }
   return {
-    score: weightedSum / activeWeight,
+    score: weightedSum / totalWeight,
     coverage: activeWeight / totalWeight,
   };
 }
