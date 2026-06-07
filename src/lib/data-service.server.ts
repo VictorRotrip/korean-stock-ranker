@@ -11,6 +11,7 @@
 
 import "server-only";
 
+import { unstable_cache } from "next/cache";
 import type {
   Stock,
   DailyPrice,
@@ -533,7 +534,7 @@ export async function fetchLatestPriceDate(): Promise<string | null> {
  * composite score in the browser, bucket, and chain bucket returns into a
  * cumulative line — no server round-trip per slider tick.
  */
-export async function fetchBacktestPayload(
+async function fetchBacktestPayloadUncached(
   systemId: string,
   universeName: string,
   horizonDays: number = 30,
@@ -560,6 +561,14 @@ export async function fetchBacktestPayload(
   const snapshots: BacktestSnapshot[] = [];
   const categorySet = new Set<string>();
 
+  // Payload-size trimming: drop tickers with no usable category scores
+  // (saves ~30% on the historical universe where many delisted/inactive
+  // names had only NULLs at a given rebalance date). Round category
+  // scores to 1 decimal — they're percentile ranks, not precise
+  // measurements.
+  const round1 = (v: number | null): number | null =>
+    v == null ? null : Math.round(v * 10) / 10;
+
   for (const row of snapRows) {
     const r = row.results as {
       rankings?: Array<{
@@ -571,8 +580,18 @@ export async function fetchBacktestPayload(
     const rankings = r?.rankings ?? [];
     const rows: BacktestTicker[] = [];
     for (const rk of rankings) {
-      const cats = rk.category_scores_simple ?? {};
-      for (const k of Object.keys(cats)) categorySet.add(k);
+      const raw = rk.category_scores_simple ?? {};
+      const cats: Record<string, number | null> = {};
+      let anyNonNull = false;
+      for (const k of Object.keys(raw)) {
+        categorySet.add(k);
+        const v = round1(raw[k]);
+        cats[k] = v;
+        if (v !== null) anyNonNull = true;
+      }
+      // Skip rows with no usable category data — they contribute nothing
+      // to the composite anyway and bloat the payload.
+      if (!anyNonNull) continue;
       rows.push({
         ticker: rk.ticker,
         cats,
@@ -589,7 +608,6 @@ export async function fetchBacktestPayload(
       ticker: schema.backtestForwardReturns.ticker,
       snapshotDate: schema.backtestForwardReturns.snapshotDate,
       forwardReturn: schema.backtestForwardReturns.forwardReturn,
-      endDate: schema.backtestForwardReturns.endDate,
     })
     .from(schema.backtestForwardReturns)
     .where(and(
@@ -605,8 +623,8 @@ export async function fetchBacktestPayload(
     returnsByDate[key].push({
       ticker: r.ticker,
       date: r.snapshotDate,
-      ret: r.forwardReturn,
-      endDate: r.endDate ?? null,
+      ret: Math.round(r.forwardReturn * 10000) / 10000,  // 4 decimal places
+      endDate: null,                                      // omitted (unused in client)
     });
   }
 
@@ -625,3 +643,19 @@ export async function fetchBacktestPayload(
     returns: returnsByDate,
   };
 }
+
+/**
+ * Server-cached wrapper around the heavy Supabase fetch. The page is rendered
+ * dynamically (no ISR) so every request hits the server, but this cache means
+ * only the first request per hour actually queries Supabase — subsequent
+ * requests reuse the in-memory result on the same Vercel function instance.
+ * The cache tag `backtest-payload` lets us bust it on demand if needed.
+ */
+export const fetchBacktestPayload = unstable_cache(
+  fetchBacktestPayloadUncached,
+  ["backtest-payload-v1"],
+  {
+    revalidate: 3600,
+    tags: ["backtest-payload"],
+  },
+);
