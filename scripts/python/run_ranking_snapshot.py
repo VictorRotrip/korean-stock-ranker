@@ -208,13 +208,18 @@ P123_TREE = {
                     {"id": "f-opmgn", "type": "factor", "name": "Operating Margin", "weight": 60, "factorId": "operating_margin_ttm"},
                     {"id": "f-gpmgn", "type": "factor", "name": "Gross Margin", "weight": 40, "factorId": "gross_margin_ttm"},
                  ]},
-                {"id": "sub-q-roc", "type": "composite", "name": "Return on Capital", "weight": 35,
+                {"id": "sub-q-roc", "type": "composite", "name": "Return on Capital", "weight": 30,
                  "children": [
-                    {"id": "f-roe", "type": "factor", "name": "ROE", "weight": 35, "factorId": "roe_ttm"},
-                    {"id": "f-roa", "type": "factor", "name": "ROA", "weight": 30, "factorId": "roa_ttm"},
-                    {"id": "f-gpa", "type": "factor", "name": "Gross Profit/Assets", "weight": 35, "factorId": "gross_profit_assets"},
+                    {"id": "f-roe", "type": "factor", "name": "ROE", "weight": 28, "factorId": "roe_ttm"},
+                    {"id": "f-roa", "type": "factor", "name": "ROA", "weight": 24, "factorId": "roa_ttm"},
+                    {"id": "f-gpa", "type": "factor", "name": "Gross Profit/Assets", "weight": 24, "factorId": "gross_profit_assets"},
+                    {"id": "f-fcfa", "type": "factor", "name": "FCF/Assets", "weight": 24, "factorId": "fcf_to_assets"},
                  ]},
-                {"id": "sub-q-turn", "type": "composite", "name": "Turnover", "weight": 15,
+                {"id": "sub-q-bs", "type": "composite", "name": "Balance Sheet Strength", "weight": 10,
+                 "children": [
+                    {"id": "f-cta", "type": "factor", "name": "Cash/Assets", "weight": 100, "factorId": "cash_to_assets"},
+                 ]},
+                {"id": "sub-q-turn", "type": "composite", "name": "Turnover", "weight": 10,
                  "children": [
                     {"id": "f-at", "type": "factor", "name": "Asset Turnover", "weight": 100, "factorId": "asset_turnover_ttm"},
                  ]},
@@ -294,7 +299,13 @@ P123_TREE = {
         {
             "id": "cat-sentiment", "type": "category", "name": "Sentiment", "weight": 10,
             "children": [
-                {"id": "f-si", "type": "factor", "name": "Short Interest", "weight": 100, "factorId": "short_interest_pct"},
+                # Short interest still unavailable (KRX restricts the data
+                # API), so the category currently relies entirely on
+                # insider net buying from DART filings. Keep the
+                # short_interest_pct slot for when the data becomes
+                # available in the future.
+                {"id": "f-insider", "type": "factor", "name": "Insider Net Buying 90d", "weight": 70, "factorId": "insider_net_buying_90d"},
+                {"id": "f-si",      "type": "factor", "name": "Short Interest",        "weight": 30, "factorId": "short_interest_pct"},
             ],
         },
     ],

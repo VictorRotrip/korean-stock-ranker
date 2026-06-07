@@ -560,6 +560,52 @@ def get_short_selling(conn, ticker, as_of):
     return None
 
 
+def get_insider_transactions_window(conn, ticker, as_of, lookback_days=90):
+    """Return a summary of insider transactions in the trailing `lookback_days`
+    that were PUBLICLY DISCLOSED before `as_of` (PIT safe).
+
+    Returns dict:
+        {"net_shares": int, "buy_shares": int, "sell_shares": int,
+         "n_buys": int, "n_sells": int, "n_filings": int}
+    or None if the ticker has no insider data at all (vs. {} for "no
+    activity in window").
+
+    PIT details: filings must satisfy filing_date < as_of. Transactions
+    themselves must satisfy transaction_date > as_of - lookback_days AND
+    transaction_date <= as_of. We use COALESCE so filings that don't
+    populate transaction_date fall back to filing_date.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(share_change) FILTER (WHERE share_change > 0), 0) AS buy_shares,
+            COALESCE(SUM(share_change) FILTER (WHERE share_change < 0), 0) AS sell_shares,
+            COALESCE(SUM(share_change), 0) AS net_shares,
+            COUNT(*) FILTER (WHERE share_change > 0) AS n_buys,
+            COUNT(*) FILTER (WHERE share_change < 0) AS n_sells,
+            COUNT(*) AS n_filings
+        FROM insider_transactions
+        WHERE ticker = %s
+          AND filing_date < %s::date
+          AND share_change IS NOT NULL
+          AND COALESCE(transaction_date, filing_date) > %s::date - %s::int
+          AND COALESCE(transaction_date, filing_date) <= %s::date
+    """, (ticker, as_of, as_of, lookback_days, as_of))
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return None
+    # Convert ints (psycopg2 may return Decimal for SUM/COUNT)
+    return {
+        "buy_shares":  int(row[0] or 0),
+        "sell_shares": int(row[1] or 0),
+        "net_shares":  int(row[2] or 0),
+        "n_buys":      int(row[3] or 0),
+        "n_sells":     int(row[4] or 0),
+        "n_filings":   int(row[5] or 0),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Factor computation orchestration
 # ---------------------------------------------------------------------------
@@ -597,6 +643,10 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
     # the legacy prior-annual we already loaded.
     prior = prior_ttm if prior_ttm is not None else prior_legacy
     short = get_short_selling(conn, ticker, as_of)
+    # Insider transactions: PIT-safe trailing-90-day net buying summary.
+    # Used by the `insider_net_buying_90d` factor in the Sentiment category.
+    insider = get_insider_transactions_window(conn, ticker, as_of,
+                                              lookback_days=90)
 
     # Determine latest market cap and shares outstanding
     market_cap = None
@@ -684,7 +734,8 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
         try:
             raw_value = _compute_single_factor(
                 factor_id, factor_meta, compute_fn_name,
-                prices, fin, prior, market_cap, shares_outstanding, short
+                prices, fin, prior, market_cap, shares_outstanding, short,
+                insider,
             )
 
             if raw_value is None:
@@ -714,6 +765,10 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
                 source_methods[factor_id] = (
                     "calculated" if raw_value is not None else "no_short_data"
                 )
+            elif data_source == "insider":
+                source_methods[factor_id] = (
+                    "calculated" if raw_value is not None else "no_insider_data"
+                )
             elif data_source == "estimates":
                 source_methods[factor_id] = "data_unavailable"
             elif data_source == "derived":
@@ -732,7 +787,8 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
 
 
 def _compute_single_factor(factor_id, factor_meta, compute_fn_name,
-                           prices, fin, prior, market_cap, shares_outstanding, short):
+                           prices, fin, prior, market_cap, shares_outstanding,
+                           short, insider=None):
     """Compute a single factor by dispatching to the appropriate calculator."""
     data_source = factor_meta.get("data_source")
     params = factor_meta.get("params", {})
@@ -770,6 +826,15 @@ def _compute_single_factor(factor_id, factor_meta, compute_fn_name,
 
         return fn(short, shares_outstanding)
 
+    elif data_source == "insider":
+        # Insider transaction factors (DART 임원·주요주주 보고).
+        # Calculator receives the trailing-window insider summary plus
+        # market_cap (for $-normalised metrics).
+        fn = getattr(sentiment, compute_fn_name, None)
+        if not fn:
+            return None
+        return fn(insider, market_cap, shares_outstanding)
+
     elif data_source == "estimates":
         # Sentiment factors (unavailable)
         fn = getattr(sentiment, compute_fn_name, None)
@@ -803,6 +868,9 @@ def _get_missing_reason(factor_id, factor_meta, prices, fin, prior, market_cap, 
 
     elif data_source == "short_interest":
         return "no_short_data"
+
+    elif data_source == "insider":
+        return "no_insider_data"
 
     elif data_source == "estimates":
         return "data_unavailable"

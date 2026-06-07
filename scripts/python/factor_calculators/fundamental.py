@@ -164,6 +164,31 @@ def calc_gross_profit_assets(fin, prior, market_cap, shares):
     return safe_div(fin.get("gross_profit"), fin.get("total_assets"))
 
 
+def calc_fcf_to_assets(fin, prior, market_cap, shares):
+    """Free Cash Flow / Total Assets — capital efficiency proxy.
+
+    Like ROA but uses FCF (operating cash flow minus capex) instead of net
+    income. Less sensitive to accounting choices, less likely to be
+    manipulated than reported earnings. High FCF/A = company generates
+    significant free cash relative to its asset base."""
+    if fin is None:
+        return None
+    return safe_div(fin.get("free_cash_flow"), fin.get("total_assets"))
+
+
+def calc_cash_to_assets(fin, prior, market_cap, shares):
+    """Cash & Equivalents / Total Assets — balance-sheet liquidity proxy.
+
+    High cash/A ratio = strong financial position, optionality for
+    M&A / buybacks / dividends / downturn cushion. Particularly
+    informative for Korean equities given the prevalence of conservative
+    cash holdings among large caps. Reads from the latest balance sheet
+    (PIT via fundamental_ttm)."""
+    if fin is None:
+        return None
+    return safe_div(fin.get("cash"), fin.get("total_assets"))
+
+
 def calc_asset_turnover(fin, prior, market_cap, shares):
     """Revenue / Total Assets."""
     if fin is None:
