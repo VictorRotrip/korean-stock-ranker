@@ -547,10 +547,15 @@ function findDirectionOverride(
 // Default Ranking System (for demo)
 // ---------------------------------------------------------------------------
 
+// Mirror of `P123_TREE` in scripts/python/run_ranking_snapshot.py. This is
+// the tree that the backend uses for the historical composite snapshots
+// surfaced on /backtest, so the editor stays in sync with what actually
+// drives the live ranking. Keep them aligned: any factor/weight change here
+// should be mirrored in Python, and vice versa.
 export const DEFAULT_RANKING_SYSTEM: RankingSystem = {
-  id: "default",
-  name: "Multi-Factor Korea",
-  description: "Balanced multi-factor ranking combining value, quality, growth, and momentum.",
+  id: "p123-inspired",
+  name: "P123 Inspired Korea Multi-Factor",
+  description: "Six-category multi-factor model (value, quality, growth, momentum, low volatility, sentiment) used for the live ranking and /backtest composites.",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   tree: {
@@ -563,46 +568,227 @@ export const DEFAULT_RANKING_SYSTEM: RankingSystem = {
         id: "cat-value",
         type: "category",
         name: "Value",
-        weight: 30,
+        weight: 25,
         children: [
-          { id: "f-ey", type: "factor", name: "Earnings Yield", weight: 35, factorId: "pe_ttm_inv" },
-          { id: "f-bm", type: "factor", name: "Book-to-Market", weight: 25, factorId: "price_book" },
-          { id: "f-ev", type: "factor", name: "EV/EBITDA (inv)", weight: 25, factorId: "ebitda_ev" },
-          { id: "f-cfy", type: "factor", name: "Cash Flow Yield", weight: 15, factorId: "fcf_mcap" },
+          {
+            id: "sub-val-earn",
+            type: "composite",
+            name: "Earnings-Based",
+            weight: 35,
+            children: [
+              { id: "f-ey", type: "factor", name: "Earnings Yield", weight: 50, factorId: "pe_ttm_inv" },
+              { id: "f-ebitda-ev", type: "factor", name: "EBITDA/EV", weight: 50, factorId: "ebitda_ev" },
+            ],
+          },
+          {
+            id: "sub-val-sales",
+            type: "composite",
+            name: "Sales-Based",
+            weight: 30,
+            children: [
+              { id: "f-ps", type: "factor", name: "Sales Yield", weight: 40, factorId: "price_sales_ttm_inv" },
+              { id: "f-evs", type: "factor", name: "Revenue/EV", weight: 30, factorId: "ev_sales_ttm_inv" },
+              { id: "f-gpev", type: "factor", name: "Gross Profit/EV", weight: 30, factorId: "gross_profit_ev" },
+            ],
+          },
+          {
+            id: "sub-val-fcf",
+            type: "composite",
+            name: "FCF-Based",
+            weight: 20,
+            children: [
+              { id: "f-fcfy", type: "factor", name: "FCF Yield", weight: 40, factorId: "fcf_mcap" },
+              { id: "f-ocfy", type: "factor", name: "OCF Yield", weight: 30, factorId: "ocf_mcap" },
+              { id: "f-ufcf", type: "factor", name: "Unlevered FCF/EV", weight: 30, factorId: "ufcf_ev" },
+            ],
+          },
+          {
+            id: "sub-val-asset",
+            type: "composite",
+            name: "Asset-Based",
+            weight: 15,
+            children: [
+              { id: "f-pb", type: "factor", name: "Book/Market", weight: 50, factorId: "price_book" },
+              { id: "f-divy", type: "factor", name: "Dividend Yield", weight: 25, factorId: "dividend_yield" },
+              { id: "f-bby", type: "factor", name: "Buyback Yield", weight: 25, factorId: "buyback_yield_yoy" },
+            ],
+          },
         ],
       },
       {
         id: "cat-quality",
         type: "category",
         name: "Quality",
-        weight: 25,
+        weight: 30,
         children: [
-          { id: "f-roe", type: "factor", name: "ROE", weight: 35, factorId: "roe_ttm" },
-          { id: "f-gp", type: "factor", name: "Gross Profitability", weight: 30, factorId: "gross_profit_assets" },
-          { id: "f-om", type: "factor", name: "Operating Margin", weight: 20, factorId: "operating_margin_ttm" },
-          { id: "f-de", type: "factor", name: "Debt/Equity", weight: 15, factorId: "debt_to_equity" },
+          {
+            id: "sub-q-margin",
+            type: "composite",
+            name: "Margins",
+            weight: 25,
+            children: [
+              { id: "f-opmgn", type: "factor", name: "Operating Margin", weight: 60, factorId: "operating_margin_ttm" },
+              { id: "f-gpmgn", type: "factor", name: "Gross Margin", weight: 40, factorId: "gross_margin_ttm" },
+            ],
+          },
+          {
+            id: "sub-q-roc",
+            type: "composite",
+            name: "Return on Capital",
+            weight: 30,
+            children: [
+              { id: "f-roe", type: "factor", name: "ROE", weight: 28, factorId: "roe_ttm" },
+              { id: "f-roa", type: "factor", name: "ROA", weight: 24, factorId: "roa_ttm" },
+              { id: "f-gpa", type: "factor", name: "Gross Profit/Assets", weight: 24, factorId: "gross_profit_assets" },
+              { id: "f-fcfa", type: "factor", name: "FCF/Assets", weight: 24, factorId: "fcf_to_assets" },
+            ],
+          },
+          {
+            id: "sub-q-bs",
+            type: "composite",
+            name: "Balance Sheet Strength",
+            weight: 10,
+            children: [
+              { id: "f-cta", type: "factor", name: "Cash/Assets", weight: 100, factorId: "cash_to_assets" },
+            ],
+          },
+          {
+            id: "sub-q-turn",
+            type: "composite",
+            name: "Turnover",
+            weight: 10,
+            children: [
+              { id: "f-at", type: "factor", name: "Asset Turnover", weight: 100, factorId: "asset_turnover_ttm" },
+            ],
+          },
+          {
+            id: "sub-q-fin",
+            type: "composite",
+            name: "Finances",
+            weight: 25,
+            children: [
+              { id: "f-de", type: "factor", name: "Debt/Equity", weight: 50, factorId: "debt_to_equity" },
+              { id: "f-ic", type: "factor", name: "Interest Coverage", weight: 50, factorId: "interest_coverage_ttm" },
+            ],
+          },
         ],
       },
       {
         id: "cat-growth",
         type: "category",
         name: "Growth",
-        weight: 20,
+        weight: 15,
         children: [
-          { id: "f-revg", type: "factor", name: "Revenue Growth", weight: 40, factorId: "sales_growth_yoy" },
-          { id: "f-epsg", type: "factor", name: "EPS Growth", weight: 35, factorId: "eps_growth_yoy" },
-          { id: "f-opg", type: "factor", name: "Op Income Growth", weight: 25, factorId: "op_income_growth_yoy" },
+          {
+            id: "sub-g-sales",
+            type: "composite",
+            name: "Sales Growth",
+            weight: 30,
+            children: [
+              { id: "f-sg", type: "factor", name: "Sales Growth YoY", weight: 100, factorId: "sales_growth_yoy" },
+            ],
+          },
+          {
+            id: "sub-g-opinc",
+            type: "composite",
+            name: "Op Income Growth",
+            weight: 25,
+            children: [
+              { id: "f-oig", type: "factor", name: "Op Income Growth YoY", weight: 100, factorId: "op_income_growth_yoy" },
+            ],
+          },
+          {
+            id: "sub-g-eps",
+            type: "composite",
+            name: "EPS Growth",
+            weight: 25,
+            children: [
+              { id: "f-epsg", type: "factor", name: "EPS Growth YoY", weight: 50, factorId: "eps_growth_yoy" },
+              { id: "f-nig", type: "factor", name: "Net Income Growth YoY", weight: 50, factorId: "net_income_growth_yoy" },
+            ],
+          },
+          {
+            id: "sub-g-cf",
+            type: "composite",
+            name: "Cash Flow Growth",
+            weight: 20,
+            children: [
+              { id: "f-ocfg", type: "factor", name: "OCF Growth YoY", weight: 50, factorId: "ocf_growth_yoy" },
+              { id: "f-fcfg", type: "factor", name: "FCF Growth YoY", weight: 50, factorId: "fcf_growth_yoy" },
+            ],
+          },
         ],
       },
       {
         id: "cat-momentum",
         type: "category",
         name: "Momentum",
-        weight: 25,
+        weight: 10,
         children: [
-          { id: "f-mom12", type: "factor", name: "12-1M Momentum", weight: 50, factorId: "momentum_12_1" },
-          { id: "f-mom6", type: "factor", name: "6M Momentum", weight: 30, factorId: "momentum_6m" },
-          { id: "f-52w", type: "factor", name: "Dist from 52W High", weight: 20, factorId: "dist_52w_high" },
+          {
+            id: "sub-m-price",
+            type: "composite",
+            name: "Price Changes",
+            weight: 30,
+            children: [
+              { id: "f-pc120", type: "factor", name: "120d Return", weight: 50, factorId: "price_change_120d" },
+              { id: "f-pc180", type: "factor", name: "180d Return", weight: 50, factorId: "price_change_180d" },
+            ],
+          },
+          {
+            id: "sub-m-tech",
+            type: "composite",
+            name: "Technical",
+            weight: 30,
+            children: [
+              { id: "f-udr20", type: "factor", name: "UpDown 20d", weight: 20, factorId: "up_down_ratio_20" },
+              { id: "f-udr60", type: "factor", name: "UpDown 60d", weight: 30, factorId: "up_down_ratio_60" },
+              { id: "f-udr120", type: "factor", name: "UpDown 120d", weight: 25, factorId: "up_down_ratio_120" },
+              { id: "f-rsi200", type: "factor", name: "RSI 200", weight: 25, factorId: "rsi_200" },
+            ],
+          },
+          {
+            id: "sub-m-qtr",
+            type: "composite",
+            name: "Quarterly Returns",
+            weight: 25,
+            children: [
+              { id: "f-m3", type: "factor", name: "3M Return", weight: 30, factorId: "momentum_3m" },
+              { id: "f-m6", type: "factor", name: "6M Return", weight: 35, factorId: "momentum_6m" },
+              { id: "f-m121", type: "factor", name: "12-1M Momentum", weight: 35, factorId: "momentum_12_1" },
+            ],
+          },
+          {
+            id: "sub-m-industry",
+            type: "composite",
+            name: "Industry Momentum",
+            weight: 15,
+            children: [
+              { id: "f-im26", type: "factor", name: "Industry 26W Momentum", weight: 50, factorId: "industry_momentum_26w" },
+              { id: "f-im52", type: "factor", name: "Industry 52W Momentum", weight: 50, factorId: "industry_momentum_52w" },
+            ],
+          },
+        ],
+      },
+      {
+        id: "cat-risk",
+        type: "category",
+        name: "Low Volatility",
+        weight: 10,
+        children: [
+          { id: "f-vol252", type: "factor", name: "252d Volatility", weight: 40, factorId: "volatility_252d" },
+          { id: "f-vol60", type: "factor", name: "60d Volatility", weight: 30, factorId: "volatility_60d" },
+          { id: "f-mdd", type: "factor", name: "Max Drawdown 252d", weight: 30, factorId: "max_drawdown_252d" },
+        ],
+      },
+      {
+        id: "cat-sentiment",
+        type: "category",
+        name: "Sentiment",
+        weight: 10,
+        children: [
+          { id: "f-insider", type: "factor", name: "Insider Net Buying 90d", weight: 70, factorId: "insider_net_buying_90d" },
+          { id: "f-si", type: "factor", name: "Short Interest", weight: 30, factorId: "short_interest_pct" },
         ],
       },
     ],
