@@ -824,6 +824,123 @@ const rsi200: ComputeFactor = {
 };
 
 // ---------------------------------------------------------------------------
+// Additional factors used by the live P123 ranking (server-driven)
+// ---------------------------------------------------------------------------
+// These factors are computed in the Python pipeline and stored in
+// factor_snapshots, but the client-side `compute` functions below are
+// simplified or null-returning placeholders. The real values come from the
+// DB via the data service. Keeping the definitions here lets the editor
+// render proper names/descriptions for the P123 tree.
+
+const buybackYieldYoy: ComputeFactor = {
+  id: "buyback_yield_yoy",
+  name: "Buyback Yield",
+  description: "YoY change in shares outstanding (negative = buyback, positive = dilution). Sibling of dividend yield.",
+  category: "value",
+  direction: "higher_is_better",
+  formula: "(prior_shares - current_shares) / current_shares",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: () => null,
+};
+
+const fcfToAssets: ComputeFactor = {
+  id: "fcf_to_assets",
+  name: "FCF / Assets",
+  description: "Free Cash Flow (TTM) / Total Assets. Capital-efficiency proxy less susceptible to accruals than ROA.",
+  category: "quality",
+  direction: "higher_is_better",
+  formula: "Free Cash Flow / Total Assets",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: ({ financials }) => {
+    if (!financials?.freeCashFlow || !financials.totalAssets) return null;
+    if (financials.totalAssets === 0) return null;
+    return financials.freeCashFlow / financials.totalAssets;
+  },
+};
+
+const cashToAssets: ComputeFactor = {
+  id: "cash_to_assets",
+  name: "Cash / Assets",
+  description: "Cash & equivalents / Total Assets. Balance-sheet liquidity; high = optionality & downturn cushion.",
+  category: "quality",
+  direction: "higher_is_better",
+  formula: "Cash & Equivalents / Total Assets",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: () => null,
+};
+
+const ocfGrowthYoy: ComputeFactor = {
+  id: "ocf_growth_yoy",
+  name: "OCF Growth YoY",
+  description: "Year-over-year growth in operating cash flow.",
+  category: "growth",
+  direction: "higher_is_better",
+  formula: "(OCF_current - OCF_prior) / |OCF_prior|",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: () => null,
+};
+
+const fcfGrowthYoy: ComputeFactor = {
+  id: "fcf_growth_yoy",
+  name: "FCF Growth YoY",
+  description: "Year-over-year growth in free cash flow.",
+  category: "growth",
+  direction: "higher_is_better",
+  formula: "(FCF_current - FCF_prior) / |FCF_prior|",
+  frequency: "quarterly",
+  availableInMvp: true,
+  dataSource: "DART financials",
+  compute: () => null,
+};
+
+const industryMomentum26w: ComputeFactor = {
+  id: "industry_momentum_26w",
+  name: "Industry 26W Momentum",
+  description: "26-week return of the stock's industry (KSIC). Captures sector-level reversion/momentum.",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "Industry index level today / 26W ago - 1",
+  frequency: "weekly",
+  availableInMvp: true,
+  dataSource: "Industry classifications + daily prices",
+  compute: () => null,
+};
+
+const industryMomentum52w: ComputeFactor = {
+  id: "industry_momentum_52w",
+  name: "Industry 52W Momentum",
+  description: "52-week return of the stock's industry (KSIC).",
+  category: "momentum",
+  direction: "higher_is_better",
+  formula: "Industry index level today / 52W ago - 1",
+  frequency: "weekly",
+  availableInMvp: true,
+  dataSource: "Industry classifications + daily prices",
+  compute: () => null,
+};
+
+const insiderNetBuying90d: ComputeFactor = {
+  id: "insider_net_buying_90d",
+  name: "Insider Net Buying 90d",
+  description: "Net insider share purchases over trailing 90 days, as a fraction of shares outstanding. Higher = more bullish insider sentiment.",
+  category: "sentiment",
+  direction: "higher_is_better",
+  formula: "(buy_shares - sell_shares) / shares_outstanding (trailing 90d)",
+  frequency: "weekly",
+  availableInMvp: true,
+  dataSource: "DART insider filings (임원·주요주주 보고)",
+  compute: () => null,
+};
+
+// ---------------------------------------------------------------------------
 // Factor Registry
 // ---------------------------------------------------------------------------
 
@@ -839,10 +956,13 @@ export const FACTOR_REGISTRY: ComputeFactor[] = [
   ufcfEv,
   priceBook,
   dividendYield,
+  buybackYieldYoy,
   // === QUALITY ===
   roeTtm,
   roaTtm,
   grossProfitAssets,
+  fcfToAssets,
+  cashToAssets,
   operatingMarginTtm,
   grossMarginTtm,
   assetTurnoverTtm,
@@ -853,6 +973,8 @@ export const FACTOR_REGISTRY: ComputeFactor[] = [
   opIncomeGrowthYoy,
   epsGrowthYoy,
   netIncomeGrowthYoy,
+  ocfGrowthYoy,
+  fcfGrowthYoy,
   // === MOMENTUM ===
   priceChange120d,
   priceChange180d,
@@ -865,6 +987,8 @@ export const FACTOR_REGISTRY: ComputeFactor[] = [
   momentum3m,
   reversal1m,
   distanceFrom52wHigh,
+  industryMomentum26w,
+  industryMomentum52w,
   // === RISK ===
   volatility60d,
   volatility252d,
@@ -873,6 +997,7 @@ export const FACTOR_REGISTRY: ComputeFactor[] = [
   shareTurnover65d,
   // === SENTIMENT ===
   shortInterestPct,
+  insiderNetBuying90d,
 ];
 
 /**
