@@ -298,14 +298,14 @@ P123_TREE = {
         },
         {
             "id": "cat-sentiment", "type": "category", "name": "Sentiment", "weight": 10,
+            # Short Interest was removed: KRX restricts the data API so
+            # short_interest_pct was always null and contributed only a
+            # neutral-imputed 50 to every stock's Sentiment score. Insider
+            # Net Buying now carries the entire Sentiment slot. If KRX
+            # short data becomes available we can re-introduce it at a
+            # specific weight and re-rank.
             "children": [
-                # Short interest still unavailable (KRX restricts the data
-                # API), so the category currently relies entirely on
-                # insider net buying from DART filings. Keep the
-                # short_interest_pct slot for when the data becomes
-                # available in the future.
-                {"id": "f-insider", "type": "factor", "name": "Insider Net Buying 90d", "weight": 70, "factorId": "insider_net_buying_90d"},
-                {"id": "f-si",      "type": "factor", "name": "Short Interest",        "weight": 30, "factorId": "short_interest_pct"},
+                {"id": "f-insider", "type": "factor", "name": "Insider Net Buying 90d", "weight": 100, "factorId": "insider_net_buying_90d"},
             ],
         },
     ],
@@ -766,7 +766,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     as_of = args.as_of_date
-    conn = psycopg2.connect(DATABASE_URL)
+    # Use a generous statement_timeout so the PIT-marcap snapshot query (which
+    # scans 3,000+ tickers x daily_prices history) survives the pooler's
+    # default 60s cap. Also defensively set default_transaction_read_only=off
+    # in case the pooler routed us to a read replica.
+    _conn_opts = (
+        "-c statement_timeout=600000 "
+        "-c default_transaction_read_only=off"
+    )
+    conn = psycopg2.connect(DATABASE_URL, options=_conn_opts)
 
     thresholds = {
         "min_active_weight_coverage": args.min_active_weight_coverage,
@@ -891,18 +899,22 @@ if __name__ == "__main__":
         # source = 'marcap_historical'. Tickers with no daily_prices
         # market_cap row at all are treated as non-PIT (no historical
         # market cap available means we can't trust value factors for them).
+        # LATERAL JOIN with LIMIT 1 per ticker; uses (ticker, date) index for
+        # one fast seek per ticker. ~100x faster than the prior GROUP BY MAX
+        # over ANY(tickers), which couldn't fit in the pooler's 60s budget.
         cur.execute("""
-            WITH latest AS (
-                SELECT ticker, MAX(date) AS d
+            SELECT t.ticker, dp.source, dp.market_cap
+            FROM unnest(%s::text[]) AS t(ticker)
+            LEFT JOIN LATERAL (
+                SELECT source, market_cap
                 FROM daily_prices
-                WHERE ticker = ANY(%s)
+                WHERE ticker = t.ticker
                   AND date <= %s
                   AND market_cap IS NOT NULL AND market_cap > 0
-                GROUP BY ticker
-            )
-            SELECT dp.ticker, dp.source, dp.market_cap
-            FROM latest l
-            JOIN daily_prices dp ON dp.ticker = l.ticker AND dp.date = l.d
+                ORDER BY date DESC
+                LIMIT 1
+            ) dp ON true
+            WHERE dp.market_cap IS NOT NULL
         """, (tickers, as_of))
         marcap_rows = cur.fetchall()
         ticker_to_source = {t: src for t, src, _mc in marcap_rows}

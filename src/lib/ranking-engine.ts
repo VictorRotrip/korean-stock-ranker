@@ -786,9 +786,10 @@ export const DEFAULT_RANKING_SYSTEM: RankingSystem = {
         type: "category",
         name: "Sentiment",
         weight: 10,
+        // Short Interest removed: KRX restricts the data API so we never had
+        // values for it. Insider Net Buying carries the full Sentiment slot.
         children: [
-          { id: "f-insider", type: "factor", name: "Insider Net Buying 90d", weight: 70, factorId: "insider_net_buying_90d" },
-          { id: "f-si", type: "factor", name: "Short Interest", weight: 30, factorId: "short_interest_pct" },
+          { id: "f-insider", type: "factor", name: "Insider Net Buying 90d", weight: 100, factorId: "insider_net_buying_90d" },
         ],
       },
     ],
