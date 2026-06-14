@@ -197,15 +197,21 @@ def normalize_financial(fs_row):
         "interest_expense", "ebitda", "shares_outstanding", "dividends_paid",
     ]
 
-    # Map financial_statements column names to fundamental_snapshots names
-    fs_to_snap = {
-        "cash": "cash_and_equivalents",
-        "depreciation": "depreciation_amortization",
-        "capital_expenditure": "capex",
+    # Aliases keyed by destination (fundamental_snapshots) name. The loop
+    # below iterates `direct_fields` (snap names) and translates each to
+    # its source (financial_statements) name. The dict used to be keyed
+    # the OTHER way round, which meant the lookup always missed and the
+    # aliased fields (cash, depreciation, capital_expenditure) were never
+    # copied across — so cash_and_equivalents was permanently NULL in
+    # fundamental_snapshots, breaking cash_to_assets and dividend_yield.
+    snap_to_fs = {
+        "cash_and_equivalents": "cash",
+        "depreciation_amortization": "depreciation",
+        "capex": "capital_expenditure",
     }
 
     for field in direct_fields:
-        fs_field = fs_to_snap.get(field, field)
+        fs_field = snap_to_fs.get(field, field)
         if fs_field in fs_row and fs_row[fs_field] is not None:
             result[field] = fs_row[fs_field]
 
