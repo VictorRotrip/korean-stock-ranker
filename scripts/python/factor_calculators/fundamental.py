@@ -183,10 +183,14 @@ def calc_cash_to_assets(fin, prior, market_cap, shares):
     M&A / buybacks / dividends / downturn cushion. Particularly
     informative for Korean equities given the prevalence of conservative
     cash holdings among large caps. Reads from the latest balance sheet
-    (PIT via fundamental_ttm)."""
+    (PIT via fundamental_ttm). TTM pipeline keys the field as
+    `cash_and_equivalents`; legacy `cash` honored as fallback."""
     if fin is None:
         return None
-    return safe_div(fin.get("cash"), fin.get("total_assets"))
+    cash = fin.get("cash_and_equivalents")
+    if cash is None:
+        cash = fin.get("cash")
+    return safe_div(cash, fin.get("total_assets"))
 
 
 def calc_asset_turnover(fin, prior, market_cap, shares):
@@ -235,10 +239,26 @@ def calc_op_income_growth_yoy(fin, prior, market_cap, shares):
 
 
 def calc_eps_growth_yoy(fin, prior, market_cap, shares):
-    """YoY EPS growth."""
+    """YoY EPS growth.
+
+    Some Korean filings don't report EPS as a separate line item but do
+    report net_income and shares_outstanding. Derive EPS from those when
+    the direct field is missing so the factor isn't N/A for stocks where
+    all the inputs ARE available — just under different names."""
     if fin is None or prior is None:
         return None
-    return _growth(fin.get("eps"), prior.get("eps"))
+
+    def eps_of(d):
+        e = d.get("eps")
+        if e:
+            return e
+        ni = d.get("net_income")
+        so = d.get("shares_outstanding")
+        if ni is not None and so:
+            return ni / so
+        return None
+
+    return _growth(eps_of(fin), eps_of(prior))
 
 
 def calc_net_income_growth_yoy(fin, prior, market_cap, shares):
