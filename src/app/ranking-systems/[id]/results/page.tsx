@@ -11,6 +11,7 @@ import type { RankingSystem, RankingResult, StockRanking, CategoryScoreDetail } 
 import { getSystemById } from "@/lib/store";
 import { runRanking, collectFactorIds, DEFAULT_RANKING_SYSTEM } from "@/lib/ranking-engine";
 import { getFactorDefinitions } from "@/lib/factors";
+import { translateIndustry } from "@/lib/i18n";
 import { cn, formatKRW, formatNumber, scoreColor, scoreBg } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -99,7 +100,7 @@ function StockDetailRow({
         </div>
         <div>
           <p className="text-xs text-muted-foreground">Sector</p>
-          <p className="text-sm">{stock.sector || "N/A"}</p>
+          <p className="text-sm">{translateIndustry(stock.sector) || "N/A"}</p>
         </div>
         <div>
           <p className="text-xs text-muted-foreground">Market Cap</p>
@@ -626,7 +627,7 @@ export default function RankingResultsPage() {
                         <Badge variant="outline" className="text-xs">{stock.market}</Badge>
                       </td>
                       <td className="px-4 py-3 hidden lg:table-cell text-xs text-muted-foreground">
-                        {stock.sector || "-"}
+                        {translateIndustry(stock.sector) || "-"}
                       </td>
                       <td className="px-4 py-3 text-right text-xs">
                         {formatKRW(stock.marketCap)}

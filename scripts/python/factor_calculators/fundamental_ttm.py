@@ -62,6 +62,10 @@ INCOME_FIELDS = (
 PERSHARE_FIELDS = ("eps",)
 
 # Balance-sheet stocks — never cumulative, just take the latest available row.
+# `dividends_paid` is included here because in Korea dividends are reported
+# annually on the FY filing (11011), and we want to take the most recent
+# annual value rather than try to YTD-difference quarterly numbers (which
+# would be incorrect when dividends are paid in a single lump).
 BALANCE_FIELDS = (
     "total_assets",
     "total_equity",
@@ -70,6 +74,7 @@ BALANCE_FIELDS = (
     "cash_and_equivalents",
     "inventory",
     "shares_outstanding",
+    "dividends_paid",
 )
 
 

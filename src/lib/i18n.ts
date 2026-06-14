@@ -321,6 +321,9 @@ const INDUSTRY_KR_TO_EN: Record<string, string> = {
   "폐기물 처리업": "Waste Treatment",
   "비내화 요업제품 제조업": "Non-Refractory Ceramics Manufacturing",
   "일차전지 및 이차전지 제조업": "Primary and Secondary Batteries Manufacturing",
+  "기타 전문 서비스업": "Other Specialised Services",
+  "생활용품 도매업": "Household Goods Wholesale",
+  "자동차 차체나 트레일러 제조업": "Auto Bodies and Trailers Manufacturing",
 };
 
 export const INDUSTRY_TRANSLATION_COUNT = Object.keys(INDUSTRY_KR_TO_EN).length;
