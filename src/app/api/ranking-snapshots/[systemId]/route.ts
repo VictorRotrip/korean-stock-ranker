@@ -40,11 +40,22 @@ export async function GET(
 
   console.log(`[ranking-snapshots] Fetching latest snapshot for system="${systemId}"`);
 
-  // 1. Get the latest snapshot for this system
+  // 1. Get the latest snapshot for this system. We constrain to the
+  //    `krx_all_current` universe so /ranking-systems Run shows the same
+  //    "today's investable" universe as the /ranking dashboard does.
+  //    Without this filter, a recent run on `krx_all_historical` (which
+  //    the /backtest pipeline produces in batches of 137) would be
+  //    returned here, mixing universes and confusing the user.
+  const DEFAULT_UNIVERSE = "krx_all_current";
   const snapshots = await db
     .select()
     .from(schema.rankingSnapshots)
-    .where(eq(schema.rankingSnapshots.rankingSystemId, systemId))
+    .where(
+      and(
+        eq(schema.rankingSnapshots.rankingSystemId, systemId),
+        eq(schema.rankingSnapshots.universeName, DEFAULT_UNIVERSE),
+      ),
+    )
     .orderBy(desc(schema.rankingSnapshots.id))
     .limit(1);
 
