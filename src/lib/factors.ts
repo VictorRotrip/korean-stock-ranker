@@ -985,10 +985,11 @@ export const FACTOR_REGISTRY: ComputeFactor[] = [
   momentum12m1m,
   momentum6m,
   momentum3m,
-  reversal1m,
-  distanceFrom52wHigh,
   industryMomentum26w,
   industryMomentum52w,
+  // `reversal1m` and `distanceFrom52wHigh` removed from registry: they
+  // are not computed by the Python pipeline (not in factor_definitions.py)
+  // and not used in the P123 tree, so they always showed as N/A in the UI.
   // === RISK ===
   volatility60d,
   volatility252d,
@@ -996,8 +997,9 @@ export const FACTOR_REGISTRY: ComputeFactor[] = [
   // === LIQUIDITY ===
   shareTurnover65d,
   // === SENTIMENT ===
-  shortInterestPct,
   insiderNetBuying90d,
+  // `shortInterestPct` removed: KRX restricts the data API; the factor was
+  // empty everywhere. Removed from P123_TREE on 2026-06-14.
 ];
 
 /**
