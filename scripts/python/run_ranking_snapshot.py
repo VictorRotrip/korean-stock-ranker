@@ -936,6 +936,33 @@ if __name__ == "__main__":
                 if src != "marcap_historical":
                     non_pit_tickers.add(t)
 
+        # Trading-suspended tickers: stocks with NO volume in the last 30
+        # calendar days. KRX leaves these in the listing during halts /
+        # going-concern reviews, but with stuck prices and no real
+        # tradability, every factor (low vol = artificially low, value =
+        # artificially cheap relative to old fundamentals, etc.) becomes
+        # misleading. Drop them from the main ranking with an explicit
+        # failure reason. ~3-4% of krx_all_current is typically suspended.
+        cur.execute(
+            """
+            SELECT t.ticker
+            FROM unnest(%s::text[]) AS t(ticker)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM daily_prices dp
+                WHERE dp.ticker = t.ticker
+                  AND dp.date >= %s::date - INTERVAL '30 days'
+                  AND dp.date <= %s::date
+                  AND dp.volume > 0
+            )
+            """,
+            (tickers, as_of, as_of),
+        )
+        suspended_tickers = {r[0] for r in cur.fetchall()}
+        if suspended_tickers:
+            print("  -> {0} stocks excluded for trading suspension "
+                  "(no volume in last 30 days).".format(
+                      len(suspended_tickers)))
+
         print("Ranking {0} stocks using system '{1}' as of {2}...".format(
             len(tickers), system_id, as_of))
         print("  Scoring method:                 {0}".format(SCORING_METHOD))
@@ -986,16 +1013,29 @@ if __name__ == "__main__":
             r["mcap_source"] = ticker_to_source.get(ticker)
             r["mcap_name"] = ticker_to_name.get(ticker)
             r["non_pit_market_cap"] = ticker in non_pit_tickers
+            r["trading_suspended"] = ticker in suspended_tickers
             all_results.append(r)
 
-        # 6. Split into pass / non-PIT excluded / coverage-fail.
-        # Non-PIT exclusion takes priority over coverage failure: a stock
-        # that's both non-PIT and low coverage shows up in the non-PIT
-        # bucket so the operator sees the more important reason.
-        non_pit_excluded = [r for r in all_results if r["non_pit_market_cap"]]
-        remaining = [r for r in all_results if not r["non_pit_market_cap"]]
+        # 6. Split into pass / suspended / non-PIT / coverage-fail.
+        # Trading suspension takes top priority — a halted stock is
+        # functionally untradeable regardless of factor coverage. Non-PIT
+        # exclusion is next. Coverage failure is last. A stock that's
+        # both suspended AND coverage-fail shows up in the suspended bucket.
+        suspended_excluded = [r for r in all_results if r["trading_suspended"]]
+        remaining = [r for r in all_results if not r["trading_suspended"]]
+        non_pit_excluded = [r for r in remaining if r["non_pit_market_cap"]]
+        remaining = [r for r in remaining if not r["non_pit_market_cap"]]
         passing = [r for r in remaining if r["passes_minimum"]]
         failing = [r for r in remaining if not r["passes_minimum"]]
+
+        # Annotate suspended stocks with explicit failure reason
+        for r in suspended_excluded:
+            r["failure_reasons"] = list(r.get("failure_reasons", []))
+            r["failure_reasons"].insert(
+                0,
+                "trading_suspended (no volume in last 30 days)",
+            )
+            r["passes_minimum"] = False
 
         # Annotate non-PIT excluded stocks with explicit failure reason
         for r in non_pit_excluded:
@@ -1026,16 +1066,21 @@ if __name__ == "__main__":
         for i, r in enumerate(non_pit_excluded):
             r["rank"] = None
             r["fallback_position"] = i + 1
+        for i, r in enumerate(suspended_excluded):
+            r["rank"] = None
+            r["fallback_position"] = i + 1
 
         # Accounting: every stock in the canonical universe must land in
-        # exactly one of (passing | failing | non_pit_excluded). The total
-        # must equal universe_member_count.
-        total_accounted = len(passing) + len(failing) + len(non_pit_excluded)
+        # exactly one of (passing | failing | non_pit_excluded |
+        # suspended_excluded). The total must equal universe_member_count.
+        total_accounted = (len(passing) + len(failing)
+                           + len(non_pit_excluded) + len(suspended_excluded))
         print("\n  Universe:                        {0} tickers".format(
             universe_member_count))
         print("  Main ranking:                    {0} stocks".format(len(passing)))
         print("  Insufficient coverage:           {0} stocks".format(len(failing)))
         print("  Non point-in-time market cap:    {0} stocks".format(len(non_pit_excluded)))
+        print("  Trading suspended:               {0} stocks".format(len(suspended_excluded)))
         print("  Total accounted:                 {0}/{1}".format(
             total_accounted, universe_member_count))
         if total_accounted != universe_member_count:
@@ -1104,9 +1149,11 @@ if __name__ == "__main__":
         results_main = [to_json(r, "passed") for r in passing]
         results_excluded = [to_json(r, "insufficient") for r in failing]
         results_non_pit = [to_json(r, "non_pit_market_cap") for r in non_pit_excluded]
+        results_suspended = [to_json(r, "trading_suspended") for r in suspended_excluded]
 
         if args.include_insufficient_coverage:
-            stored_results = results_main + results_excluded + results_non_pit
+            stored_results = (results_main + results_excluded
+                              + results_non_pit + results_suspended)
         else:
             stored_results = results_main
 
