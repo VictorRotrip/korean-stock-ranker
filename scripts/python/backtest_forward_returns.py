@@ -188,25 +188,46 @@ def detect_splits_in_window(rows, window_start, window_end,
     """
     splits = []
     prev = None
+    # PRICE_ONLY_SPLIT_RATIO: if close changes by >=5x in a single day,
+    # treat it as a split regardless of what shares_outstanding says.
+    # Required for the Q4 2022 KOSDAQ reverse-split wave where
+    # marcap_historical updated the price but never updated the shares
+    # figure (see ticker 060900, 123840, 276730), making the
+    # shares-based detector blind. 5x is a safe lower bound — no real
+    # Korean equity moves that much in one session without an action.
+    PRICE_ONLY_SPLIT_RATIO = 5.0
     for cur in rows:
         d, close, sh = cur
         if prev is not None:
             prev_d, prev_close, prev_sh = prev
-            if (prev_sh is not None and sh is not None
+            in_window = window_start < d <= window_end
+            matched = False
+            # Path A: shares-based detection (preferred when both halves
+            # of the data are present and clean).
+            if (in_window
+                    and prev_sh is not None and sh is not None
                     and prev_sh > 0 and sh > 0
                     and prev_close > 0 and close > 0):
                 shares_ratio = sh / prev_sh
                 price_ratio = close / prev_close
-                # Big enough share-count jump?
-                big = shares_ratio >= min_shares_ratio or shares_ratio <= 1.0 / min_shares_ratio
+                big = (shares_ratio >= min_shares_ratio
+                       or shares_ratio <= 1.0 / min_shares_ratio)
                 if big:
-                    # Market cap should be preserved (clean split). The
-                    # combined ratio shares_ratio * price_ratio should be
-                    # ~1.0 within ±20% tolerance.
                     combined = shares_ratio * price_ratio
                     if 0.8 <= combined <= 1.25:
-                        if window_start < d <= window_end:
-                            splits.append((d, shares_ratio))
+                        splits.append((d, shares_ratio))
+                        matched = True
+            # Path B: price-only fallback for cases where shares data
+            # lags. Implied shares_ratio = 1 / price_ratio (so combined
+            # market cap is preserved by construction).
+            if (in_window and not matched
+                    and prev_close is not None and prev_close > 0
+                    and close is not None and close > 0):
+                price_ratio = close / prev_close
+                if (price_ratio >= PRICE_ONLY_SPLIT_RATIO
+                        or price_ratio <= 1.0 / PRICE_ONLY_SPLIT_RATIO):
+                    implied_shares_ratio = 1.0 / price_ratio
+                    splits.append((d, implied_shares_ratio))
         prev = cur
     return splits
 
