@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatKRW } from "@/lib/utils";
-import { translateIndustry } from "@/lib/i18n";
+import { displayName, translateIndustry } from "@/lib/i18n";
 import type { Stock } from "@/types";
 
 export interface EnrichedStock extends Stock {
@@ -28,7 +28,9 @@ export default function UniverseClient({ stocks }: Props) {
 
   const sectors = useMemo(() => {
     const s = new Set(stocks.map(st => st.sector).filter(Boolean));
-    return Array.from(s).sort() as string[];
+    return (Array.from(s) as string[]).sort((a, b) =>
+      (translateIndustry(a) ?? "").localeCompare(translateIndustry(b) ?? ""),
+    );
   }, [stocks]);
 
   const filtered = useMemo(() => {
@@ -79,7 +81,7 @@ export default function UniverseClient({ stocks }: Props) {
           <SelectContent>
             <SelectItem value="ALL">All Sectors</SelectItem>
             {sectors.map(s => (
-              <SelectItem key={s} value={s}>{s}</SelectItem>
+              <SelectItem key={s} value={s}>{translateIndustry(s)}</SelectItem>
             ))}
           </SelectContent>
         </Select>
@@ -114,14 +116,21 @@ export default function UniverseClient({ stocks }: Props) {
                     </td>
                     <td className="px-4 py-3">
                       <div>
-                        <p className="font-medium">{stock.name}</p>
-                        {stock.nameEn && <p className="text-xs text-muted-foreground">{stock.nameEn}</p>}
+                        <p className="font-medium">{displayName(stock)}</p>
+                        {stock.nameEn && stock.nameEn.trim() && (
+                          <p className="text-xs text-muted-foreground">{stock.name}</p>
+                        )}
                       </div>
                     </td>
                     <td className="px-4 py-3">
                       <Badge variant="outline" className="text-xs">{stock.market}</Badge>
                     </td>
-                    <td className="px-4 py-3 text-xs text-muted-foreground">{translateIndustry(stock.sector) || "-"}</td>
+                    <td
+                      className="px-4 py-3 text-xs text-muted-foreground min-w-[16rem]"
+                      title={translateIndustry(stock.sector) ?? undefined}
+                    >
+                      {translateIndustry(stock.sector) || "-"}
+                    </td>
                     <td className="px-4 py-3 text-right font-mono text-xs">
                       {stock.price.toLocaleString("ko-KR")}
                     </td>
@@ -131,8 +140,8 @@ export default function UniverseClient({ stocks }: Props) {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex gap-1">
-                        {stock.isFinancial && <Badge variant="secondary" className="text-[10px] px-1">금융</Badge>}
-                        {stock.isHolding && <Badge variant="secondary" className="text-[10px] px-1">지주</Badge>}
+                        {stock.isFinancial && <Badge variant="secondary" className="text-[10px] px-1">Financial</Badge>}
+                        {stock.isHolding && <Badge variant="secondary" className="text-[10px] px-1">Holding</Badge>}
                         {stock.isReit && <Badge variant="secondary" className="text-[10px] px-1">REIT</Badge>}
                       </div>
                     </td>
