@@ -1,5 +1,6 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { fetchBacktestPayload } from "@/lib/data-service.server";
+import { DEFAULT_RANKING_SYSTEM } from "@/lib/ranking-engine";
 import BacktestClient from "./BacktestClient";
 
 // Historical-universe payload (~137 snapshots × 3,400 tickers + forward
@@ -10,17 +11,13 @@ export const dynamic = "force-dynamic";
 // Generous timeout for the heavy initial data fetch.
 export const maxDuration = 60;
 
-// Default weights (Portfolio123-style balanced). Mirror the seeds used by
-// run_ranking_snapshot.py for the p123-inspired system so the page lands on
-// the same blend the live ranking uses.
-const DEFAULT_WEIGHTS: Record<string, number> = {
-  "Value": 25,
-  "Quality": 20,
-  "Growth": 15,
-  "Momentum": 25,
-  "Low Volatility": 5,
-  "Sentiment": 10,
-};
+// Default weights: derived from the live ranking system (DEFAULT_RANKING_SYSTEM,
+// the p123-inspired tree) so the backtest always lands on the same category
+// blend the dashboard ranking uses. Previously these were a hand-maintained
+// second copy and silently drifted out of sync. Single source of truth now.
+const DEFAULT_WEIGHTS: Record<string, number> = Object.fromEntries(
+  (DEFAULT_RANKING_SYSTEM.tree.children ?? []).map(c => [c.name, c.weight]),
+);
 
 export default async function BacktestPage() {
   const payload = await fetchBacktestPayload("p123-inspired", "krx_all_historical", 30);
