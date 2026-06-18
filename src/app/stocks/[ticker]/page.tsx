@@ -3,8 +3,8 @@ import { Button } from "@/components/ui/button";
 import {
   fetchStockByTicker,
   fetchStockPriceHistory,
-  fetchLatestFinancials,
-  fetchLatestPrices,
+  fetchLatestFinancialsForTicker,
+  fetchLatestPriceForTicker,
   fetchLatestRankingSnapshot,
   fetchFactorSnapshotsForStock,
   fetchLatestPriceDate,
@@ -32,15 +32,12 @@ export default async function StockDetailPage({ params }: PageProps) {
 
   const asOf = (await fetchLatestPriceDate()) ?? new Date().toISOString().slice(0, 10);
 
-  const [priceHistory, latestPriceMap, financialsMap, snapshot] = await Promise.all([
+  const [priceHistory, latestPrice, financials, snapshot] = await Promise.all([
     fetchStockPriceHistory(ticker),
-    fetchLatestPrices(),
-    fetchLatestFinancials(asOf),
+    fetchLatestPriceForTicker(ticker),
+    fetchLatestFinancialsForTicker(ticker, asOf),
     fetchLatestRankingSnapshot("p123-inspired", "krx_all_current"),
   ]);
-
-  const latestPrice = latestPriceMap.get(ticker) ?? null;
-  const financials = financialsMap.get(ticker) ?? null;
 
   // Pull factor snapshots for this ticker on the snapshot's date so we can
   // show universe-relative percentiles, not just raw recomputed values.

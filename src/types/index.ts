@@ -315,6 +315,7 @@ export interface StockRanking {
   rank: number | null;
   ticker: string;
   name: string;
+  nameEn?: string;
   market: Market;
   sector?: string;
   industry?: string;

@@ -262,6 +262,7 @@ export async function GET(
       rank: r.rank,
       ticker: r.ticker,
       name: stock?.name ?? r.ticker,
+      nameEn: stock?.nameEn ?? undefined,
       market: (stock?.market ?? "KOSPI") as "KOSPI" | "KOSDAQ",
       sector: stock?.sector ?? undefined,
       industry: stock?.industry ?? undefined,

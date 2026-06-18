@@ -118,7 +118,38 @@ export async function fetchLatestPrices(): Promise<Map<string, DailyPrice>> {
   return result;
 }
 
-export async function fetchStockPriceHistory(ticker: string): Promise<DailyPrice[]> {
+/**
+ * Latest price row for a single ticker. Uses the (ticker, date) index for an
+ * index-only seek instead of scanning/grouping the whole 6.8M-row table the
+ * way fetchLatestPrices() does. Use this on per-stock pages.
+ */
+export async function fetchLatestPriceForTicker(
+  ticker: string,
+): Promise<DailyPrice | null> {
+  if (getDataSource() === "mock") {
+    return mockGetLatestPrices().get(ticker) ?? null;
+  }
+
+  const db = getDb()!;
+  const rows = await db
+    .select()
+    .from(schema.dailyPrices)
+    .where(eq(schema.dailyPrices.ticker, ticker))
+    .orderBy(desc(schema.dailyPrices.date))
+    .limit(1);
+
+  return rows.length > 0 ? mapDbPrice(rows[0]) : null;
+}
+
+/**
+ * Recent daily prices for one ticker, newest-bounded. The stock detail chart
+ * only renders the last ~120 trading days, so we fetch a small window instead
+ * of the stock's entire multi-year history. Returns ascending by date.
+ */
+export async function fetchStockPriceHistory(
+  ticker: string,
+  limit = 150,
+): Promise<DailyPrice[]> {
   if (getDataSource() === "mock") return mockGetStockPriceHistory(ticker);
 
   const db = getDb()!;
@@ -126,9 +157,11 @@ export async function fetchStockPriceHistory(ticker: string): Promise<DailyPrice
     .select()
     .from(schema.dailyPrices)
     .where(eq(schema.dailyPrices.ticker, ticker))
-    .orderBy(asc(schema.dailyPrices.date));
+    .orderBy(desc(schema.dailyPrices.date))
+    .limit(limit);
 
-  return rows.map(mapDbPrice);
+  // rows are newest-first; reverse to ascending for the chart
+  return rows.reverse().map(mapDbPrice);
 }
 
 export async function fetchPriceHistoryForTickers(
@@ -189,6 +222,37 @@ export async function fetchLatestFinancials(
     }
   }
   return result;
+}
+
+/**
+ * Latest financial statement for a single ticker (point-in-time safe). Seeks
+ * via the (ticker, period_end, ...) index instead of loading every company's
+ * statements the way fetchLatestFinancials() does. Use on per-stock pages.
+ */
+export async function fetchLatestFinancialsForTicker(
+  ticker: string,
+  asOfDate: string,
+): Promise<FinancialStatement | null> {
+  if (getDataSource() === "mock") {
+    return mockGetLatestFinancials(asOfDate).get(ticker) ?? null;
+  }
+
+  const db = getDb()!;
+  const rows = await db
+    .select()
+    .from(schema.financialStatements)
+    .where(
+      and(
+        eq(schema.financialStatements.ticker, ticker),
+        lte(schema.financialStatements.dataAvailableDate, asOfDate),
+        eq(schema.financialStatements.statementType, "annual"),
+        eq(schema.financialStatements.consolidatedOrSeparate, "consolidated"),
+      ),
+    )
+    .orderBy(desc(schema.financialStatements.periodEnd))
+    .limit(1);
+
+  return rows.length > 0 ? mapDbFinancial(rows[0]) : null;
 }
 
 export async function fetchPriorFinancials(

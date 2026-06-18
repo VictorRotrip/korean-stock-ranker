@@ -11,7 +11,7 @@ import type { RankingSystem, RankingResult, StockRanking, CategoryScoreDetail } 
 import { getSystemById } from "@/lib/store";
 import { runRanking, collectFactorIds, DEFAULT_RANKING_SYSTEM } from "@/lib/ranking-engine";
 import { getFactorDefinitions } from "@/lib/factors";
-import { translateIndustry } from "@/lib/i18n";
+import { displayName, translateIndustry } from "@/lib/i18n";
 import { cn, formatKRW, formatNumber, scoreColor, scoreBg } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -619,7 +619,7 @@ export default function RankingResultsPage() {
                       </td>
                       <td className="px-4 py-3">
                         <div>
-                          <p className="font-medium text-sm">{stock.name}</p>
+                          <p className="font-medium text-sm">{displayName(stock)}</p>
                           <p className="text-xs text-muted-foreground">{stock.ticker}</p>
                         </div>
                       </td>
