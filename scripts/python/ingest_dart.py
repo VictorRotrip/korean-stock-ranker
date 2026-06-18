@@ -1326,7 +1326,7 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
 # Upsert
 # ---------------------------------------------------------------------------
 
-def upsert_financials(conn, records):
+def upsert_financials(conn, records, overwrite=False):
     if not records:
         return 0
 
@@ -1350,6 +1350,37 @@ def upsert_financials(conn, records):
         for r in records
     ]
 
+    # Columns whose value is fully recomputed from a fresh DART fetch by the
+    # current parser logic (borrowings sum, true interest, shares + derived
+    # per-share metrics, D&A/EBITDA). With --overwrite we take the freshly
+    # fetched value verbatim (EXCLUDED) — including NULL — so corrections (e.g.
+    # de-polluted interest, recomputed debt) actually replace stale values.
+    # Without --overwrite every column is COALESCE (fill-nulls-only), the safe
+    # default that never wipes good data on a partial re-fetch.
+    RECOMPUTED = {
+        "eps", "total_debt", "ebitda", "interest_expense",
+        "depreciation", "book_value_per_share", "shares_outstanding",
+    }
+    data_cols = [
+        "revenue", "cost_of_revenue", "gross_profit", "operating_income",
+        "net_income", "eps", "total_assets", "total_liabilities", "total_equity",
+        "current_assets", "current_liabilities", "cash", "total_debt",
+        "operating_cash_flow", "capital_expenditure", "free_cash_flow", "ebitda",
+        "interest_expense", "depreciation", "dividends_paid",
+        "book_value_per_share", "shares_outstanding",
+    ]
+    set_lines = [
+        "filing_date = EXCLUDED.filing_date",
+        "data_available_date = EXCLUDED.data_available_date",
+    ]
+    for col in data_cols:
+        if overwrite and col in RECOMPUTED:
+            set_lines.append("{0} = EXCLUDED.{0}".format(col))
+        else:
+            set_lines.append(
+                "{0} = COALESCE(EXCLUDED.{0}, financial_statements.{0})".format(col)
+            )
+
     query = """
     INSERT INTO financial_statements (
         ticker, period_end, filing_date, data_available_date,
@@ -1366,31 +1397,7 @@ def upsert_financials(conn, records):
     ) VALUES %s
     ON CONFLICT (ticker, period_end, statement_type, consolidated_or_separate)
     DO UPDATE SET
-        filing_date = EXCLUDED.filing_date,
-        data_available_date = EXCLUDED.data_available_date,
-        revenue = COALESCE(EXCLUDED.revenue, financial_statements.revenue),
-        cost_of_revenue = COALESCE(EXCLUDED.cost_of_revenue, financial_statements.cost_of_revenue),
-        gross_profit = COALESCE(EXCLUDED.gross_profit, financial_statements.gross_profit),
-        operating_income = COALESCE(EXCLUDED.operating_income, financial_statements.operating_income),
-        net_income = COALESCE(EXCLUDED.net_income, financial_statements.net_income),
-        eps = COALESCE(EXCLUDED.eps, financial_statements.eps),
-        total_assets = COALESCE(EXCLUDED.total_assets, financial_statements.total_assets),
-        total_liabilities = COALESCE(EXCLUDED.total_liabilities, financial_statements.total_liabilities),
-        total_equity = COALESCE(EXCLUDED.total_equity, financial_statements.total_equity),
-        current_assets = COALESCE(EXCLUDED.current_assets, financial_statements.current_assets),
-        current_liabilities = COALESCE(EXCLUDED.current_liabilities, financial_statements.current_liabilities),
-        cash = COALESCE(EXCLUDED.cash, financial_statements.cash),
-        total_debt = COALESCE(EXCLUDED.total_debt, financial_statements.total_debt),
-        operating_cash_flow = COALESCE(EXCLUDED.operating_cash_flow, financial_statements.operating_cash_flow),
-        capital_expenditure = COALESCE(EXCLUDED.capital_expenditure, financial_statements.capital_expenditure),
-        free_cash_flow = COALESCE(EXCLUDED.free_cash_flow, financial_statements.free_cash_flow),
-        ebitda = COALESCE(EXCLUDED.ebitda, financial_statements.ebitda),
-        interest_expense = COALESCE(EXCLUDED.interest_expense, financial_statements.interest_expense),
-        depreciation = COALESCE(EXCLUDED.depreciation, financial_statements.depreciation),
-        dividends_paid = COALESCE(EXCLUDED.dividends_paid, financial_statements.dividends_paid),
-        book_value_per_share = COALESCE(EXCLUDED.book_value_per_share, financial_statements.book_value_per_share),
-        shares_outstanding = COALESCE(EXCLUDED.shares_outstanding, financial_statements.shares_outstanding)
-    """
+    """ + ",\n        ".join(set_lines) + "\n"
     execute_values(cur, query, values)
     conn.commit()
     cur.close()
@@ -1529,6 +1536,13 @@ if __name__ == "__main__":
                         help="Skip ticker/year/report combos already in financial_statements")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Alias for --resume")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Re-fetch ticker/year/report combos even if they "
+                             "already exist, and OVERWRITE the recomputed columns "
+                             "(total_debt, interest_expense, shares_outstanding, "
+                             "eps, book_value_per_share, depreciation, ebitda) with "
+                             "the fresh values. Use this to apply parser fixes to "
+                             "existing rows. Ignores --resume/--skip-existing.")
     parser.add_argument("--rate-limit", type=float, default=1.0,
                         help="Seconds between API calls (default: 1.0)")
     parser.add_argument("--dry-run", action="store_true",
@@ -1692,7 +1706,10 @@ if __name__ == "__main__":
     rate_limit = args.rate_limit
     retry_count = args.retry
     dry_run = args.dry_run
-    resume = args.resume or args.skip_existing
+    # --overwrite forces a full re-fetch (no skipping) so parser fixes reach
+    # rows that already exist; it also flips the upsert to overwrite mode below.
+    overwrite = args.overwrite
+    resume = (args.resume or args.skip_existing) and not overwrite
 
     active_tickers = list(ticker_corp.keys())
     total_calls = len(active_tickers) * len(years) * len(report_codes)
@@ -1864,7 +1881,7 @@ if __name__ == "__main__":
             # Batch upsert every 50 records
             if len(records) >= 50:
                 conn, n = db_write_with_retry(
-                    conn, upsert_financials, records)
+                    conn, upsert_financials, records, overwrite=overwrite)
                 cnt_inserted += n
                 print("  -> Batch upsert: {} records".format(n), flush=True)
                 records = []
@@ -1872,7 +1889,7 @@ if __name__ == "__main__":
         # Final upsert
         if records and not dry_run:
             conn, n = db_write_with_retry(
-                conn, upsert_financials, records)
+                conn, upsert_financials, records, overwrite=overwrite)
             cnt_inserted += n
             print("  -> Final upsert: {} records".format(n), flush=True)
 
