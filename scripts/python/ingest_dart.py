@@ -892,6 +892,14 @@ ACCOUNT_MAP = {
     "당기순이익": "net_income",
     "당기순이익(손실)": "net_income",
     "당기순손익": "net_income",                  # alt phrasing: 손익 instead of 이익
+    # Net income attributable to owners of the parent — used (when present) for
+    # more accurate per-share derivation than total net income, which includes
+    # the minority/non-controlling interest.
+    "지배기업의소유주에게귀속되는당기순이익": "net_income_owners",
+    "지배기업의소유주에게귀속되는당기순이익(손실)": "net_income_owners",
+    "지배기업소유주지분순이익": "net_income_owners",
+    "지배기업소유주순이익": "net_income_owners",
+    "지배주주순이익": "net_income_owners",
     "주당이익": "eps",
     "기본주당이익(손실)": "eps",
     "기본주당순이익": "eps",
@@ -902,6 +910,11 @@ ACCOUNT_MAP = {
     "자산총계": "total_assets",
     "부채총계": "total_liabilities",
     "자본총계": "total_equity",
+    # Equity attributable to owners of the parent — used (when present) for
+    # more accurate book-value-per-share than total equity.
+    "지배기업의소유주에게귀속되는자본": "equity_owners",
+    "지배기업소유주지분": "equity_owners",
+    "지배주주지분": "equity_owners",
     "유동자산": "current_assets",
     "유동부채": "current_liabilities",
     "현금및현금성자산": "cash",
@@ -1004,6 +1017,21 @@ ACCOUNT_PRIORITY = {
 }
 
 
+# Interest-bearing borrowing line items on the balance sheet. total_debt is the
+# SUM of every matching line (current + non-current borrowings and all bond
+# types) — the generic ACCOUNT_MAP loop overwrites duplicate field names, so a
+# company listing both bank borrowings and convertible bonds would otherwise be
+# under-counted. Lease liabilities are deliberately excluded (operating leases
+# aren't interest-bearing financial debt in the classic sense).
+BORROWING_LABELS = [
+    "단기차입금", "단기차입금및사채", "유동성장기부채", "유동성장기차입금",
+    "유동성사채", "단기사채", "유동성전환사채",
+    "장기차입금", "장기차입금및사채", "장기성차입금",
+    "사채", "전환사채", "신주인수권부사채", "교환사채",
+]
+BORROWING_LABELS_NORM = {_normalize_account_name(x) for x in BORROWING_LABELS}
+
+
 # ---------------------------------------------------------------------------
 # Statement-type filter (sj_div) — prevents cross-statement contamination
 # ---------------------------------------------------------------------------
@@ -1037,6 +1065,7 @@ FIELD_TO_STATEMENT = {
     "gross_profit":       IS_DIVS,
     "operating_income":   IS_DIVS,
     "net_income":         IS_DIVS,
+    "net_income_owners":  IS_DIVS,
     "eps":                IS_DIVS,
     "interest_expense":   IS_DIVS,
     # Depreciation/amortization is reported on both IS and the CF
@@ -1047,6 +1076,7 @@ FIELD_TO_STATEMENT = {
     "total_assets":       BS_DIVS,
     "total_liabilities":  BS_DIVS,
     "total_equity":       BS_DIVS,
+    "equity_owners":      BS_DIVS,
     "current_assets":     BS_DIVS,
     "current_liabilities": BS_DIVS,
     "cash":               BS_DIVS,
@@ -1197,22 +1227,28 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
         result.setdefault("total_equity", result["total_assets"] - result["total_liabilities"])
 
     if "total_debt" not in result:
-        total_debt = 0
-        found_component = False
-        for k in ("short_term_debt", "long_term_debt", "bonds_payable"):
-            if k in result:
-                total_debt += result[k]
-                found_component = True
-        if found_component:
-            result["total_debt"] = total_debt
+        # Sum EVERY interest-bearing borrowing line on the balance sheet (read
+        # straight from the raw accounts, so multiple borrowing/bond lines add
+        # up instead of overwriting one another).
+        debt_sum = 0
+        found_borrowing = False
+        for item in accounts:
+            sj = str(item.get("sj_div") or "").upper()
+            if sj and sj not in BS_DIVS:
+                continue
+            name = _normalize_account_name(str(item.get("account_nm", "")))
+            if name in BORROWING_LABELS_NORM:
+                v = _item_value(item)
+                if v is not None:
+                    debt_sum += v
+                    found_borrowing = True
+        if found_borrowing:
+            result["total_debt"] = debt_sum
         else:
-            # No borrowing line items on the face of the balance sheet. Decide
-            # between "genuinely unlevered" (record explicit 0 so Debt/Equity
-            # scores it well) and "unknown" (leave NULL -> excluded from the
-            # factor, never fabricated). We treat it as a true zero only when
-            # we clearly parsed a detailed balance sheet (current_liabilities
-            # present) AND there's no genuine interest expense — a strong
-            # combined signal of no interest-bearing debt. Otherwise NULL.
+            # No borrowing line items on a balance sheet we clearly parsed in
+            # detail, and no genuine interest expense -> treat as unlevered and
+            # record an explicit 0 (so Debt/Equity scores it well). Otherwise
+            # leave NULL = unknown -> excluded from the factor, never fabricated.
             bs_detailed = (
                 "total_assets" in result
                 and "total_liabilities" in result
@@ -1265,10 +1301,18 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
     # only fills when missing, so a reported EPS is never overwritten.
     shares_out = result.get("shares_outstanding")
     if shares_out and shares_out > 0:
-        if not result.get("eps") and result.get("net_income") is not None:
-            result["eps"] = result["net_income"] / shares_out
-        if not result.get("book_value_per_share") and result.get("total_equity") is not None:
-            result["book_value_per_share"] = result["total_equity"] / shares_out
+        # Prefer owners-of-parent figures (exclude minority interest); fall back
+        # to the consolidated totals when the attributable line isn't reported.
+        ni = result.get("net_income_owners")
+        if ni is None:
+            ni = result.get("net_income")
+        eq = result.get("equity_owners")
+        if eq is None:
+            eq = result.get("total_equity")
+        if not result.get("eps") and ni is not None:
+            result["eps"] = ni / shares_out
+        if not result.get("book_value_per_share") and eq is not None:
+            result["book_value_per_share"] = eq / shares_out
 
     field_count = sum(1 for k in result if k not in (
         "ticker", "period_end", "filing_date", "data_available_date",
