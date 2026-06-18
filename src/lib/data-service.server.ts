@@ -622,16 +622,21 @@ async function fetchBacktestPayloadUncached(
 
   if (snapRows.length === 0) return null;
 
-  const snapshots: BacktestSnapshot[] = [];
   const categorySet = new Set<string>();
 
   // Payload-size trimming: drop tickers with no usable category scores
   // (saves ~30% on the historical universe where many delisted/inactive
-  // names had only NULLs at a given rebalance date). Round category
-  // scores to 1 decimal — they're percentile ranks, not precise
-  // measurements.
-  const round1 = (v: number | null): number | null =>
-    v == null ? null : Math.round(v * 10) / 10;
+  // names had only NULLs at a given rebalance date). Round category scores
+  // to integers — they're percentile ranks (0–100), not precise
+  // measurements, so integers shorten each score in the JSON wire payload.
+  const round = (v: number | null): number | null =>
+    v == null ? null : Math.round(v);
+
+  // First pass: collect rows keyed by category name. The final positional
+  // category order isn't known until we've scanned every snapshot, so we
+  // compact to arrays in a second pass below.
+  type TmpRow = { ticker: string; cats: Record<string, number | null>; passed: boolean };
+  const tmpSnapshots: Array<{ date: string; rows: TmpRow[] }> = [];
 
   for (const row of snapRows) {
     const r = row.results as {
@@ -642,14 +647,14 @@ async function fetchBacktestPayloadUncached(
       }>;
     };
     const rankings = r?.rankings ?? [];
-    const rows: BacktestTicker[] = [];
+    const rows: TmpRow[] = [];
     for (const rk of rankings) {
       const raw = rk.category_scores_simple ?? {};
       const cats: Record<string, number | null> = {};
       let anyNonNull = false;
       for (const k of Object.keys(raw)) {
         categorySet.add(k);
-        const v = round1(raw[k]);
+        const v = round(raw[k]);
         cats[k] = v;
         if (v !== null) anyNonNull = true;
       }
@@ -662,11 +667,11 @@ async function fetchBacktestPayloadUncached(
         passed: rk.passes_minimum ?? false,
       });
     }
-    snapshots.push({ date: row.date, rows });
+    tmpSnapshots.push({ date: row.date, rows });
   }
 
   // 2. Forward returns for those snapshot dates at the chosen horizon.
-  const dates = snapshots.map(s => s.date);
+  const dates = tmpSnapshots.map(s => s.date);
   const retRows = await db
     .select({
       ticker: schema.backtestForwardReturns.ticker,
@@ -685,10 +690,8 @@ async function fetchBacktestPayloadUncached(
     const key = r.snapshotDate;
     if (!returnsByDate[key]) returnsByDate[key] = [];
     returnsByDate[key].push({
-      ticker: r.ticker,
-      date: r.snapshotDate,
+      t: r.ticker,
       ret: Math.round(r.forwardReturn * 10000) / 10000,  // 4 decimal places
-      endDate: null,                                      // omitted (unused in client)
     });
   }
 
@@ -697,6 +700,18 @@ async function fetchBacktestPayloadUncached(
   const ordered: string[] = [];
   for (const c of CANONICAL) if (categorySet.has(c)) ordered.push(c);
   for (const c of categorySet) if (!ordered.includes(c)) ordered.push(c);
+
+  // Second pass: compact each row to a positional score array aligned to
+  // `ordered`, plus a 1/0 passed flag. This drops the six repeated category
+  // key strings per ticker row — the bulk of the wire payload.
+  const snapshots: BacktestSnapshot[] = tmpSnapshots.map(s => ({
+    date: s.date,
+    rows: s.rows.map((r): BacktestTicker => ({
+      t: r.ticker,
+      c: ordered.map(cat => r.cats[cat] ?? null),
+      p: r.passed ? 1 : 0,
+    })),
+  }));
 
   return {
     systemId,

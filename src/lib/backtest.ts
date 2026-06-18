@@ -13,14 +13,16 @@
 // =============================================================================
 
 /**
- * Compact per-ticker row inside a snapshot. Keeps payload small enough to
- * ship to the browser (≈ 80 KB per date × ~28 dates ≈ 2 MB before gzip).
+ * Compact per-ticker row inside a snapshot. Field names are deliberately
+ * one-letter and `c` is a positional array aligned to
+ * BacktestPayload.categories — repeating the six category-name keys per row
+ * was the bulk of the (~50 MB) wire payload. `p` is the passes-coverage flag
+ * (1/0). Scores are integer percentile ranks (0–100).
  */
 export interface BacktestTicker {
-  ticker: string;
-  /** category_scores_simple for this ticker; missing keys = null. */
-  cats: Record<string, number | null>;
-  passed: boolean;
+  t: string;                 // ticker
+  c: (number | null)[];      // category scores, aligned to payload.categories
+  p: 0 | 1;                  // 1 = passed coverage gate
 }
 
 export interface BacktestSnapshot {
@@ -29,10 +31,8 @@ export interface BacktestSnapshot {
 }
 
 export interface BacktestForwardReturn {
-  ticker: string;
-  date: string;          // snapshot_date
-  ret: number;           // forward total return
-  endDate: string | null;
+  t: string;             // ticker
+  ret: number;           // forward total return (snapshot date is the map key)
 }
 
 export interface BacktestPayload {
@@ -204,17 +204,49 @@ export function runBacktest({
 }: RunArgs): BacktestResult {
   const periods: BucketPeriodReturn[] = [];
 
+  // Precompute the scoring plan once: which array index each weighted category
+  // maps to, plus the total weight. Mirrors compositeScore() exactly (neutral
+  // imputation = 50 for missing categories; weight still counts toward the
+  // denominator). idx === -1 means the category isn't in the payload, so it's
+  // always treated as missing/neutral.
+  const catIndex: Record<string, number> = {};
+  payload.categories.forEach((c, i) => { catIndex[c] = i; });
+  const NEUTRAL = 50;
+  const plan: Array<{ idx: number; w: number }> = [];
+  let totalWeight = 0;
+  for (const cat of Object.keys(weights)) {
+    const w = weights[cat];
+    if (w <= 0) continue;
+    totalWeight += w;
+    plan.push({ idx: catIndex[cat] ?? -1, w });
+  }
+  const scoreRow = (c: (number | null)[]): number | null => {
+    if (totalWeight === 0) return null;
+    let weightedSum = 0;
+    let sawAny = false;
+    for (const { idx, w } of plan) {
+      const v = idx >= 0 ? c[idx] : null;
+      if (v !== null && v !== undefined) {
+        weightedSum += w * v;
+        sawAny = true;
+      } else {
+        weightedSum += w * NEUTRAL;
+      }
+    }
+    return sawAny ? weightedSum / totalWeight : null;
+  };
+
   for (const snap of payload.snapshots) {
     const rets = payload.returns[snap.date] ?? [];
     if (rets.length === 0) continue;  // no forward data yet for this date
     const retByTicker = new Map<string, number>();
-    for (const r of rets) retByTicker.set(r.ticker, r.ret);
+    for (const r of rets) retByTicker.set(r.t, r.ret);
 
     // Score every ticker that has a return AND passes filter.
     const scored: ScoredTicker[] = [];
     for (const row of snap.rows) {
-      if (universeFilter === "passed" && !row.passed) continue;
-      const ret = retByTicker.get(row.ticker);
+      if (universeFilter === "passed" && row.p !== 1) continue;
+      const ret = retByTicker.get(row.t);
       if (ret === undefined) continue;
       // Backstop only — splits are already adjusted in
       // backtest_forward_returns.py via the shares-outstanding-based
@@ -224,9 +256,9 @@ export function runBacktest({
       // -95% (max realistic loss without delisting) to +500% (top of
       // realistic biotech/M&A catalyst territory).
       const winsorisedRet = Math.max(-0.95, Math.min(5.0, ret));
-      const { score } = compositeScore(row.cats, weights);
+      const score = scoreRow(row.c);
       if (score === null) continue;
-      scored.push({ ticker: row.ticker, score, ret: winsorisedRet });
+      scored.push({ ticker: row.t, score, ret: winsorisedRet });
     }
 
     if (scored.length < nBuckets) continue;  // not enough names to bucket
