@@ -520,6 +520,53 @@ def fetch_finstate_raw(corp_code, year, report_code, fs_div, timeout, retry_coun
     return params, data
 
 
+def fetch_shares_outstanding(corp_code, year, report_code, timeout, retry_count=2):
+    """Outstanding common-share count from DART's stockTotqySttus disclosure.
+
+    Share counts are NOT carried in the financial-statement endpoint
+    (fnlttSinglAcntAll), which is why EPS and book-value-per-share were almost
+    always NULL. This separate disclosure ("주식의 총수 현황") gives, per share
+    class (se): issued total (istc_totqy), treasury (tesstk_co) and outstanding
+    /distributed (distb_stock_co).
+
+    Returns outstanding common shares (보통주 유통주식수), falling back to
+    issued-minus-treasury, then to the 합계 (total) row. Returns None on any
+    failure so it never blocks the rest of the ingest.
+    """
+    params = {
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": report_code,
+    }
+    try:
+        data = dart_api_call("stockTotqySttus", params, timeout, retry_count)
+    except Exception:
+        return None
+    if not data or data.get("status") != "000":
+        return None
+
+    def _outstanding(row):
+        v = parse_amount(row.get("distb_stock_co"))
+        if v is None or v <= 0:
+            issued = parse_amount(row.get("istc_totqy"))
+            treasury = parse_amount(row.get("tesstk_co")) or 0
+            v = (issued - treasury) if issued is not None else None
+        return v if (v is not None and v > 0) else None
+
+    common = None
+    total = None
+    for row in (data.get("list") or []):
+        se = _normalize_account_name(str(row.get("se") or ""))
+        shares = _outstanding(row)
+        if shares is None:
+            continue
+        if "보통주" in se:
+            common = shares
+        elif "합계" in se or "총계" in se:
+            total = shares
+    return common if common is not None else total
+
+
 # ---------------------------------------------------------------------------
 # Debug helpers (--debug-dart-report)
 # ---------------------------------------------------------------------------
@@ -879,7 +926,16 @@ ACCOUNT_MAP = {
     "무형자산의취득": "capex_intangible",
     "무형자산취득": "capex_intangible",
     "감가상각비": "depreciation",
+    # Combined D&A lines (common on the cash-flow reconciliation) -> fold into
+    # depreciation; EBITDA only sums whatever is present, so a combined value
+    # here still builds EBITDA correctly without double counting amortization.
+    "감가상각비와무형자산상각비": "depreciation",
+    "감가상각비및무형자산상각비": "depreciation",
+    "감가상각비와기타상각비": "depreciation",
+    "유형자산감가상각비": "depreciation",
     "무형자산상각비": "amortization",
+    "무형자산상각": "amortization",
+    "무형자산의상각": "amortization",
     "이자비용": "interest_expense",
     "배당금지급": "dividends_paid",
     "배당금의지급": "dividends_paid",
@@ -924,14 +980,18 @@ def _lookup_field(account_name):
 # so it can override the simpler mapping when a more precise concept
 # was also present.
 #
-# Specifically for interest_expense: Korean issuers commonly report
-# 금융비용 (finance costs — a broader bucket including FX losses) or
-# 금융원가 (synonym) instead of, or alongside, the precise 이자비용
-# line item. We accept 금융비용 as a fallback when 이자비용 is absent;
-# when both present, 이자비용 wins.
+# interest_expense must be TRUE interest cost only. Korean issuers often
+# report 금융비용 (finance costs — a broad bucket that includes FX losses and
+# fair-value losses) on the face of the income statement while the precise
+# 이자비용 sits in the notes. We previously substituted 금융비용 when 이자비용
+# was absent, which badly overstated interest for exporters (e.g. Spigen showed
+# ~10.5B of "interest" that was mostly FX) and corrupted the interest-coverage
+# factor. We now capture ONLY genuine interest-expense concepts; if none is on
+# the face, interest_expense stays NULL (the precise figure lives in the XBRL
+# notes, which this endpoint doesn't return). 금융비용 is deliberately excluded.
 ACCOUNT_PRIORITY = {
     "interest_expense": [
-        # Most precise -> least precise
+        # Most precise -> least precise (all are genuine interest cost)
         "이자비용",
         "이자비용및유사비용",
         "이자비용 및 유사비용",
@@ -940,8 +1000,6 @@ ACCOUNT_PRIORITY = {
         "사채이자비용",
         "차입금이자",
         "사채이자",
-        "금융비용",       # broader: interest + FX losses + fair value losses
-        "금융원가",       # synonym of 금융비용
     ],
 }
 
@@ -1140,11 +1198,29 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
 
     if "total_debt" not in result:
         total_debt = 0
+        found_component = False
         for k in ("short_term_debt", "long_term_debt", "bonds_payable"):
             if k in result:
                 total_debt += result[k]
-        if total_debt > 0:
+                found_component = True
+        if found_component:
             result["total_debt"] = total_debt
+        else:
+            # No borrowing line items on the face of the balance sheet. Decide
+            # between "genuinely unlevered" (record explicit 0 so Debt/Equity
+            # scores it well) and "unknown" (leave NULL -> excluded from the
+            # factor, never fabricated). We treat it as a true zero only when
+            # we clearly parsed a detailed balance sheet (current_liabilities
+            # present) AND there's no genuine interest expense — a strong
+            # combined signal of no interest-bearing debt. Otherwise NULL.
+            bs_detailed = (
+                "total_assets" in result
+                and "total_liabilities" in result
+                and "current_liabilities" in result
+            )
+            no_interest = not result.get("interest_expense")
+            if bs_detailed and no_interest:
+                result["total_debt"] = 0
 
     if "capex" not in result:
         capex = 0
@@ -1175,6 +1251,24 @@ def fetch_financials(ticker, corp_code, year, report_code, timeout, retry_count=
                 ebitda += result[k]
         if ebitda != 0:
             result["ebitda"] = ebitda
+
+    # Shares outstanding (and the per-share metrics that depend on it) aren't
+    # in the financial statements — pull from the stock-total-count disclosure.
+    if not result.get("shares_outstanding"):
+        shares = fetch_shares_outstanding(corp_code, year, report_code, timeout, retry_count)
+        if shares:
+            result["shares_outstanding"] = shares
+
+    # Derive EPS and book value per share when the filing didn't report them
+    # directly but we now have a share count. EPS uses period net income (a
+    # close enough proxy for the weighted-average-based figure for ranking);
+    # only fills when missing, so a reported EPS is never overwritten.
+    shares_out = result.get("shares_outstanding")
+    if shares_out and shares_out > 0:
+        if not result.get("eps") and result.get("net_income") is not None:
+            result["eps"] = result["net_income"] / shares_out
+        if not result.get("book_value_per_share") and result.get("total_equity") is not None:
+            result["book_value_per_share"] = result["total_equity"] / shares_out
 
     field_count = sum(1 for k in result if k not in (
         "ticker", "period_end", "filing_date", "data_available_date",

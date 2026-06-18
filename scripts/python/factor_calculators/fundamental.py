@@ -201,13 +201,19 @@ def calc_asset_turnover(fin, prior, market_cap, shares):
 
 
 def calc_debt_to_equity(fin, prior, market_cap, shares):
-    """Total Debt / Total Equity."""
+    """Interest-bearing debt / Total Equity (lower is better).
+
+    Intentionally does NOT fall back to total_liabilities when total_debt is
+    null: liabilities include trade payables, accruals and deferred revenue
+    (operating liabilities), a different concept from financial leverage that
+    silently inflated this factor for every company whose borrowings weren't
+    captured. A genuinely debt-free company has total_debt = 0 (recorded
+    explicitly at ingest) and scores best; a company whose debt simply wasn't
+    captured stays null and is excluded from this factor rather than mis-scored.
+    """
     if fin is None:
         return None
-    debt = fin.get("total_debt")
-    if debt is None:
-        debt = fin.get("total_liabilities")
-    return safe_div(debt, fin.get("total_equity"))
+    return safe_div(fin.get("total_debt"), fin.get("total_equity"))
 
 
 def calc_interest_coverage(fin, prior, market_cap, shares):
