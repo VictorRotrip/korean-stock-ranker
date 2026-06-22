@@ -147,6 +147,9 @@ export const financialStatements = pgTable("financial_statements", {
   interestExpense: bigint("interest_expense", { mode: "number" }),
   depreciation: bigint("depreciation", { mode: "number" }),
   sharesOutstanding: bigint("shares_outstanding", { mode: "number" }),
+  // Correction tracking: source filing receipt + date a 정정 (correction) was applied
+  receiptNo: varchar("receipt_no", { length: 30 }),
+  correctedAt: date("corrected_at"),
 }, (table) => ({
   tickerPeriodIdx: uniqueIndex("fs_ticker_period_type_idx")
     .on(table.ticker, table.periodEnd, table.statementType, table.consolidatedOrSeparate),

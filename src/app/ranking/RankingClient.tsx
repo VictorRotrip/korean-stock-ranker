@@ -57,6 +57,8 @@ export interface RankingRow {
   status: "passed" | "insufficient" | "non_pit_market_cap";
   dartUrl: string | null;
   dartFilingDate: string | null;
+  correctedAt: string | null;      // date a corrected filing was applied (recent)
+  correctedPeriod: string | null;  // which period was restated
 }
 
 interface Props {
@@ -136,6 +138,15 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
           <p className="text-sm">{row.marketCap ? formatKRW(row.marketCap) : "—"}</p>
         </div>
       </div>
+
+      {/* Corrected-filing notice */}
+      {row.correctedAt && (
+        <div className="rounded border border-amber-500/40 bg-amber-50 dark:bg-amber-900/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+          A corrected (정정) filing was applied on <span className="font-medium">{row.correctedAt}</span>
+          {row.correctedPeriod ? <> for period <span className="font-medium">{row.correctedPeriod}</span></> : null}.
+          The numbers below were refreshed from the restated report — open the DART link to see the latest filing.
+        </div>
+      )}
 
       {/* Liquidity */}
       <div className="rounded border bg-card px-3 py-2">
@@ -498,6 +509,15 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe,
                       <div className="flex items-center gap-2">
                         <span className="font-medium">{r.name}</span>
                         <Badge variant="outline" className="text-[10px]">{r.market}</Badge>
+                        {r.correctedAt && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-400"
+                            title={`A corrected filing was applied on ${r.correctedAt}${r.correctedPeriod ? ` (period ${r.correctedPeriod})` : ""}. Numbers were refreshed from the restated report.`}
+                          >
+                            corrected
+                          </Badge>
+                        )}
                       </div>
                     </td>
                     <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap" title={r.sector || undefined}>{r.sector || "-"}</td>

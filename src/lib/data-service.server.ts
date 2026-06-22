@@ -153,6 +153,38 @@ export async function fetchMedianDailyTurnover(days = 20): Promise<Map<string, n
 }
 
 // ---------------------------------------------------------------------------
+// Corrections (recently restated filings)
+// ---------------------------------------------------------------------------
+
+export interface CorrectionInfo {
+  correctedAt: string;   // date the correction was applied
+  periodEnd: string;     // which period was restated
+}
+
+/**
+ * Tickers whose financials were refreshed from a corrected DART filing within
+ * the last `days`. Used to flag "recently corrected" in the ranking views so
+ * you know a company restated numbers after the original filing.
+ */
+export async function fetchRecentlyCorrected(days = 45): Promise<Map<string, CorrectionInfo>> {
+  const map = new Map<string, CorrectionInfo>();
+  if (getDataSource() === "mock") return map;
+
+  const db = getDb()!;
+  const rows = await db.execute(sql`
+    SELECT DISTINCT ON (ticker) ticker, corrected_at::text AS corrected_at, period_end::text AS period_end
+    FROM financial_statements
+    WHERE corrected_at IS NOT NULL
+      AND corrected_at >= (CURRENT_DATE - ${days} * INTERVAL '1 day')
+    ORDER BY ticker, corrected_at DESC
+  `);
+  for (const r of rows as unknown as Array<{ ticker: string; corrected_at: string; period_end: string }>) {
+    map.set(r.ticker, { correctedAt: r.corrected_at, periodEnd: r.period_end });
+  }
+  return map;
+}
+
+// ---------------------------------------------------------------------------
 // FX
 // ---------------------------------------------------------------------------
 

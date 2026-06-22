@@ -6,6 +6,7 @@ import {
   fetchLatestDartFilings,
   fetchMedianDailyTurnover,
   fetchLatestUsdKrwRate,
+  fetchRecentlyCorrected,
 } from "@/lib/data-service.server";
 import { USD_KRW_RATE } from "@/lib/utils";
 import { displayName, translateIndustry } from "@/lib/i18n";
@@ -16,13 +17,14 @@ export const revalidate = 1800;  // 30 min — daily snapshot updates land in th
 const CATEGORY_ORDER = ["Value", "Quality", "Growth", "Momentum", "Low Volatility", "Sentiment"];
 
 export default async function RankingPage() {
-  const [snapshot, stocks, priceMap, dartMap, turnoverMap, usdKrwRate] = await Promise.all([
+  const [snapshot, stocks, priceMap, dartMap, turnoverMap, usdKrwRate, correctedMap] = await Promise.all([
     fetchLatestRankingSnapshot("p123-inspired", "krx_all_current"),
     fetchStocks(),
     fetchLatestPrices(),
     fetchLatestDartFilings(),
     fetchMedianDailyTurnover(20),
     fetchLatestUsdKrwRate(),
+    fetchRecentlyCorrected(45),
   ]);
 
   if (!snapshot) {
@@ -48,6 +50,7 @@ export default async function RankingPage() {
     const stock = stockMap.get(r.ticker);
     const price = priceMap.get(r.ticker);
     const dart = dartMap.get(r.ticker) ?? null;
+    const corrected = correctedMap.get(r.ticker) ?? null;
     return {
       rank: r.rank,
       ticker: r.ticker,
@@ -69,6 +72,8 @@ export default async function RankingPage() {
       status: r.coverage_status,
       dartUrl: dart?.url ?? null,
       dartFilingDate: dart?.filingDate ?? null,
+      correctedAt: corrected?.correctedAt ?? null,
+      correctedPeriod: corrected?.periodEnd ?? null,
     };
   });
 

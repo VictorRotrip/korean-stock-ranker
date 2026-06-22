@@ -114,6 +114,14 @@ jobs:
             --resume
         continue-on-error: true   # rate-limit failures shouldn't kill the run
 
+      # ----- Step 4b: refresh corrected (정정) filings market-wide -----
+      # Detects companies that refiled a corrected periodic report and re-pulls
+      # just those periods, stamping corrected_at so the UI can flag them.
+      - name: Refresh corrected DART filings
+        working-directory: scripts/python
+        run: python -u refresh_corrections.py --days 14
+        continue-on-error: true
+
       # ----- Step 5: compute factors -----
       - name: Calculate factors
         working-directory: scripts/python
