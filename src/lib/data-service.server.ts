@@ -120,6 +120,38 @@ export async function fetchLatestDartFilings(): Promise<Map<string, LatestDartFi
   return map;
 }
 
+/**
+ * Median daily trading value (거래대금, in KRW) per ticker over the most recent
+ * `days` trading days. A liquidity gauge: how much money actually changes hands
+ * in this stock on a typical day, so you can judge whether it's tradable at size.
+ * Uses trading_value where present, else close × volume.
+ */
+export async function fetchMedianDailyTurnover(days = 20): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (getDataSource() === "mock") return map;
+
+  const db = getDb()!;
+  const rows = await db.execute(sql`
+    WITH recent AS (
+      SELECT ticker,
+             COALESCE(trading_value, close * volume) AS tv,
+             row_number() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+      FROM daily_prices
+      WHERE date >= (SELECT max(date) FROM daily_prices) - INTERVAL '60 days'
+    )
+    SELECT ticker,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY tv) AS median_tv
+    FROM recent
+    WHERE rn <= ${days} AND tv IS NOT NULL
+    GROUP BY ticker
+  `);
+
+  for (const r of rows as unknown as Array<{ ticker: string; median_tv: string | number | null }>) {
+    if (r.median_tv !== null) map.set(r.ticker, Number(r.median_tv));
+  }
+  return map;
+}
+
 // ---------------------------------------------------------------------------
 // Prices
 // ---------------------------------------------------------------------------

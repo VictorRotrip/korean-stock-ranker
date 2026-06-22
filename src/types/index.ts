@@ -344,6 +344,11 @@ export interface StockRanking {
   imputedCategories?: string[];
   factorCount?: number;
   failureReasons?: string[];
+  /** Direct link to the latest DART source report (the filing the financials came from) */
+  dartUrl?: string | null;
+  dartFilingDate?: string | null;
+  /** Median daily trading value (KRW) over the last 20 trading days — liquidity gauge */
+  medianTurnover?: number | null;
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, ChevronDown, ChevronUp, Database, FileText, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronUp, Database, FileText, AlertTriangle, CheckCircle2, ExternalLink } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -105,6 +105,12 @@ function StockDetailRow({
         <div>
           <p className="text-xs text-muted-foreground">Market Cap</p>
           <p className="text-sm">{formatKRW(stock.marketCap)}</p>
+        </div>
+        <div>
+          <p className="text-xs text-muted-foreground">Median daily value (20d)</p>
+          <p className="text-sm font-medium">
+            {stock.medianTurnover ? formatKRW(stock.medianTurnover) : "—"}
+          </p>
         </div>
       </div>
 
@@ -219,12 +225,27 @@ function StockDetailRow({
         </div>
       )}
 
-      <div className="pt-1">
-        <Link href={`/stocks/${stock.ticker}`}>
-          <Button variant="outline" size="sm" className="text-xs">
-            View Full Stock Detail
-          </Button>
-        </Link>
+      {/* Source data links */}
+      <div className="pt-1 flex flex-wrap items-center gap-2">
+        {stock.dartUrl ? (
+          <a href={stock.dartUrl} target="_blank" rel="noopener noreferrer"
+             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted transition-colors">
+            <FileText className="h-3.5 w-3.5" />
+            View source report on DART
+            {stock.dartFilingDate && (
+              <span className="text-muted-foreground">· filed {stock.dartFilingDate}</span>
+            )}
+            <ExternalLink className="h-3 w-3 opacity-60" />
+          </a>
+        ) : (
+          <span className="text-xs text-muted-foreground">No DART filing on record for this ticker.</span>
+        )}
+        <a href={`https://finance.naver.com/item/main.naver?code=${stock.ticker}`}
+           target="_blank" rel="noopener noreferrer"
+           className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted transition-colors">
+          Naver Finance
+          <ExternalLink className="h-3 w-3 opacity-60" />
+        </a>
       </div>
     </div>
   );

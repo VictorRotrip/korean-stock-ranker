@@ -6,7 +6,14 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { cn, formatKRW } from "@/lib/utils";
+import { cn, formatKRW, formatNumber, scoreColor } from "@/lib/utils";
+import { getFactorDefinitions } from "@/lib/factors";
+
+interface FactorScore {
+  factorId: string;
+  rawValue: number | null;
+  percentileRank: number;
+}
 
 export interface CategoryDetail {
   score: number | null;
@@ -22,6 +29,7 @@ export interface RankingRow {
   market: string;
   sector: string | null;
   marketCap: number | null;
+  medianTurnover: number | null;   // median daily trading value (KRW), 20d
   composite: number;
   categories: Record<string, number | null>;
   categoryDetails: Record<string, CategoryDetail>;
@@ -40,6 +48,8 @@ export interface RankingRow {
 interface Props {
   rows: RankingRow[];
   categoryOrder: string[];
+  asOfDate: string;
+  universe: string;
 }
 
 function scoreBadgeClasses(score: number | null): string {
@@ -62,7 +72,12 @@ function statusLabel(status: string): string | null {
   }
 }
 
-function RankingDetail({ row, categoryOrder }: { row: RankingRow; categoryOrder: string[] }) {
+function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
+  row: RankingRow;
+  categoryOrder: string[];
+  factorData: FactorScore[] | "loading" | undefined;
+  factorDefs: ReturnType<typeof getFactorDefinitions>;
+}) {
   return (
     <div className="bg-muted/30 px-4 py-3 border-t space-y-3">
       {/* Identity */}
@@ -83,6 +98,14 @@ function RankingDetail({ row, categoryOrder }: { row: RankingRow; categoryOrder:
           <p className="text-xs text-muted-foreground">Market Cap</p>
           <p className="text-sm">{row.marketCap ? formatKRW(row.marketCap) : "—"}</p>
         </div>
+      </div>
+
+      {/* Liquidity */}
+      <div className="rounded border bg-card px-3 py-2">
+        <p className="text-xs text-muted-foreground">Median daily trading value (20d) — liquidity</p>
+        <p className="text-sm font-mono font-semibold">
+          {row.medianTurnover ? formatKRW(row.medianTurnover) : "—"}
+        </p>
       </div>
 
       {/* Coverage summary */}
@@ -161,6 +184,36 @@ function RankingDetail({ row, categoryOrder }: { row: RankingRow; categoryOrder:
         </div>
       </div>
 
+      {/* Factor details (loaded on demand) */}
+      <div>
+        <p className="text-xs font-medium text-muted-foreground mb-2">Factor Details</p>
+        {factorData === undefined || factorData === "loading" ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : factorData.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No factor detail available for this stock.</p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+            {factorData.map(d => {
+              const def = factorDefs.find(f => f.id === d.factorId);
+              return (
+                <div key={d.factorId}
+                     className="flex items-center justify-between px-3 py-1.5 rounded border bg-card text-xs">
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium truncate">{def?.name ?? d.factorId}</p>
+                    <p className="text-muted-foreground">
+                      Raw: {d.rawValue !== null ? formatNumber(d.rawValue, 4) : "N/A"}
+                    </p>
+                  </div>
+                  <div className={cn("ml-2 font-mono font-medium", scoreColor(d.percentileRank))}>
+                    {d.percentileRank.toFixed(1)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {/* Source filing link */}
       <div className="pt-1 flex flex-wrap items-center gap-2">
         {row.dartUrl ? (
@@ -187,18 +240,39 @@ function RankingDetail({ row, categoryOrder }: { row: RankingRow; categoryOrder:
   );
 }
 
-export default function RankingClient({ rows, categoryOrder }: Props) {
+export default function RankingClient({ rows, categoryOrder, asOfDate, universe }: Props) {
   const [search, setSearch] = useState("");
   const [marketFilter, setMarketFilter] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("passed");
   const [sectorFilter, setSectorFilter] = useState<string>("ALL");
+  const [liquidityFilter, setLiquidityFilter] = useState<string>("ALL");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [factorCache, setFactorCache] = useState<Record<string, FactorScore[] | "loading">>({});
+
+  const factorDefs = useMemo(() => getFactorDefinitions(), []);
+
+  const loadFactors = (ticker: string) => {
+    if (factorCache[ticker]) return;   // already loading or loaded
+    setFactorCache(prev => ({ ...prev, [ticker]: "loading" }));
+    fetch(`/api/stocks/${ticker}/factors?date=${asOfDate}&universe=${encodeURIComponent(universe)}`)
+      .then(res => res.json())
+      .then((data: { factors?: FactorScore[] }) => {
+        setFactorCache(prev => ({ ...prev, [ticker]: data.factors ?? [] }));
+      })
+      .catch(() => {
+        setFactorCache(prev => ({ ...prev, [ticker]: [] }));
+      });
+  };
 
   const toggleRow = (ticker: string) => {
     setExpanded(prev => {
       const next = new Set(prev);
-      if (next.has(ticker)) next.delete(ticker);
-      else next.add(ticker);
+      if (next.has(ticker)) {
+        next.delete(ticker);
+      } else {
+        next.add(ticker);
+        loadFactors(ticker);
+      }
       return next;
     });
   };
@@ -209,10 +283,16 @@ export default function RankingClient({ rows, categoryOrder }: Props) {
   }, [rows]);
 
   const filtered = useMemo(() => {
+    const minLiquidity = liquidityFilter === "ALL" ? 0 : Number(liquidityFilter);
     return rows.filter(r => {
       if (statusFilter !== "ALL" && r.status !== statusFilter) return false;
       if (marketFilter !== "ALL" && r.market !== marketFilter) return false;
       if (sectorFilter !== "ALL" && r.sector !== sectorFilter) return false;
+      if (minLiquidity > 0) {
+        // Hide names below the liquidity floor — and those with no turnover
+        // data, since we can't confirm they're tradable.
+        if (r.medianTurnover === null || r.medianTurnover < minLiquidity) return false;
+      }
       if (search) {
         const q = search.toLowerCase();
         if (
@@ -222,7 +302,7 @@ export default function RankingClient({ rows, categoryOrder }: Props) {
       }
       return true;
     });
-  }, [rows, search, marketFilter, statusFilter, sectorFilter]);
+  }, [rows, search, marketFilter, statusFilter, sectorFilter, liquidityFilter]);
 
   return (
     <div className="space-y-4">
@@ -267,6 +347,19 @@ export default function RankingClient({ rows, categoryOrder }: Props) {
             ))}
           </SelectContent>
         </Select>
+        <Select value={liquidityFilter} onValueChange={setLiquidityFilter}>
+          <SelectTrigger className="w-48">
+            <SelectValue placeholder="Min liquidity" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="ALL">Any liquidity</SelectItem>
+            <SelectItem value="100000000">≥ ₩1억 / day</SelectItem>
+            <SelectItem value="500000000">≥ ₩5억 / day</SelectItem>
+            <SelectItem value="1000000000">≥ ₩10억 / day</SelectItem>
+            <SelectItem value="5000000000">≥ ₩50억 / day</SelectItem>
+            <SelectItem value="10000000000">≥ ₩100억 / day</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       <p className="text-sm text-muted-foreground">{filtered.length.toLocaleString()} stocks</p>
@@ -282,6 +375,7 @@ export default function RankingClient({ rows, categoryOrder }: Props) {
                   <th className="px-3 py-3 text-left text-xs font-medium text-muted-foreground">Name</th>
                   <th className="px-3 py-3 text-left text-xs font-medium text-muted-foreground">Sector</th>
                   <th className="px-3 py-3 text-right text-xs font-medium text-muted-foreground">Mkt Cap</th>
+                  <th className="px-3 py-3 text-right text-xs font-medium text-muted-foreground" title="Median daily trading value over the last 20 trading days">Liq 20d</th>
                   <th className="px-3 py-3 text-right text-xs font-medium text-muted-foreground">Composite</th>
                   {categoryOrder.map(c => (
                     <th key={c} className="px-2 py-3 text-right text-xs font-medium text-muted-foreground">{c}</th>
@@ -313,8 +407,9 @@ export default function RankingClient({ rows, categoryOrder }: Props) {
                         <Badge variant="outline" className="text-[10px]">{r.market}</Badge>
                       </div>
                     </td>
-                    <td className="px-3 py-2 text-xs text-muted-foreground max-w-[180px] truncate">{r.sector || "-"}</td>
+                    <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap" title={r.sector || undefined}>{r.sector || "-"}</td>
                     <td className="px-3 py-2 text-right text-xs">{r.marketCap ? formatKRW(r.marketCap) : "-"}</td>
+                    <td className="px-3 py-2 text-right text-xs">{r.medianTurnover ? formatKRW(r.medianTurnover) : "-"}</td>
                     <td className="px-3 py-2 text-right">
                       <span className={cn("inline-block px-2 py-0.5 rounded font-mono text-xs font-semibold",
                         scoreBadgeClasses(r.composite))}>
@@ -342,8 +437,13 @@ export default function RankingClient({ rows, categoryOrder }: Props) {
                   </tr>
                   {isOpen && (
                     <tr>
-                      <td colSpan={7 + categoryOrder.length} className="p-0">
-                        <RankingDetail row={r} categoryOrder={categoryOrder} />
+                      <td colSpan={8 + categoryOrder.length} className="p-0">
+                        <RankingDetail
+                          row={r}
+                          categoryOrder={categoryOrder}
+                          factorData={factorCache[r.ticker]}
+                          factorDefs={factorDefs}
+                        />
                       </td>
                     </tr>
                   )}

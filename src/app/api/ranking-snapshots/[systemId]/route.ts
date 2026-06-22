@@ -215,6 +215,44 @@ export async function GET(
     };
   }
 
+  // 5b. Latest DART filing per ticker -> direct link to the source report.
+  const dartMap = new Map<string, { url: string; filingDate: string | null }>();
+  if (tickers.length > 0) {
+    const dartRows = await db.execute(sql`
+      SELECT DISTINCT ON (ticker) ticker, receipt_no, filing_date::text AS filing_date
+      FROM dart_filings
+      WHERE receipt_no IS NOT NULL AND ticker = ANY(${tickers})
+      ORDER BY ticker, filing_date DESC NULLS LAST
+    `);
+    for (const d of dartRows as unknown as Array<{ ticker: string; receipt_no: string; filing_date: string | null }>) {
+      dartMap.set(d.ticker, {
+        url: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${d.receipt_no}`,
+        filingDate: d.filing_date,
+      });
+    }
+  }
+
+  // 5c. Median daily trading value (20d) per ticker — liquidity gauge.
+  const turnoverMap = new Map<string, number>();
+  if (tickers.length > 0) {
+    const tvRows = await db.execute(sql`
+      WITH recent AS (
+        SELECT ticker,
+               COALESCE(trading_value, close * volume) AS tv,
+               row_number() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+        FROM daily_prices
+        WHERE ticker = ANY(${tickers})
+          AND date >= (SELECT max(date) FROM daily_prices) - INTERVAL '60 days'
+      )
+      SELECT ticker, percentile_cont(0.5) WITHIN GROUP (ORDER BY tv) AS median_tv
+      FROM recent WHERE rn <= 20 AND tv IS NOT NULL
+      GROUP BY ticker
+    `);
+    for (const t of tvRows as unknown as Array<{ ticker: string; median_tv: string | number | null }>) {
+      if (t.median_tv !== null) turnoverMap.set(t.ticker, Number(t.median_tv));
+    }
+  }
+
   // 6. Helper: extract a simple {name: score} map from either envelope shape.
   // Envelope shape stores per-category {score, weight, coverage, status}.
   function flattenCategoryScores(entry: SnapshotEntry): Record<string, number> {
@@ -257,10 +295,14 @@ export async function GET(
     const factors = factorMap.get(r.ticker) ?? {};
     const categoryScores = flattenCategoryScores(r);
     const categoryDetails = extractCategoryDetails(r);
+    const dart = dartMap.get(r.ticker);
 
     return {
       rank: r.rank,
       ticker: r.ticker,
+      dartUrl: dart?.url ?? null,
+      dartFilingDate: dart?.filingDate ?? null,
+      medianTurnover: turnoverMap.get(r.ticker) ?? null,
       name: stock?.name ?? r.ticker,
       nameEn: stock?.nameEn ?? undefined,
       market: (stock?.market ?? "KOSPI") as "KOSPI" | "KOSDAQ",
