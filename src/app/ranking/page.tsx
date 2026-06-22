@@ -3,6 +3,7 @@ import {
   fetchLatestRankingSnapshot,
   fetchStocks,
   fetchLatestPrices,
+  fetchLatestDartFilings,
 } from "@/lib/data-service.server";
 import { displayName, translateIndustry } from "@/lib/i18n";
 import RankingClient, { type RankingRow } from "./RankingClient";
@@ -12,10 +13,11 @@ export const revalidate = 1800;  // 30 min — daily snapshot updates land in th
 const CATEGORY_ORDER = ["Value", "Quality", "Growth", "Momentum", "Low Volatility", "Sentiment"];
 
 export default async function RankingPage() {
-  const [snapshot, stocks, priceMap] = await Promise.all([
+  const [snapshot, stocks, priceMap, dartMap] = await Promise.all([
     fetchLatestRankingSnapshot("p123-inspired", "krx_all_current"),
     fetchStocks(),
     fetchLatestPrices(),
+    fetchLatestDartFilings(),
   ]);
 
   if (!snapshot) {
@@ -40,6 +42,7 @@ export default async function RankingPage() {
   const rows: RankingRow[] = snapshot.rankings.map(r => {
     const stock = stockMap.get(r.ticker);
     const price = priceMap.get(r.ticker);
+    const dart = dartMap.get(r.ticker) ?? null;
     return {
       rank: r.rank,
       ticker: r.ticker,
@@ -49,9 +52,17 @@ export default async function RankingPage() {
       marketCap: price?.marketCap ?? null,
       composite: r.composite_score,
       categories: r.category_scores_simple ?? {},
+      categoryDetails: r.category_scores ?? {},
+      activeCategories: r.active_categories ?? [],
+      imputedCategories: r.imputed_categories ?? [],
+      activeCategoryCount: r.active_category_count ?? null,
+      passesMinimum: r.passes_minimum,
+      failureReasons: r.failure_reasons ?? [],
       coverage: r.active_weight_coverage ?? 0,
       factorCount: r.factor_count ?? 0,
       status: r.coverage_status,
+      dartUrl: dart?.url ?? null,
+      dartFilingDate: dart?.filingDate ?? null,
     };
   });
 

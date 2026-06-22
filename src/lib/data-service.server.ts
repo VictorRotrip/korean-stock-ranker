@@ -83,6 +83,44 @@ export async function fetchStockByTicker(ticker: string): Promise<Stock | null> 
 }
 
 // ---------------------------------------------------------------------------
+// DART filings (source documents)
+// ---------------------------------------------------------------------------
+
+export interface LatestDartFiling {
+  receiptNo: string;
+  filingDate: string | null;
+  /** Direct link to the actual filed report on DART's viewer. */
+  url: string;
+}
+
+/**
+ * Most recent DART filing per ticker, as a map keyed by ticker. Used to link
+ * each ranked stock to the actual source report on dart.fss.or.kr so the
+ * underlying numbers can be traced back to the filing they came from.
+ */
+export async function fetchLatestDartFilings(): Promise<Map<string, LatestDartFiling>> {
+  const map = new Map<string, LatestDartFiling>();
+  if (getDataSource() === "mock") return map;
+
+  const db = getDb()!;
+  const rows = await db.execute(sql`
+    SELECT DISTINCT ON (ticker) ticker, receipt_no, filing_date::text AS filing_date
+    FROM dart_filings
+    WHERE receipt_no IS NOT NULL AND ticker IS NOT NULL
+    ORDER BY ticker, filing_date DESC NULLS LAST
+  `);
+
+  for (const r of rows as unknown as Array<{ ticker: string; receipt_no: string; filing_date: string | null }>) {
+    map.set(r.ticker, {
+      receiptNo: r.receipt_no,
+      filingDate: r.filing_date,
+      url: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${r.receipt_no}`,
+    });
+  }
+  return map;
+}
+
+// ---------------------------------------------------------------------------
 // Prices
 // ---------------------------------------------------------------------------
 
