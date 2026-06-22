@@ -19,7 +19,7 @@ import sys
 import re
 import time
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -60,8 +60,9 @@ def parse_report(report_nm):
     return None
 
 
-def list_recent_filings(bgn, end, timeout):
-    """All periodic-report (pblntf_ty=A) filings in [bgn, end], paginated."""
+def _list_window(bgn, end, timeout):
+    """Paginate one date window of periodic filings. DART status codes:
+    000=ok, 013=no data (not an error)."""
     out = []
     page = 1
     while True:
@@ -72,7 +73,15 @@ def list_recent_filings(bgn, end, timeout):
             "page_no": page,
             "page_count": 100,
         }, timeout)
-        if not data or data.get("status") != "000":
+        if not data:
+            print("    {0}..{1}: no response from DART".format(bgn, end), flush=True)
+            break
+        status = data.get("status")
+        if status == "013":            # no data in this window — fine
+            break
+        if status != "000":
+            print("    {0}..{1}: DART status {2} ({3})".format(
+                bgn, end, status, data.get("message", "")), flush=True)
             break
         out.extend(data.get("list", []))
         total_page = int(data.get("total_page", 1) or 1)
@@ -80,6 +89,21 @@ def list_recent_filings(bgn, end, timeout):
             break
         page += 1
         time.sleep(0.3)
+    return out
+
+
+def list_recent_filings(bgn, end, timeout):
+    """All periodic-report filings in [bgn, end]. The DART `list` endpoint caps
+    the range at ~3 months when no corp_code is given, so we chunk into <=80-day
+    windows and aggregate."""
+    bgn_d = datetime.strptime(bgn, "%Y%m%d")
+    end_d = datetime.strptime(end, "%Y%m%d")
+    out = []
+    cur = bgn_d
+    while cur <= end_d:
+        win_end = min(cur + timedelta(days=80), end_d)
+        out.extend(_list_window(cur.strftime("%Y%m%d"), win_end.strftime("%Y%m%d"), timeout))
+        cur = win_end + timedelta(days=1)
     return out
 
 
@@ -101,8 +125,9 @@ def main():
     conn = psycopg2.connect(DATABASE_URL)
     tickers = known_tickers(conn)
 
-    end = datetime.utcnow().strftime("%Y%m%d")
-    bgn = (datetime.utcnow() - timedelta(days=args.days)).strftime("%Y%m%d")
+    now = datetime.now(timezone.utc)
+    end = now.strftime("%Y%m%d")
+    bgn = (now - timedelta(days=args.days)).strftime("%Y%m%d")
     print("Scanning DART periodic filings {0}..{1} for corrections...".format(bgn, end), flush=True)
 
     filings = list_recent_filings(bgn, end, args.timeout)
