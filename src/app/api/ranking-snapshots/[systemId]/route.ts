@@ -253,6 +253,16 @@ export async function GET(
     }
   }
 
+  // 5d. Latest USD/KRW rate for approximate USD display.
+  let usdKrwRate: number | null = null;
+  {
+    const fxRows = await db.execute(sql`
+      SELECT rate FROM fx_rates WHERE pair = 'USD/KRW' ORDER BY date DESC LIMIT 1
+    `);
+    const fx = (fxRows as unknown as Array<{ rate: number }>)[0];
+    if (fx) usdKrwRate = Number(fx.rate);
+  }
+
   // 6. Helper: extract a simple {name: score} map from either envelope shape.
   // Envelope shape stores per-category {score, weight, coverage, status}.
   function flattenCategoryScores(entry: SnapshotEntry): Record<string, number> {
@@ -336,6 +346,7 @@ export async function GET(
     computedAt: snapshot.computedAt?.toISOString() ?? new Date().toISOString(),
     snapshotId: snapshot.id,
     dataSource: "db" as const,
+    usdKrwRate,
     // Snapshot-level metadata
     scoringMethod: meta?.scoring_method ?? "percentile_rank",
     missingCategoryPolicy: meta?.missing_category_policy ?? null,

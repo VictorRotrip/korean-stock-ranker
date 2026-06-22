@@ -95,6 +95,12 @@ jobs:
       #   run: python -u ingest_short_selling_krx.py --date "${{ steps.date.outputs.as_of }}"
       #   continue-on-error: true
 
+      # ----- Step 3b: USD/KRW exchange rate (for USD display in the UI) -----
+      - name: Ingest USD/KRW rate
+        working-directory: scripts/python
+        run: python -u ingest_fx.py --days 10
+        continue-on-error: true   # FX is display-only; don't fail the run
+
       # ----- Step 4: DART new filings (current year, annual + quarterlies) -----
       # `--resume` skips filings already in financial_statements so this runs
       # quickly most days. Only picks up newly-filed reports.

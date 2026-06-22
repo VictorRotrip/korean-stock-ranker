@@ -12,7 +12,7 @@ import { getSystemById } from "@/lib/store";
 import { runRanking, collectFactorIds, DEFAULT_RANKING_SYSTEM } from "@/lib/ranking-engine";
 import { getFactorDefinitions } from "@/lib/factors";
 import { displayName, translateIndustry } from "@/lib/i18n";
-import { cn, formatKRW, formatUSD, formatNumber, scoreColor, scoreBg } from "@/lib/utils";
+import { cn, formatKRW, formatUSD, formatNumber, scoreColor, scoreBg, USD_KRW_RATE } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Data source detection (client-safe — uses NEXT_PUBLIC_ env var)
@@ -83,9 +83,11 @@ function CategoryStatusBadge({ status }: { status: CategoryScoreDetail["status"]
 function StockDetailRow({
   stock,
   factorDefs,
+  usdKrwRate,
 }: {
   stock: StockRanking;
   factorDefs: ReturnType<typeof getFactorDefinitions>;
+  usdKrwRate: number;
 }) {
   return (
     <div className="bg-muted/30 px-4 py-3 border-t space-y-3">
@@ -110,7 +112,7 @@ function StockDetailRow({
           <p className="text-xs text-muted-foreground">Median daily value (20d)</p>
           <p className="text-sm font-medium">
             {stock.medianTurnover
-              ? `${formatKRW(stock.medianTurnover)}  (≈ ${formatUSD(stock.medianTurnover)})`
+              ? `${formatKRW(stock.medianTurnover)}  (≈ ${formatUSD(stock.medianTurnover, usdKrwRate)})`
               : "—"}
           </p>
         </div>
@@ -260,6 +262,7 @@ function StockDetailRow({
 interface DbRankingResult extends RankingResult {
   snapshotId?: number;
   dataSource?: "db" | "mock";
+  usdKrwRate?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -700,7 +703,7 @@ export default function RankingResultsPage() {
                     {expandedRows.has(stock.ticker) && (
                       <tr>
                         <td colSpan={8 + categoryNames.length}>
-                          <StockDetailRow stock={stock} factorDefs={factorDefs} />
+                          <StockDetailRow stock={stock} factorDefs={factorDefs} usdKrwRate={dbResult.usdKrwRate ?? USD_KRW_RATE} />
                         </td>
                       </tr>
                     )}

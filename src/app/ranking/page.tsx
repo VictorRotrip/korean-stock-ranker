@@ -5,7 +5,9 @@ import {
   fetchLatestPrices,
   fetchLatestDartFilings,
   fetchMedianDailyTurnover,
+  fetchLatestUsdKrwRate,
 } from "@/lib/data-service.server";
+import { USD_KRW_RATE } from "@/lib/utils";
 import { displayName, translateIndustry } from "@/lib/i18n";
 import RankingClient, { type RankingRow } from "./RankingClient";
 
@@ -14,12 +16,13 @@ export const revalidate = 1800;  // 30 min — daily snapshot updates land in th
 const CATEGORY_ORDER = ["Value", "Quality", "Growth", "Momentum", "Low Volatility", "Sentiment"];
 
 export default async function RankingPage() {
-  const [snapshot, stocks, priceMap, dartMap, turnoverMap] = await Promise.all([
+  const [snapshot, stocks, priceMap, dartMap, turnoverMap, usdKrwRate] = await Promise.all([
     fetchLatestRankingSnapshot("p123-inspired", "krx_all_current"),
     fetchStocks(),
     fetchLatestPrices(),
     fetchLatestDartFilings(),
     fetchMedianDailyTurnover(20),
+    fetchLatestUsdKrwRate(),
   ]);
 
   if (!snapshot) {
@@ -87,6 +90,7 @@ export default async function RankingPage() {
         categoryOrder={CATEGORY_ORDER}
         asOfDate={snapshot.date}
         universe={snapshot.universeName ?? "krx_all_current"}
+        usdKrwRate={usdKrwRate ?? USD_KRW_RATE}
       />
     </div>
   );

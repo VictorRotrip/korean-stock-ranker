@@ -15,6 +15,20 @@ interface FactorScore {
   percentileRank: number;
 }
 
+interface FinancialPeriod {
+  periodEnd: string;
+  statementType: string;
+  revenue: number | null;
+  operatingIncome: number | null;
+  netIncome: number | null;
+  operatingCashFlow: number | null;
+  freeCashFlow: number | null;
+  totalDebt: number | null;
+  totalEquity: number | null;
+  eps: number | null;
+  sharesOutstanding: number | null;
+}
+
 export interface CategoryDetail {
   score: number | null;
   weight: number;
@@ -50,6 +64,7 @@ interface Props {
   categoryOrder: string[];
   asOfDate: string;
   universe: string;
+  usdKrwRate: number;
 }
 
 function scoreBadgeClasses(score: number | null): string {
@@ -72,12 +87,34 @@ function statusLabel(status: string): string | null {
   }
 }
 
-function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
+const FIN_ROWS: { key: keyof FinancialPeriod; label: string; kind: "krw" | "eps" | "shares" }[] = [
+  { key: "revenue", label: "Revenue", kind: "krw" },
+  { key: "operatingIncome", label: "Operating income", kind: "krw" },
+  { key: "netIncome", label: "Net income", kind: "krw" },
+  { key: "operatingCashFlow", label: "Operating cash flow", kind: "krw" },
+  { key: "freeCashFlow", label: "Free cash flow", kind: "krw" },
+  { key: "totalDebt", label: "Total debt", kind: "krw" },
+  { key: "totalEquity", label: "Total equity", kind: "krw" },
+  { key: "eps", label: "EPS", kind: "eps" },
+  { key: "sharesOutstanding", label: "Shares out.", kind: "shares" },
+];
+
+function finCell(v: number | null, kind: "krw" | "eps" | "shares"): string {
+  if (v === null || v === undefined) return "—";
+  if (kind === "krw") return formatKRW(v);
+  if (kind === "shares") return v.toLocaleString("en-US");
+  return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+
+function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials, usdKrwRate }: {
   row: RankingRow;
   categoryOrder: string[];
   factorData: FactorScore[] | "loading" | undefined;
   factorDefs: ReturnType<typeof getFactorDefinitions>;
+  financials: FinancialPeriod[] | "loading" | undefined;
+  usdKrwRate: number;
 }) {
+  const finPeriods = Array.isArray(financials) ? financials.slice(0, 5) : [];
   return (
     <div className="bg-muted/30 px-4 py-3 border-t space-y-3">
       {/* Identity */}
@@ -105,7 +142,7 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
         <p className="text-xs text-muted-foreground">Median daily trading value (20d) — liquidity</p>
         <p className="text-sm font-mono font-semibold">
           {row.medianTurnover
-            ? `${formatKRW(row.medianTurnover)}  (≈ ${formatUSD(row.medianTurnover)})`
+            ? `${formatKRW(row.medianTurnover)}  (≈ ${formatUSD(row.medianTurnover, usdKrwRate)})`
             : "—"}
         </p>
       </div>
@@ -186,6 +223,45 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
         </div>
       </div>
 
+      {/* Source financials (loaded on demand) */}
+      <div>
+        <p className="text-xs font-medium text-muted-foreground mb-2">
+          Source financials <span className="font-normal">— stored values behind the factors (consolidated). Cross-check against the DART report below.</span>
+        </p>
+        {financials === undefined || financials === "loading" ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : finPeriods.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No stored financials for this stock.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="text-xs border rounded">
+              <thead>
+                <tr className="bg-card">
+                  <th className="px-2 py-1 text-left font-medium text-muted-foreground">Metric</th>
+                  {finPeriods.map((p, i) => (
+                    <th key={i} className="px-2 py-1 text-right font-medium whitespace-nowrap">
+                      {p.periodEnd}<span className="text-muted-foreground"> · {p.statementType}</span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {FIN_ROWS.map(fr => (
+                  <tr key={fr.key} className="border-t">
+                    <td className="px-2 py-1 text-muted-foreground whitespace-nowrap">{fr.label}</td>
+                    {finPeriods.map((p, i) => (
+                      <td key={i} className="px-2 py-1 text-right font-mono whitespace-nowrap">
+                        {finCell(p[fr.key] as number | null, fr.kind)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       {/* Factor details (loaded on demand) */}
       <div>
         <p className="text-xs font-medium text-muted-foreground mb-2">Factor Details</p>
@@ -242,7 +318,7 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
   );
 }
 
-export default function RankingClient({ rows, categoryOrder, asOfDate, universe }: Props) {
+export default function RankingClient({ rows, categoryOrder, asOfDate, universe, usdKrwRate }: Props) {
   const [search, setSearch] = useState("");
   const [marketFilter, setMarketFilter] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("passed");
@@ -250,6 +326,7 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe 
   const [liquidityFilter, setLiquidityFilter] = useState<string>("ALL");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [factorCache, setFactorCache] = useState<Record<string, FactorScore[] | "loading">>({});
+  const [finCache, setFinCache] = useState<Record<string, FinancialPeriod[] | "loading">>({});
 
   const factorDefs = useMemo(() => getFactorDefinitions(), []);
 
@@ -266,6 +343,19 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe 
       });
   };
 
+  const loadFinancials = (ticker: string) => {
+    if (finCache[ticker]) return;
+    setFinCache(prev => ({ ...prev, [ticker]: "loading" }));
+    fetch(`/api/stocks/${ticker}/financials`)
+      .then(res => res.json())
+      .then((data: { periods?: FinancialPeriod[] }) => {
+        setFinCache(prev => ({ ...prev, [ticker]: data.periods ?? [] }));
+      })
+      .catch(() => {
+        setFinCache(prev => ({ ...prev, [ticker]: [] }));
+      });
+  };
+
   const toggleRow = (ticker: string) => {
     setExpanded(prev => {
       const next = new Set(prev);
@@ -274,6 +364,7 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe 
       } else {
         next.add(ticker);
         loadFactors(ticker);
+        loadFinancials(ticker);
       }
       return next;
     });
@@ -415,7 +506,7 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe 
                       {r.medianTurnover ? (
                         <div className="leading-tight">
                           <div>{formatKRW(r.medianTurnover)}</div>
-                          <div className="text-[10px] text-muted-foreground">≈ {formatUSD(r.medianTurnover)}</div>
+                          <div className="text-[10px] text-muted-foreground">≈ {formatUSD(r.medianTurnover, usdKrwRate)}</div>
                         </div>
                       ) : "-"}
                     </td>
@@ -452,6 +543,8 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe 
                           categoryOrder={categoryOrder}
                           factorData={factorCache[r.ticker]}
                           factorDefs={factorDefs}
+                          financials={finCache[r.ticker]}
+                          usdKrwRate={usdKrwRate}
                         />
                       </td>
                     </tr>

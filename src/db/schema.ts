@@ -386,3 +386,17 @@ export const backtestForwardReturns = pgTable("backtest_forward_returns", {
   pk: primaryKey({ columns: [table.ticker, table.snapshotDate, table.horizonDays] }),
   dateHorizonIdx: index("bfr_date_horizon_idx").on(table.snapshotDate, table.horizonDays),
 }));
+
+// ---------------------------------------------------------------------------
+// FX rates (USD/KRW etc.) — for showing approximate USD figures in the UI
+// ---------------------------------------------------------------------------
+
+export const fxRates = pgTable("fx_rates", {
+  pair: varchar("pair", { length: 12 }).notNull(),   // e.g. "USD/KRW"
+  date: date("date").notNull(),
+  rate: doublePrecision("rate").notNull(),
+  source: varchar("source", { length: 30 }),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.pair, table.date] }),
+}));

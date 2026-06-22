@@ -153,6 +153,26 @@ export async function fetchMedianDailyTurnover(days = 20): Promise<Map<string, n
 }
 
 // ---------------------------------------------------------------------------
+// FX
+// ---------------------------------------------------------------------------
+
+/**
+ * Latest USD/KRW rate from fx_rates (refreshed daily by the pipeline). Returns
+ * null if unavailable so callers can fall back to the hardcoded constant.
+ */
+export async function fetchLatestUsdKrwRate(): Promise<number | null> {
+  if (getDataSource() === "mock") return null;
+  const db = getDb()!;
+  const rows = await db
+    .select({ rate: schema.fxRates.rate })
+    .from(schema.fxRates)
+    .where(eq(schema.fxRates.pair, "USD/KRW"))
+    .orderBy(desc(schema.fxRates.date))
+    .limit(1);
+  return rows.length > 0 ? rows[0].rate : null;
+}
+
+// ---------------------------------------------------------------------------
 // Prices
 // ---------------------------------------------------------------------------
 
