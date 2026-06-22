@@ -6,7 +6,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { cn, formatKRW, formatNumber, scoreColor } from "@/lib/utils";
+import { cn, formatKRW, formatUSD, formatNumber, scoreColor } from "@/lib/utils";
 import { getFactorDefinitions } from "@/lib/factors";
 
 interface FactorScore {
@@ -18,7 +18,7 @@ interface FactorScore {
 export interface CategoryDetail {
   score: number | null;
   weight: number;
-  coverage: number;
+  coverage: string | number;   // e.g. "10/11" (factors used / total)
   status: string;
 }
 
@@ -104,7 +104,9 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
       <div className="rounded border bg-card px-3 py-2">
         <p className="text-xs text-muted-foreground">Median daily trading value (20d) — liquidity</p>
         <p className="text-sm font-mono font-semibold">
-          {row.medianTurnover ? formatKRW(row.medianTurnover) : "—"}
+          {row.medianTurnover
+            ? `${formatKRW(row.medianTurnover)}  (≈ ${formatUSD(row.medianTurnover)})`
+            : "—"}
         </p>
       </div>
 
@@ -176,7 +178,7 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs }: {
                 <span className="font-medium">{score !== null ? score.toFixed(1) : "—"}</span>
                 {sLabel && <span className="text-[9px] opacity-70">({sLabel})</span>}
                 {detail && (
-                  <span className="text-[10px] opacity-70">{(detail.coverage * 100).toFixed(0)}%</span>
+                  <span className="text-[10px] opacity-70">{detail.coverage}</span>
                 )}
               </div>
             );
@@ -409,7 +411,14 @@ export default function RankingClient({ rows, categoryOrder, asOfDate, universe 
                     </td>
                     <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap" title={r.sector || undefined}>{r.sector || "-"}</td>
                     <td className="px-3 py-2 text-right text-xs">{r.marketCap ? formatKRW(r.marketCap) : "-"}</td>
-                    <td className="px-3 py-2 text-right text-xs">{r.medianTurnover ? formatKRW(r.medianTurnover) : "-"}</td>
+                    <td className="px-3 py-2 text-right text-xs">
+                      {r.medianTurnover ? (
+                        <div className="leading-tight">
+                          <div>{formatKRW(r.medianTurnover)}</div>
+                          <div className="text-[10px] text-muted-foreground">≈ {formatUSD(r.medianTurnover)}</div>
+                        </div>
+                      ) : "-"}
+                    </td>
                     <td className="px-3 py-2 text-right">
                       <span className={cn("inline-block px-2 py-0.5 rounded font-mono text-xs font-semibold",
                         scoreBadgeClasses(r.composite))}>

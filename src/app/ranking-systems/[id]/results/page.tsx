@@ -12,7 +12,7 @@ import { getSystemById } from "@/lib/store";
 import { runRanking, collectFactorIds, DEFAULT_RANKING_SYSTEM } from "@/lib/ranking-engine";
 import { getFactorDefinitions } from "@/lib/factors";
 import { displayName, translateIndustry } from "@/lib/i18n";
-import { cn, formatKRW, formatNumber, scoreColor, scoreBg } from "@/lib/utils";
+import { cn, formatKRW, formatUSD, formatNumber, scoreColor, scoreBg } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Data source detection (client-safe — uses NEXT_PUBLIC_ env var)
@@ -109,7 +109,9 @@ function StockDetailRow({
         <div>
           <p className="text-xs text-muted-foreground">Median daily value (20d)</p>
           <p className="text-sm font-medium">
-            {stock.medianTurnover ? formatKRW(stock.medianTurnover) : "—"}
+            {stock.medianTurnover
+              ? `${formatKRW(stock.medianTurnover)}  (≈ ${formatUSD(stock.medianTurnover)})`
+              : "—"}
           </p>
         </div>
       </div>

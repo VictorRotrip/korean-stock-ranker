@@ -5,6 +5,25 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/**
+ * Approximate KRW→USD rate for display only. Korean figures are stored in won;
+ * this gives a rough dollar sense for non-KRW readers. Updated 2026-06-22
+ * (USD/KRW ≈ 1,538). For a liquidity gauge an approximate rate is fine — update
+ * here, or wire to a live daily FX feed if precision matters.
+ */
+export const USD_KRW_RATE = 1538;
+
+/** Format a KRW amount in approximate USD with compact $K/$M/$B suffixes. */
+export function formatUSD(krwValue: number, rate: number = USD_KRW_RATE): string {
+  const usd = krwValue / rate;
+  const sign = usd < 0 ? "-" : "";
+  const abs = Math.abs(usd);
+  if (abs >= 1_000_000_000) return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(0)}K`;
+  return `${sign}$${abs.toFixed(0)}`;
+}
+
 /** Format a number as Korean Won using Korean-style 조/억/만 suffixes.
  *  Handles negative values (e.g., Free Cash Flow can be negative for a
  *  company in heavy capex, which previously displayed as raw integers
