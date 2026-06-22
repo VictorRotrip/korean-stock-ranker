@@ -48,16 +48,29 @@ jobs:
         id: date
         run: |
           if [ -n "${{ inputs.as_of_date }}" ]; then
-            echo "as_of=${{ inputs.as_of_date }}" >> "$GITHUB_OUTPUT"
+            AS_OF="${{ inputs.as_of_date }}"
           else
-            echo "as_of=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+            AS_OF="$(date -u +%F)"
           fi
+          echo "as_of=$AS_OF" >> "$GITHUB_OUTPUT"
           echo "year=$(date -u +%Y)" >> "$GITHUB_OUTPUT"
+          # Trailing window for the marcap backfill: covers holidays / any
+          # missed runs. --resume keeps it cheap (skips days already filled).
+          echo "start=$(date -u -d "$AS_OF - 10 days" +%F)" >> "$GITHUB_OUTPUT"
 
-      # ----- Step 1: prices + market cap snapshot for today -----
-      - name: Ingest marcap (today's snapshot)
+      # ----- Step 1: point-in-time market cap (fdr close x shares) -----
+      # Uses the PIT-correct fdr source (genuine daily close x share count),
+      # NOT the old --source snapshot (current listing), which is not
+      # point-in-time and caused every stock to be excluded under the PIT
+      # guard. KRX/pykrx is blocked from GitHub runners, so fdr is the source.
+      - name: Ingest marcap (PIT, fdr)
         working-directory: scripts/python
-        run: python -u ingest_marcap.py --source snapshot --as-of-date "${{ steps.date.outputs.as_of }}"
+        run: |
+          python -u ingest_marcap.py --source fdr \
+            --universe "$UNIVERSE" \
+            --start-date "${{ steps.date.outputs.start }}" \
+            --end-date "${{ steps.date.outputs.as_of }}" \
+            --resume
 
       # ----- Step 2: pykrx valuation fundamentals -----
       # Skipped: KRX changed their API in 2026 to require KRX_ID + KRX_PW
