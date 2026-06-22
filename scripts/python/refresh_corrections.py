@@ -115,9 +115,26 @@ def known_tickers(conn):
     return s
 
 
+def db_filing_date(conn, ticker, year, quarter):
+    """Filing date of the version we currently have stored for this period
+    (max across consolidated/separate). None if we don't track the period."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT max(filing_date)::text FROM financial_statements
+        WHERE ticker=%s AND fiscal_year=%s
+          AND fiscal_quarter IS NOT DISTINCT FROM %s
+    """, (ticker, year, quarter))
+    r = cur.fetchone()
+    cur.close()
+    return r[0] if r and r[0] else None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Refresh corrected DART filings")
     ap.add_argument("--days", type=int, default=14, help="Look-back window")
+    ap.add_argument("--min-year", type=int, default=None,
+                    help="Ignore corrections to periods before this fiscal year "
+                         "(default: current year - 2)")
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--rate-limit", type=float, default=1.0)
     args = ap.parse_args()
@@ -126,9 +143,11 @@ def main():
     tickers = known_tickers(conn)
 
     now = datetime.now(timezone.utc)
+    min_year = args.min_year if args.min_year is not None else now.year - 2
     end = now.strftime("%Y%m%d")
     bgn = (now - timedelta(days=args.days)).strftime("%Y%m%d")
-    print("Scanning DART periodic filings {0}..{1} for corrections...".format(bgn, end), flush=True)
+    print("Scanning DART periodic filings {0}..{1} for corrections (periods >= FY{2})...".format(
+        bgn, end, min_year), flush=True)
 
     filings = list_recent_filings(bgn, end, args.timeout)
     print("  {0} periodic filings in window".format(len(filings)), flush=True)
@@ -138,6 +157,9 @@ def main():
 
     refreshed = 0
     skipped = 0
+    skipped_old = 0
+    skipped_already = 0   # correction predates the version we already ingested
+    skipped_untracked = 0  # we don't hold this period at all
     for f in corrections:
         stock_code = (f.get("stock_code") or "").strip()
         corp_code = (f.get("corp_code") or "").strip()
@@ -151,6 +173,25 @@ def main():
         if not parsed:
             continue
         year, report_code, quarter = parsed
+        if year < min_year:
+            skipped_old += 1
+            continue
+
+        corr_date = None
+        if rcept_dt and len(rcept_dt) == 8:
+            corr_date = "{0}-{1}-{2}".format(rcept_dt[0:4], rcept_dt[4:6], rcept_dt[6:8])
+
+        # Only act when the correction is NEWER than the filing we already have.
+        # A correction filed on/before our stored filing date is already baked
+        # into our numbers (DART's API returns the latest version), so it's not
+        # a change "since we pulled" — skip it (no fetch, no flag).
+        stored_fd = db_filing_date(conn, stock_code, year, quarter)
+        if stored_fd is None:
+            skipped_untracked += 1
+            continue
+        if corr_date is not None and corr_date <= stored_fd:
+            skipped_already += 1
+            continue
 
         try:
             result, status = fetch_financials(stock_code, corp_code, year, report_code, args.timeout)
@@ -162,10 +203,6 @@ def main():
             continue
 
         upsert_financials(conn, [result], overwrite=True)
-
-        corr_date = None
-        if rcept_dt and len(rcept_dt) == 8:
-            corr_date = "{0}-{1}-{2}".format(rcept_dt[0:4], rcept_dt[4:6], rcept_dt[6:8])
 
         cur = conn.cursor()
         cur.execute("""
@@ -183,7 +220,9 @@ def main():
         print("  refreshed {0} {1} (corrected {2})".format(stock_code, report_nm, corr_date), flush=True)
         time.sleep(args.rate_limit)
 
-    print("Done. Refreshed {0} corrected filings; {1} skipped (no data).".format(refreshed, skipped), flush=True)
+    print("Done. Refreshed {0} (newer than our data). "
+          "Skipped: {1} already-have, {2} old-period, {3} untracked, {4} no-data.".format(
+              refreshed, skipped_already, skipped_old, skipped_untracked, skipped), flush=True)
     conn.close()
 
 
