@@ -129,6 +129,48 @@ def db_filing_date(conn, ticker, year, quarter):
     return r[0] if r and r[0] else None
 
 
+# Fields we compare to decide whether a correction actually changed our numbers.
+CMP_FIELDS = [
+    "revenue", "operating_income", "net_income", "operating_cash_flow",
+    "free_cash_flow", "total_assets", "total_liabilities", "total_equity",
+    "total_debt", "eps", "gross_profit",
+]
+
+
+def db_stored_values(conn, ticker, year, quarter, consolidated):
+    cur = conn.cursor()
+    cols = ", ".join(CMP_FIELDS)
+    cur.execute("""
+        SELECT {0} FROM financial_statements
+        WHERE ticker=%s AND fiscal_year=%s
+          AND fiscal_quarter IS NOT DISTINCT FROM %s
+          AND consolidated_or_separate=%s
+        LIMIT 1
+    """.format(cols), (ticker, year, quarter, consolidated))
+    r = cur.fetchone()
+    cur.close()
+    if not r:
+        return None
+    return {f: r[i] for i, f in enumerate(CMP_FIELDS)}
+
+
+def values_changed(old, new):
+    """True if any compared field moved by >0.5% (or appeared/disappeared)."""
+    if old is None:
+        return True
+    for f in CMP_FIELDS:
+        a = old.get(f)
+        b = new.get(f)
+        if a is None and b is None:
+            continue
+        if a is None or b is None:
+            return True
+        denom = max(abs(a), abs(b), 1.0)
+        if abs(a - b) / denom > 0.005:
+            return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser(description="Refresh corrected DART filings")
     ap.add_argument("--days", type=int, default=14, help="Look-back window")
@@ -160,6 +202,7 @@ def main():
     skipped_old = 0
     skipped_already = 0   # correction predates the version we already ingested
     skipped_untracked = 0  # we don't hold this period at all
+    skipped_unchanged = 0  # correction didn't move any number we store
     for f in corrections:
         stock_code = (f.get("stock_code") or "").strip()
         corp_code = (f.get("corp_code") or "").strip()
@@ -202,6 +245,14 @@ def main():
             skipped += 1
             continue
 
+        # Only flag/refresh when the corrected filing actually moved our numbers.
+        # Many 정정 are notation/attachment fixes that leave the figures intact.
+        cons = result.get("consolidated_or_separate", "consolidated")
+        old = db_stored_values(conn, stock_code, year, quarter, cons)
+        if not values_changed(old, result):
+            skipped_unchanged += 1
+            continue
+
         upsert_financials(conn, [result], overwrite=True)
 
         cur = conn.cursor()
@@ -220,9 +271,9 @@ def main():
         print("  refreshed {0} {1} (corrected {2})".format(stock_code, report_nm, corr_date), flush=True)
         time.sleep(args.rate_limit)
 
-    print("Done. Refreshed {0} (newer than our data). "
-          "Skipped: {1} already-have, {2} old-period, {3} untracked, {4} no-data.".format(
-              refreshed, skipped_already, skipped_old, skipped_untracked, skipped), flush=True)
+    print("Done. Refreshed {0} (numbers actually changed). "
+          "Skipped: {1} already-have, {2} unchanged, {3} old-period, {4} untracked, {5} no-data.".format(
+              refreshed, skipped_already, skipped_unchanged, skipped_old, skipped_untracked, skipped), flush=True)
     conn.close()
 
 
