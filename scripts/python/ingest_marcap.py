@@ -788,6 +788,323 @@ def run_historical_range(conn, ticker_filter, start_date, end_date,
 
 
 # ---------------------------------------------------------------------------
+# Source: pykrx (KRX official daily market cap; PIT-correct, updates next day)
+# ---------------------------------------------------------------------------
+
+def fetch_pykrx_marcap_range(start_date, end_date, tickers=None):
+    """Fetch genuine point-in-time daily market cap from KRX via pykrx.
+
+    The FinanceData/marcap GitHub dataset lags by months; KRX's own data
+    portal (which pykrx scrapes) is current to the previous trading day.
+    We pull one call per calendar day via stock.get_market_cap_by_ticker;
+    non-trading days return an empty frame and are skipped.
+
+    Returns a DataFrame normalized to the same columns the historical
+    upsert expects: ticker, date (YYYY-MM-DD str), market_cap, volume,
+    trading_value, shares_outstanding. Returns None if nothing fetched.
+    """
+    try:
+        from pykrx import stock
+    except ImportError:
+        print("  ERROR: pykrx not installed. Run: pip install pykrx",
+              flush=True)
+        return None
+
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    tickerset = set(tickers) if tickers else None
+
+    # Korean column labels returned by get_market_cap_by_ticker.
+    rename = {
+        "티커": "ticker",
+        "시가총액": "market_cap",
+        "거래량": "volume",
+        "거래대금": "trading_value",
+        "상장주식수": "shares_outstanding",
+    }
+
+    frames = []
+    d = start
+    n_days = (end - start).days + 1
+    checked = 0
+    while d <= end:
+        checked += 1
+        ymd = d.strftime("%Y%m%d")
+        try:
+            df = stock.get_market_cap_by_ticker(ymd, market="ALL")
+        except Exception as e:
+            print("    {0}: fetch error ({1}); skipping".format(
+                d.strftime("%Y-%m-%d"), str(e)[:60]), flush=True)
+            df = None
+        if df is not None and len(df) > 0:
+            df = df.reset_index()
+            df = df.rename(columns=rename)
+            if "ticker" not in df.columns:
+                # Fallback: first column is the ticker index after reset
+                df = df.rename(columns={df.columns[0]: "ticker"})
+            df["ticker"] = df["ticker"].astype(str).str.zfill(6)
+            df["date"] = d.strftime("%Y-%m-%d")
+            if tickerset:
+                df = df[df["ticker"].isin(tickerset)]
+            keep = [c for c in ["ticker", "date", "market_cap", "volume",
+                                "trading_value", "shares_outstanding"]
+                    if c in df.columns]
+            if len(df) > 0:
+                frames.append(df[keep])
+                print("    [{0}/{1}] {2}: {3} tickers".format(
+                    checked, n_days, d.strftime("%Y-%m-%d"), len(df)),
+                    flush=True)
+        d += timedelta(days=1)
+        time.sleep(0.3)
+
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+def run_pykrx_range(conn, ticker_filter, start_date, end_date,
+                    batch_size=25, resume=False, dry_run=False):
+    """Backfill PIT market cap for a date range using the pykrx source.
+
+    Mirrors run_historical_range but pulls from KRX directly. Rows are
+    written with source='marcap_historical' (via the shared bulk upsert)
+    because they are genuinely point-in-time, so the ranking snapshot's
+    PIT guard accepts them with no further change.
+    """
+    print("", flush=True)
+    print("  Fetching pykrx market cap "
+          "{0} -> {1}...".format(start_date, end_date), flush=True)
+    t0 = time.time()
+    df = fetch_pykrx_marcap_range(start_date, end_date, tickers=ticker_filter)
+    fetch_elapsed = time.time() - t0
+
+    if df is None or len(df) == 0:
+        print("  ERROR: pykrx returned no data for the range", flush=True)
+        return None
+
+    print("  Fetched {0:,} rows in {1:.1f}s ({2} unique tickers, "
+          "{3} unique dates)".format(
+              len(df), fetch_elapsed,
+              df["ticker"].nunique(),
+              df["date"].nunique()), flush=True)
+
+    missing = []
+    if ticker_filter:
+        missing = sorted(set(ticker_filter) - set(df["ticker"].unique()))
+
+    all_dates = sorted(df["date"].unique())
+    target_dates = all_dates
+    if resume and ticker_filter:
+        target_dates = get_resume_dates(
+            conn, ticker_filter, all_dates, SOURCE_HISTORICAL)
+        skipped = len(all_dates) - len(target_dates)
+        if skipped > 0:
+            print("  Resume: skipping {0} dates already complete".format(
+                skipped), flush=True)
+
+    total_updated = 0
+    total_inserted = 0
+    total_processed = 0
+    dates_done = 0
+    for i, dt in enumerate(target_dates, start=1):
+        df_d = df[df["date"] == dt]
+        proc, ins, upd = upsert_historical_marcap_bulk(
+            conn, df_d, dry_run=dry_run)
+        total_processed += proc
+        total_inserted += ins
+        total_updated += upd
+        dates_done += 1
+        if i % batch_size == 0 or i == len(target_dates):
+            print("    [{0}/{1}] {2}: +{3} ins, ~{4} upd "
+                  "(running totals: {5} ins / {6} upd)".format(
+                      i, len(target_dates), dt, ins, upd,
+                      total_inserted, total_updated), flush=True)
+
+    return {
+        "matched": df["ticker"].nunique(),
+        "missing": missing,
+        "updated": total_updated,
+        "inserted": total_inserted,
+        "processed": total_processed,
+        "dates_done": dates_done,
+        "fetch_elapsed": fetch_elapsed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source: fdr (FinanceDataReader daily close x shares; PIT-correct, works
+# from non-Korea IPs where KRX/pykrx is blocked)
+# ---------------------------------------------------------------------------
+
+def _fdr_shares_map():
+    """Return {ticker: shares_outstanding} from the current KRX listing.
+
+    fdr.StockListing('KRX') is a CURRENT snapshot, but the share COUNT is
+    stable over a few-month window, so using it as the multiplier for daily
+    closes yields a market cap that is point-in-time on the price axis (the
+    part that actually moves day to day). Returns {} on failure.
+    """
+    try:
+        import FinanceDataReader as fdr
+    except ImportError:
+        print("  ERROR: FinanceDataReader not installed. "
+              "Run: pip install finance-datareader", flush=True)
+        return {}
+    try:
+        df = fdr.StockListing("KRX")
+    except Exception as e:
+        print("  WARNING: fdr.StockListing failed: {0}".format(
+            str(e)[:80]), flush=True)
+        return {}
+    if df is None or len(df) == 0:
+        return {}
+    code_col = next((c for c in ("Code", "Symbol", "ticker") if c in df.columns), None)
+    shares_col = next((c for c in ("Stocks", "Shares", "shares_outstanding")
+                       if c in df.columns), None)
+    if not code_col or not shares_col:
+        print("  WARNING: fdr listing missing Code/Stocks columns: {0}".format(
+            list(df.columns)), flush=True)
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        t = str(r[code_col]).zfill(6)
+        sh = safe_int(r[shares_col])
+        if sh:
+            out[t] = sh
+    return out
+
+
+def _db_shares_map(conn, tickers):
+    """Fallback {ticker: shares} from the most recent non-null
+    shares_outstanding already in daily_prices (marcap_historical carries
+    these through the last covered date)."""
+    if not tickers:
+        return {}
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT ON (ticker) ticker, shares_outstanding
+        FROM daily_prices
+        WHERE ticker = ANY(%s::text[]) AND shares_outstanding IS NOT NULL
+        ORDER BY ticker, date DESC
+    """, (list(tickers),))
+    out = {row[0]: row[1] for row in cur.fetchall()}
+    cur.close()
+    return out
+
+
+def run_fdr_range(conn, ticker_filter, start_date, end_date,
+                  batch_size=25, resume=False, dry_run=False):
+    """Backfill PIT market cap via FinanceDataReader: daily close x shares.
+
+    Iterates per ticker (fdr.DataReader is a per-symbol call), multiplies
+    each day's close by the share count, and writes with
+    source='marcap_historical' so the ranking PIT guard accepts it.
+    """
+    try:
+        import FinanceDataReader as fdr
+    except ImportError:
+        print("  ERROR: FinanceDataReader not installed.", flush=True)
+        return None
+
+    print("", flush=True)
+    print("  Building share-count map from fdr.StockListing('KRX')...",
+          flush=True)
+    shares_map = _fdr_shares_map()
+    print("    {0} tickers with shares from listing".format(len(shares_map)),
+          flush=True)
+
+    tickers = list(ticker_filter) if ticker_filter else sorted(shares_map.keys())
+    db_fallback = _db_shares_map(conn, tickers)
+
+    # Resume: skip tickers that already have good marcap_historical coverage
+    # in the range (>=90% of the best-covered ticker's day count).
+    skip = set()
+    if resume:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ticker, COUNT(*) FROM daily_prices
+            WHERE ticker = ANY(%s::text[]) AND source = 'marcap_historical'
+              AND market_cap IS NOT NULL AND date BETWEEN %s AND %s
+            GROUP BY ticker
+        """, (tickers, start_date, end_date))
+        counts = {r[0]: r[1] for r in cur.fetchall()}
+        cur.close()
+        if counts:
+            expected = max(counts.values())
+            if expected > 0:
+                skip = {t for t, c in counts.items() if c >= 0.9 * expected}
+                print("  Resume: skipping {0} tickers already covered".format(
+                    len(skip)), flush=True)
+
+    total_ins = total_upd = total_proc = 0
+    done_tickers = 0
+    no_shares = 0
+    no_price = 0
+    errors = 0
+    t0 = time.time()
+
+    for i, t in enumerate(tickers, start=1):
+        if t in skip:
+            continue
+        shares = shares_map.get(t) or db_fallback.get(t)
+        if not shares:
+            no_shares += 1
+            continue
+        try:
+            px = fdr.DataReader(t, start_date, end_date)
+        except Exception as e:
+            errors += 1
+            if errors <= 10:
+                print("    {0}: fdr error ({1})".format(t, str(e)[:50]),
+                      flush=True)
+            continue
+        if px is None or len(px) == 0 or "Close" not in px.columns:
+            no_price += 1
+            continue
+
+        px = px.reset_index()
+        date_col = next((c for c in ("Date", "index", "date")
+                         if c in px.columns), px.columns[0])
+        rows_df = pd.DataFrame({
+            "ticker": t,
+            "date": pd.to_datetime(px[date_col]).dt.strftime("%Y-%m-%d"),
+            "close": px["Close"],
+            "volume": px["Volume"] if "Volume" in px.columns else None,
+            "shares_outstanding": shares,
+        })
+        rows_df["market_cap"] = (rows_df["close"] * shares).round()
+        if "Amount" in px.columns:
+            rows_df["trading_value"] = px["Amount"]
+
+        proc, ins, upd = upsert_historical_marcap_bulk(
+            conn, rows_df, dry_run=dry_run)
+        total_proc += proc
+        total_ins += ins
+        total_upd += upd
+        done_tickers += 1
+
+        if i % batch_size == 0 or i == len(tickers):
+            rate = i / max(time.time() - t0, 0.1)
+            print("    [{0}/{1}] {2}: +{3} ins ~{4} upd  "
+                  "(done {5}, no_sh {6}, no_px {7}, err {8}; {9:.1f}/s)".format(
+                      i, len(tickers), t, ins, upd, done_tickers,
+                      no_shares, no_price, errors, rate), flush=True)
+        time.sleep(0.05)
+
+    return {
+        "matched": done_tickers,
+        "missing": [],
+        "updated": total_upd,
+        "inserted": total_ins,
+        "processed": total_proc,
+        "dates_done": done_tickers,
+        "no_shares": no_shares,
+        "no_price": no_price,
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -799,10 +1116,12 @@ if __name__ == "__main__":
     # Source selection
     parser.add_argument(
         "--source", default="auto",
-        choices=["historical", "snapshot", "auto"],
-        help=("Data source. historical=PIT-correct (marcap pkg); "
-              "snapshot=current fdr.StockListing (NOT PIT); "
-              "auto=try historical, fall back to snapshot."))
+        choices=["historical", "snapshot", "pykrx", "fdr", "auto"],
+        help=("Data source. historical=PIT-correct (marcap GitHub pkg, lags "
+              "months); pykrx=PIT-correct from KRX direct (blocked on non-KR "
+              "IPs); fdr=PIT-correct via FinanceDataReader (daily close x "
+              "shares, works anywhere); snapshot=current fdr.StockListing "
+              "(NOT PIT); auto=try historical, fall back to snapshot."))
 
     # Date arguments
     parser.add_argument(
@@ -945,13 +1264,38 @@ if __name__ == "__main__":
                       "mode (it has no historical dates).", flush=True)
                 sys.exit(1)
 
-            # historical or auto -> try historical
-            result = run_historical_range(
-                conn, ticker_filter,
-                args.start_date, args.end_date,
-                batch_size=args.batch_size,
-                resume=args.resume,
-                dry_run=args.dry_run)
+            if args.source == "pykrx":
+                result = run_pykrx_range(
+                    conn, ticker_filter,
+                    args.start_date, args.end_date,
+                    batch_size=args.batch_size,
+                    resume=args.resume,
+                    dry_run=args.dry_run)
+                if result is None:
+                    print("  ERROR: pykrx source returned no data.", flush=True)
+                    log_finish(conn, log_id, "error",
+                               error_message="pykrx source unavailable")
+                    sys.exit(1)
+            elif args.source == "fdr":
+                result = run_fdr_range(
+                    conn, ticker_filter,
+                    args.start_date, args.end_date,
+                    batch_size=args.batch_size,
+                    resume=args.resume,
+                    dry_run=args.dry_run)
+                if result is None:
+                    print("  ERROR: fdr source returned no data.", flush=True)
+                    log_finish(conn, log_id, "error",
+                               error_message="fdr source unavailable")
+                    sys.exit(1)
+            else:
+                # historical or auto -> try historical
+                result = run_historical_range(
+                    conn, ticker_filter,
+                    args.start_date, args.end_date,
+                    batch_size=args.batch_size,
+                    resume=args.resume,
+                    dry_run=args.dry_run)
 
             if result is None and args.source == "historical":
                 print("  ERROR: historical source unavailable.", flush=True)
