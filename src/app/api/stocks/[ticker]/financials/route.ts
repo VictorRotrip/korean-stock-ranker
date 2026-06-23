@@ -29,6 +29,8 @@ export async function GET(
     .select({
       periodEnd: fs.periodEnd,
       statementType: fs.statementType,
+      fiscalYear: fs.fiscalYear,
+      fiscalQuarter: fs.fiscalQuarter,
       consolidated: fs.consolidatedOrSeparate,
       // Income statement
       revenue: fs.revenue,

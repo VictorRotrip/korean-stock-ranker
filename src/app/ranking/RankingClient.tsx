@@ -19,6 +19,8 @@ interface FactorScore {
 interface FinancialPeriod {
   periodEnd: string;
   statementType: string;
+  fiscalYear: number | null;
+  fiscalQuarter: number | null;
   revenue: number | null;
   costOfRevenue: number | null;
   grossProfit: number | null;
@@ -101,31 +103,33 @@ function statusLabel(status: string): string | null {
   }
 }
 
-const FIN_ROWS: { key: keyof FinancialPeriod; label: string; kind: "krw" | "eps" | "shares" }[] = [
+// flow = summed over trailing 12 months (income/cash-flow); point = latest
+// balance-sheet snapshot. This drives the TTM column.
+const FIN_ROWS: { key: keyof FinancialPeriod; label: string; kind: "krw" | "eps" | "shares"; flow: boolean }[] = [
   // Income statement
-  { key: "revenue", label: "Revenue", kind: "krw" },
-  { key: "costOfRevenue", label: "Cost of revenue", kind: "krw" },
-  { key: "grossProfit", label: "Gross profit", kind: "krw" },
-  { key: "operatingIncome", label: "Operating income", kind: "krw" },
-  { key: "ebitda", label: "EBITDA", kind: "krw" },
-  { key: "interestExpense", label: "Interest expense", kind: "krw" },
-  { key: "netIncome", label: "Net income", kind: "krw" },
-  // Balance sheet
-  { key: "totalAssets", label: "Total assets", kind: "krw" },
-  { key: "totalLiabilities", label: "Total liabilities", kind: "krw" },
-  { key: "currentAssets", label: "Current assets", kind: "krw" },
-  { key: "currentLiabilities", label: "Current liabilities", kind: "krw" },
-  { key: "cash", label: "Cash & equivalents", kind: "krw" },
-  { key: "totalDebt", label: "Total debt", kind: "krw" },
-  { key: "totalEquity", label: "Total equity", kind: "krw" },
+  { key: "revenue", label: "Revenue", kind: "krw", flow: true },
+  { key: "costOfRevenue", label: "Cost of revenue", kind: "krw", flow: true },
+  { key: "grossProfit", label: "Gross profit", kind: "krw", flow: true },
+  { key: "operatingIncome", label: "Operating income", kind: "krw", flow: true },
+  { key: "ebitda", label: "EBITDA", kind: "krw", flow: true },
+  { key: "interestExpense", label: "Interest expense", kind: "krw", flow: true },
+  { key: "netIncome", label: "Net income", kind: "krw", flow: true },
+  // Balance sheet (point-in-time → TTM column shows the latest value)
+  { key: "totalAssets", label: "Total assets", kind: "krw", flow: false },
+  { key: "totalLiabilities", label: "Total liabilities", kind: "krw", flow: false },
+  { key: "currentAssets", label: "Current assets", kind: "krw", flow: false },
+  { key: "currentLiabilities", label: "Current liabilities", kind: "krw", flow: false },
+  { key: "cash", label: "Cash & equivalents", kind: "krw", flow: false },
+  { key: "totalDebt", label: "Total debt", kind: "krw", flow: false },
+  { key: "totalEquity", label: "Total equity", kind: "krw", flow: false },
   // Cash flow
-  { key: "operatingCashFlow", label: "Operating cash flow", kind: "krw" },
-  { key: "capitalExpenditure", label: "Capital expenditure", kind: "krw" },
-  { key: "freeCashFlow", label: "Free cash flow", kind: "krw" },
-  { key: "dividendsPaid", label: "Dividends paid", kind: "krw" },
+  { key: "operatingCashFlow", label: "Operating cash flow", kind: "krw", flow: true },
+  { key: "capitalExpenditure", label: "Capital expenditure", kind: "krw", flow: true },
+  { key: "freeCashFlow", label: "Free cash flow", kind: "krw", flow: true },
+  { key: "dividendsPaid", label: "Dividends paid", kind: "krw", flow: true },
   // Per share
-  { key: "eps", label: "EPS", kind: "eps" },
-  { key: "sharesOutstanding", label: "Shares out.", kind: "shares" },
+  { key: "eps", label: "EPS", kind: "eps", flow: true },
+  { key: "sharesOutstanding", label: "Shares out.", kind: "shares", flow: false },
 ];
 
 function finCell(v: number | null, kind: "krw" | "eps" | "shares"): string {
@@ -133,6 +137,32 @@ function finCell(v: number | null, kind: "krw" | "eps" | "shares"): string {
   if (kind === "krw") return formatKRW(v);
   if (kind === "shares") return v.toLocaleString("en-US");
   return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+
+/**
+ * Trailing-twelve-month value the factors actually use. For flow metrics:
+ * latest full year + this-year YTD − last-year same-period YTD. For point-in-
+ * time (balance sheet, shares): the latest reported value.
+ */
+function ttmValue(periods: FinancialPeriod[], key: keyof FinancialPeriod, flow: boolean): number | null {
+  if (periods.length === 0) return null;
+  const num = (p: FinancialPeriod | undefined) => {
+    const v = p ? (p[key] as number | null) : null;
+    return typeof v === "number" ? v : null;
+  };
+  const latest = periods[0]; // sorted desc by period_end
+  if (!flow) return num(latest);
+
+  // Flow: if the latest period is an interim quarter, annualize via YTD math.
+  if (latest.statementType === "annual") return num(latest);
+  const annual = periods.find(p => p.statementType === "annual");
+  const priorInterim = periods.find(
+    p => p.statementType === latest.statementType
+      && p.fiscalYear === (latest.fiscalYear ?? 0) - 1,
+  );
+  const a = num(annual), l = num(latest), pr = num(priorInterim);
+  if (a === null || l === null || pr === null) return null;
+  return a + l - pr;
 }
 
 function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials, usdKrwRate }: {
@@ -276,9 +306,12 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
               <thead>
                 <tr className="bg-card">
                   <th className="px-2 py-1 text-left font-medium text-muted-foreground">Metric</th>
+                  <th className="px-2 py-1 text-right font-medium whitespace-nowrap" title="Trailing twelve months — the value the factors use">
+                    TTM
+                  </th>
                   {finPeriods.map((p, i) => (
-                    <th key={i} className="px-2 py-1 text-right font-medium whitespace-nowrap">
-                      {p.periodEnd}<span className="text-muted-foreground"> · {p.statementType}</span>
+                    <th key={i} className="px-2 py-1 text-right font-medium whitespace-nowrap text-muted-foreground">
+                      {p.periodEnd}<span> · {p.statementType}</span>
                     </th>
                   ))}
                 </tr>
@@ -287,8 +320,11 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
                 {FIN_ROWS.map(fr => (
                   <tr key={fr.key} className="border-t">
                     <td className="px-2 py-1 text-muted-foreground whitespace-nowrap">{fr.label}</td>
+                    <td className="px-2 py-1 text-right font-mono font-semibold whitespace-nowrap">
+                      {finCell(ttmValue(finPeriods, fr.key, fr.flow), fr.kind)}
+                    </td>
                     {finPeriods.map((p, i) => (
-                      <td key={i} className="px-2 py-1 text-right font-mono whitespace-nowrap">
+                      <td key={i} className="px-2 py-1 text-right font-mono whitespace-nowrap text-muted-foreground">
                         {finCell(p[fr.key] as number | null, fr.kind)}
                       </td>
                     ))}
@@ -296,6 +332,9 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
                 ))}
               </tbody>
             </table>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              TTM = trailing twelve months (latest full year + this-year YTD − last-year YTD for flow items; latest balance-sheet value for the rest). This is the figure the factors use.
+            </p>
           </div>
         )}
       </div>
