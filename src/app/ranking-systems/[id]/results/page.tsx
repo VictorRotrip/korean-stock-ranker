@@ -204,24 +204,29 @@ function StockDetailRow({
       {/* Individual factor scores */}
       {stock.factorScores && Object.keys(stock.factorScores).length > 0 && (
         <div>
-          <p className="text-xs font-medium text-muted-foreground mb-2">Factor Details</p>
+          <p className="text-xs font-medium text-muted-foreground mb-2">
+            Factor Details <span className="font-normal">— each factor&apos;s formula (computed from the source financials), this stock&apos;s value, and its percentile rank vs peers (0–100).</span>
+          </p>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
             {Object.entries(stock.factorScores).map(([factorId, data]) => {
               const def = factorDefs.find(f => f.id === factorId);
               return (
                 <div
                   key={factorId}
-                  className="flex items-center justify-between px-3 py-1.5 rounded border bg-card text-xs"
+                  className="px-3 py-1.5 rounded border bg-card text-xs"
                 >
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{def?.name ?? factorId}</p>
-                    <p className="text-muted-foreground">
-                      Raw: {data.rawValue !== null ? formatNumber(data.rawValue, 4) : "N/A"}
-                    </p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="font-medium">{def?.name ?? factorId}</p>
+                    <div className={cn("font-mono font-medium shrink-0", scoreColor(data.percentileRank))}>
+                      {data.percentileRank.toFixed(1)}
+                    </div>
                   </div>
-                  <div className={cn("ml-2 font-mono font-medium", scoreColor(data.percentileRank))}>
-                    {data.percentileRank.toFixed(1)}
-                  </div>
+                  {def?.description && (
+                    <p className="text-muted-foreground mt-0.5">{def.description}</p>
+                  )}
+                  <p className="text-muted-foreground mt-0.5">
+                    Value from this stock&apos;s data: {data.rawValue !== null ? formatNumber(data.rawValue, 4) : "N/A"}
+                  </p>
                 </div>
               );
             })}

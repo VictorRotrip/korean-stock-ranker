@@ -275,7 +275,9 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
 
       {/* Factor details (loaded on demand) */}
       <div>
-        <p className="text-xs font-medium text-muted-foreground mb-2">Factor Details</p>
+        <p className="text-xs font-medium text-muted-foreground mb-2">
+          Factor Details <span className="font-normal">— each factor&apos;s formula (computed from the source financials above), this stock&apos;s value, and its percentile rank vs peers (0–100, higher = better).</span>
+        </p>
         {factorData === undefined || factorData === "loading" ? (
           <p className="text-xs text-muted-foreground">Loading…</p>
         ) : factorData.length === 0 ? (
@@ -286,16 +288,19 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
               const def = factorDefs.find(f => f.id === d.factorId);
               return (
                 <div key={d.factorId}
-                     className="flex items-center justify-between px-3 py-1.5 rounded border bg-card text-xs">
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{def?.name ?? d.factorId}</p>
-                    <p className="text-muted-foreground">
-                      Raw: {d.rawValue !== null ? formatNumber(d.rawValue, 4) : "N/A"}
-                    </p>
+                     className="px-3 py-1.5 rounded border bg-card text-xs">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="font-medium">{def?.name ?? d.factorId}</p>
+                    <div className={cn("font-mono font-medium shrink-0", scoreColor(d.percentileRank))}>
+                      {d.percentileRank.toFixed(1)}
+                    </div>
                   </div>
-                  <div className={cn("ml-2 font-mono font-medium", scoreColor(d.percentileRank))}>
-                    {d.percentileRank.toFixed(1)}
-                  </div>
+                  {def?.description && (
+                    <p className="text-muted-foreground mt-0.5">{def.description}</p>
+                  )}
+                  <p className="text-muted-foreground mt-0.5">
+                    Value from this stock&apos;s data: {d.rawValue !== null ? formatNumber(d.rawValue, 4) : "N/A"}
+                  </p>
                 </div>
               );
             })}
