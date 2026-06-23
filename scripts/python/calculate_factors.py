@@ -39,6 +39,7 @@ from dotenv import load_dotenv
 from factor_definitions import FACTORS, get_implemented_factors
 from factor_calculators import technical, fundamental, industry, sentiment
 from factor_calculators import fundamental_ttm
+from factor_explain import build_explain
 
 load_dotenv()
 
@@ -709,6 +710,7 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
     factors = {}
     missing_reasons = {}
     source_methods = {}
+    explains = {}
 
     implemented = get_implemented_factors()
 
@@ -743,6 +745,9 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
                     factor_id, factor_meta, prices, fin, prior, market_cap, shares_outstanding
                 )
             factors[factor_id] = raw_value
+            explains[factor_id] = build_explain(
+                factor_id, fin, prior, market_cap, shares_outstanding,
+                raw_value, factor_meta.get("description"))
 
             # Record source-method per factor. For DART-derived factors,
             # use the TTM/annual provenance recorded in fin_meta. Other
@@ -783,7 +788,7 @@ def compute_all_factors(conn, ticker, as_of, mcap_pit_safe=True):
             missing_reasons[factor_id] = "computation_error: {0}".format(str(e))
             source_methods[factor_id] = "computation_error"
 
-    return factors, missing_reasons, source_methods, fin_meta
+    return factors, missing_reasons, source_methods, fin_meta, explains
 
 
 def _compute_single_factor(factor_id, factor_meta, compute_fn_name,
@@ -1092,12 +1097,13 @@ def upsert_factor_snapshots(conn, rows, chunk_size=5000):
 
     query = """
     INSERT INTO factor_snapshots
-        (universe_name, ticker, factor_id, date, raw_value, percentile_rank, source)
+        (universe_name, ticker, factor_id, date, raw_value, percentile_rank, source, explain)
     VALUES %s
     ON CONFLICT (universe_name, ticker, factor_id, date) DO UPDATE SET
         raw_value = EXCLUDED.raw_value,
         percentile_rank = EXCLUDED.percentile_rank,
-        source = EXCLUDED.source
+        source = EXCLUDED.source,
+        explain = EXCLUDED.explain
     """
 
     total = len(rows)
@@ -1384,6 +1390,7 @@ if __name__ == "__main__":
         all_raw = {}  # ticker -> {factorId: rawValue}
         all_missing = {}  # ticker -> {factorId: missingReason}
         all_methods = {}  # ticker -> {factorId: source_method}
+        all_explains = {}  # ticker -> {factorId: worked-calculation string}
         ttm_status_counts = defaultdict(int)
         # Per-field counter for annual-fill events (one increment per
         # ticker per field). Tracks how often the new annual fallback
@@ -1398,12 +1405,13 @@ if __name__ == "__main__":
                 pit_safe = ticker in pit_safe_set
             else:
                 pit_safe = True  # treat all as safe; biased factors allowed
-            factors, missing, methods, fin_meta = compute_all_factors(
+            factors, missing, methods, fin_meta, explains = compute_all_factors(
                 conn, ticker, as_of, mcap_pit_safe=pit_safe,
             )
             all_raw[ticker] = factors
             all_missing[ticker] = missing
             all_methods[ticker] = methods
+            all_explains[ticker] = explains
             # Aggregate annual-fill stats from fin_meta.
             for f in fin_meta.get("fin_annual_fill", []) or []:
                 fin_fill_counts[f] += 1
@@ -1528,9 +1536,10 @@ if __name__ == "__main__":
                 if len(annotated) > 50:
                     annotated = annotated[:50]
                 rank_scope_stats[(category, scope)] += 1
+                explain = all_explains.get(ticker, {}).get(factor_id)
                 snapshot_rows.append((
                     universe_name_for_scope, ticker, factor_id, as_of,
-                    raw, pct_rank, annotated,
+                    raw, pct_rank, annotated, explain,
                 ))
 
         # Step 6a: Clear stale snapshots for this universe+date+ticker scope.

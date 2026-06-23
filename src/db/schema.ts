@@ -315,6 +315,7 @@ export const factorSnapshots = pgTable("factor_snapshots", {
   scope: varchar("scope", { length: 20 }),    // what scope was used for ranking
   scopeFallback: boolean("scope_fallback").default(false), // true if fell back to universe scope
   missingReason: varchar("missing_reason", { length: 30 }), // null if present, "no_data" | "insufficient_history" | "unavailable"
+  explain: text("explain"),  // worked calculation: formula with this stock's numbers filled in
 }, (table) => ({
   pk: primaryKey({ columns: [table.universeName, table.ticker, table.factorId, table.date] }),
   dateIdx: index("factor_snap_date_idx").on(table.date),

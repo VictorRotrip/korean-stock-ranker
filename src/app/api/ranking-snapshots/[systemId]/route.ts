@@ -204,7 +204,7 @@ export async function GET(
         .from(schema.factorSnapshots)
         .where(eq(schema.factorSnapshots.date, snapshot.date));
 
-  const factorMap = new Map<string, Record<string, { rawValue: number | null; percentileRank: number }>>();
+  const factorMap = new Map<string, Record<string, { rawValue: number | null; percentileRank: number; explain?: string | null }>>();
   for (const f of factorRows) {
     if (!factorMap.has(f.ticker)) {
       factorMap.set(f.ticker, {});
@@ -212,6 +212,7 @@ export async function GET(
     factorMap.get(f.ticker)![f.factorId] = {
       rawValue: f.rawValue,
       percentileRank: f.percentileRank ?? 50,
+      explain: f.explain ?? null,
     };
   }
 

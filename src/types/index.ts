@@ -330,6 +330,7 @@ export interface StockRanking {
   factorScores: Record<string, {
     rawValue: number | null;
     percentileRank: number;
+    explain?: string | null;
   }>;
   // ----- Coverage metadata (post-fix snapshots only) -----
   /** "passed" = passed minimum coverage; "insufficient" = failed and excluded from main ranking */

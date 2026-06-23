@@ -34,6 +34,7 @@ export async function GET(
       factorId: schema.factorSnapshots.factorId,
       rawValue: schema.factorSnapshots.rawValue,
       percentileRank: schema.factorSnapshots.percentileRank,
+      explain: schema.factorSnapshots.explain,
     })
     .from(schema.factorSnapshots)
     .where(and(
@@ -47,6 +48,7 @@ export async function GET(
       factorId: r.factorId,
       rawValue: r.rawValue,
       percentileRank: r.percentileRank ?? 50,
+      explain: r.explain ?? null,
     })),
   });
 }

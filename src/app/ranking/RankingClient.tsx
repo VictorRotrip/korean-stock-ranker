@@ -13,6 +13,7 @@ interface FactorScore {
   factorId: string;
   rawValue: number | null;
   percentileRank: number;
+  explain?: string | null;
 }
 
 interface FinancialPeriod {
@@ -321,12 +322,18 @@ function RankingDetail({ row, categoryOrder, factorData, factorDefs, financials,
                       {d.percentileRank.toFixed(1)}
                     </div>
                   </div>
-                  {def?.description && (
-                    <p className="text-muted-foreground mt-0.5">{def.description}</p>
+                  {d.explain ? (
+                    <p className="text-muted-foreground mt-0.5 font-mono text-[11px] break-words">{d.explain}</p>
+                  ) : (
+                    <>
+                      {def?.description && (
+                        <p className="text-muted-foreground mt-0.5">{def.description}</p>
+                      )}
+                      <p className="text-muted-foreground mt-0.5">
+                        Value: {d.rawValue !== null ? formatNumber(d.rawValue, 4) : "N/A"}
+                      </p>
+                    </>
                   )}
-                  <p className="text-muted-foreground mt-0.5">
-                    Value from this stock&apos;s data: {d.rawValue !== null ? formatNumber(d.rawValue, 4) : "N/A"}
-                  </p>
                 </div>
               );
             })}

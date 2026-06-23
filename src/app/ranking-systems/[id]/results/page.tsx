@@ -221,12 +221,18 @@ function StockDetailRow({
                       {data.percentileRank.toFixed(1)}
                     </div>
                   </div>
-                  {def?.description && (
-                    <p className="text-muted-foreground mt-0.5">{def.description}</p>
+                  {data.explain ? (
+                    <p className="text-muted-foreground mt-0.5 font-mono text-[11px] break-words">{data.explain}</p>
+                  ) : (
+                    <>
+                      {def?.description && (
+                        <p className="text-muted-foreground mt-0.5">{def.description}</p>
+                      )}
+                      <p className="text-muted-foreground mt-0.5">
+                        Value: {data.rawValue !== null ? formatNumber(data.rawValue, 4) : "N/A"}
+                      </p>
+                    </>
                   )}
-                  <p className="text-muted-foreground mt-0.5">
-                    Value from this stock&apos;s data: {data.rawValue !== null ? formatNumber(data.rawValue, 4) : "N/A"}
-                  </p>
                 </div>
               );
             })}
