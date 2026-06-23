@@ -30,13 +30,28 @@ export async function GET(
       periodEnd: fs.periodEnd,
       statementType: fs.statementType,
       consolidated: fs.consolidatedOrSeparate,
+      // Income statement
       revenue: fs.revenue,
+      costOfRevenue: fs.costOfRevenue,
+      grossProfit: fs.grossProfit,
       operatingIncome: fs.operatingIncome,
+      ebitda: fs.ebitda,
+      interestExpense: fs.interestExpense,
       netIncome: fs.netIncome,
-      operatingCashFlow: fs.operatingCashFlow,
-      freeCashFlow: fs.freeCashFlow,
+      // Balance sheet
+      totalAssets: fs.totalAssets,
+      totalLiabilities: fs.totalLiabilities,
+      currentAssets: fs.currentAssets,
+      currentLiabilities: fs.currentLiabilities,
+      cash: fs.cash,
       totalDebt: fs.totalDebt,
       totalEquity: fs.totalEquity,
+      // Cash flow
+      operatingCashFlow: fs.operatingCashFlow,
+      capitalExpenditure: fs.capitalExpenditure,
+      freeCashFlow: fs.freeCashFlow,
+      dividendsPaid: fs.dividendsPaid,
+      // Per share
       eps: fs.eps,
       sharesOutstanding: fs.sharesOutstanding,
     })

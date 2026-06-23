@@ -19,12 +19,23 @@ interface FinancialPeriod {
   periodEnd: string;
   statementType: string;
   revenue: number | null;
+  costOfRevenue: number | null;
+  grossProfit: number | null;
   operatingIncome: number | null;
+  ebitda: number | null;
+  interestExpense: number | null;
   netIncome: number | null;
-  operatingCashFlow: number | null;
-  freeCashFlow: number | null;
+  totalAssets: number | null;
+  totalLiabilities: number | null;
+  currentAssets: number | null;
+  currentLiabilities: number | null;
+  cash: number | null;
   totalDebt: number | null;
   totalEquity: number | null;
+  operatingCashFlow: number | null;
+  capitalExpenditure: number | null;
+  freeCashFlow: number | null;
+  dividendsPaid: number | null;
   eps: number | null;
   sharesOutstanding: number | null;
 }
@@ -90,13 +101,28 @@ function statusLabel(status: string): string | null {
 }
 
 const FIN_ROWS: { key: keyof FinancialPeriod; label: string; kind: "krw" | "eps" | "shares" }[] = [
+  // Income statement
   { key: "revenue", label: "Revenue", kind: "krw" },
+  { key: "costOfRevenue", label: "Cost of revenue", kind: "krw" },
+  { key: "grossProfit", label: "Gross profit", kind: "krw" },
   { key: "operatingIncome", label: "Operating income", kind: "krw" },
+  { key: "ebitda", label: "EBITDA", kind: "krw" },
+  { key: "interestExpense", label: "Interest expense", kind: "krw" },
   { key: "netIncome", label: "Net income", kind: "krw" },
-  { key: "operatingCashFlow", label: "Operating cash flow", kind: "krw" },
-  { key: "freeCashFlow", label: "Free cash flow", kind: "krw" },
+  // Balance sheet
+  { key: "totalAssets", label: "Total assets", kind: "krw" },
+  { key: "totalLiabilities", label: "Total liabilities", kind: "krw" },
+  { key: "currentAssets", label: "Current assets", kind: "krw" },
+  { key: "currentLiabilities", label: "Current liabilities", kind: "krw" },
+  { key: "cash", label: "Cash & equivalents", kind: "krw" },
   { key: "totalDebt", label: "Total debt", kind: "krw" },
   { key: "totalEquity", label: "Total equity", kind: "krw" },
+  // Cash flow
+  { key: "operatingCashFlow", label: "Operating cash flow", kind: "krw" },
+  { key: "capitalExpenditure", label: "Capital expenditure", kind: "krw" },
+  { key: "freeCashFlow", label: "Free cash flow", kind: "krw" },
+  { key: "dividendsPaid", label: "Dividends paid", kind: "krw" },
+  // Per share
   { key: "eps", label: "EPS", kind: "eps" },
   { key: "sharesOutstanding", label: "Shares out.", kind: "shares" },
 ];
