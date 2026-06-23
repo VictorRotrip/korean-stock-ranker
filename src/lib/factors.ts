@@ -74,7 +74,7 @@ const peTtmInv: ComputeFactor = {
 
 const priceBook: ComputeFactor = {
   id: "price_book",
-  name: "Price / Book",
+  name: "Book / Market",
   description: "Book-to-Market = Total Equity / Market Cap. Higher means cheaper.",
   category: "value",
   direction: "higher_is_better",
