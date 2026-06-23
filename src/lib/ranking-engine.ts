@@ -337,7 +337,7 @@ export function collectFactorIds(node: RankingNode): string[] {
  * Compute the composite score for a single stock by walking the tree.
  * Returns a score from 0-100.
  */
-function computeNodeScore(
+export function computeNodeScore(
   node: RankingNode,
   factorRanks: Map<string, number | null>, // factorId → percentile rank for this stock
 ): number | null {

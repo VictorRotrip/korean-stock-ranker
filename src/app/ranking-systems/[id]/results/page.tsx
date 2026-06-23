@@ -309,8 +309,28 @@ export default function RankingResultsPage() {
           const data = await res.json();
 
           if (!res.ok) {
-            console.error(`[results] API error:`, data);
-            setError(data.error || "Failed to load ranking snapshot from database.");
+            // No precomputed snapshot — likely a custom (user-built) system.
+            // Compute it live against today's factor data instead.
+            const sys = getSystemById(id) ?? (id === "default" ? DEFAULT_RANKING_SYSTEM : null);
+            if (!sys) {
+              setError(data.error || "Ranking system not found.");
+              setLoading(false);
+              return;
+            }
+            console.log(`[results] No snapshot for "${id}"; computing live for custom system`);
+            const liveRes = await fetch(`/api/ranking/run-live`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ system: sys }),
+            });
+            const liveData = await liveRes.json();
+            if (!liveRes.ok) {
+              setError(liveData.error || "Failed to run this ranking system against live data.");
+              setLoading(false);
+              return;
+            }
+            setSystem(sys);
+            setResult(liveData as DbRankingResult);
             setLoading(false);
             return;
           }
